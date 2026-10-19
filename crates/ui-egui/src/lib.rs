@@ -447,6 +447,7 @@ pub struct SolveApp {
     pub preview: preview::PreviewState,
     /// OK pressed on a feature that takes a while: its evaluation runs off the window thread.
     pub applying: Option<dialogs::Applying>,
+    pub(crate) editing_state: Option<dialogs::EditingState>,
     /// A command recomputing the history (the marker moved, undo) computing off the window
     /// thread, and those asked for meanwhile ([`deferred`]).
     pub deferred: Option<deferred::Deferred>,
@@ -620,6 +621,7 @@ impl SolveApp {
             slicer_menu: dialogs_save_mesh::SlicerMenu::default(),
             preview: preview::PreviewState::default(),
             applying: None,
+            editing_state: None,
             deferred: None,
             deferred_queue: Vec::new(),
             start_after_roll: None,
@@ -883,6 +885,11 @@ impl SolveApp {
         let t0 = now_ms();
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
         self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
+        self.command_completed(id, r)
+    }
+
+    /// Host effects shared by directly executed and already evaluated commands.
+    pub(crate) fn command_completed(&mut self, id: &str, r: Result<Value, String>) -> Result<Value, String> {
         if let Ok(v) = &r {
             if id == "view.layout" {
                 let layout =
@@ -976,6 +983,8 @@ impl SolveApp {
                     // The old document is already replaced: discard its editor without
                     // applying cancellation hooks (such as restoring its timeline marker).
                     self.dialog = None;
+                    self.applying = None;
+                    self.editing_state = None;
                     self.tool = None;
                     self.preview.reset();
                     self.cam = Camera::default();
@@ -1216,6 +1225,11 @@ impl SolveApp {
             }
             return;
         }
+        // Cancel the previous feature transaction before finishing a sketch or
+        // waiting for its history marker to return.
+        if self.interactive(id) && (self.editing_state.is_some() || self.applying.is_some()) {
+            dialogs::cancel(self);
+        }
         let finished_sketch = self.session.active_sketch.filter(|_| ends_sketch(id) && self.interactive(id));
         if finished_sketch.is_some() {
             self.finish_sketch();
@@ -1321,6 +1335,7 @@ impl SolveApp {
     /// timeline back to just before themselves and reopen their dialog, filled in.
     pub fn edit_feature(&mut self, id: u64) {
         use solidcraft_engine::doc::FeatureKind;
+        dialogs::cancel(self);
         let Some(f) = self.session.doc.feature(id) else { return };
         if matches!(f.kind, FeatureKind::Sketch { .. }) {
             self.edit_sketch(id);
@@ -1328,15 +1343,21 @@ impl SolveApp {
         }
         let Some(idx) = self.session.doc.feature_index(id) else { return };
         let marker = self.finish_sketch_for_edit();
+        let original = self.session.scratch();
         self.tool = None;
         if dialogs::roll_marker(self, Some(idx)).is_err() {
             return;
         }
+        self.editing_state = Some(dialogs::EditingState { source: self.session.scratch(), original });
         match dialogs::for_feature(self, id, marker) {
-            Some(d) => self.dialog = Some(d),
+            Some(d) => {
+                if !d.previews() {
+                    self.editing_state = None;
+                }
+                self.dialog = Some(d);
+            }
             None => {
-                let _ = dialogs::roll_marker(self, marker);
-                // No dialog for this feature: open the search box with the command to edit it.
+                dialogs::restore_editing(self, marker);
                 self.sbox.text = format!("timeline.edit {{\"feature\": {id}, \"set\": {{}}}}");
                 self.ui.palette_open = true;
             }
