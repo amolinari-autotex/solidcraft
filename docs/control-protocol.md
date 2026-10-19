@@ -41,6 +41,17 @@ events, one pointer event per frame. A connection that sent `control.subscribe` 
 event lines `{"event": "…", "params": {…}}`, which have no `id`
 ([Following the design](#following-the-design)).
 
+### Isolated native test profiles
+
+For automation against public-safe test designs, set `SOLIDCRAFT_SETTINGS_DIR` to
+an absolute private folder before starting the desktop app. Settings, graphics
+preferences and startup markers use that folder; legacy-settings adoption is
+skipped. Empty or relative overrides fail before normal-profile startup. Without
+the override, the usual platform settings location is unchanged. On Windows,
+eframe uses the OS roaming-folder API, so `APPDATA` alone does not isolate settings.
+Also set `SOLIDCRAFT_RECOVERY_DIR`, `SOLIDCRAFT_CRASH_DIR` and
+`SOLIDCRAFT_CONTROL_DIR` to private test folders to isolate those separate stores.
+
 ### Token
 
 Every connection must authenticate. At start the app makes a random 256-bit token for this
