@@ -1137,7 +1137,8 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
                 let result = if workspace == "pdm" {
                     crate::pdm_panel::enter(app)
                 } else {
-                    app.pdm.workspace_active = false;
+                    crate::pdm_panel::leave(app);
+                    app.home.open = false;
                     crate::render_workspace::enter(app, workspace == "render")
                 };
                 if let Err(error) = result {

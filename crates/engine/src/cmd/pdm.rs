@@ -16,7 +16,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("pdm.preview", "Preview", preview).icon("render_image").noundo().doc_only().params("document,version; retrieves the embedded thumbnail for that exact version, if available"),
     CommandSpec::new("pdm.archive", "Check In", archive).at("PDM", "WORKSPACE").icon("save").noundo().doc_only().params("document?: selected identity guard; logical_path?: workspace-relative path; reconcile:true only reconciles an existing authenticated publication receipt and never publishes"),
     CommandSpec::new("pdm.checkout", "Check Out", checkout).at("PDM", "WORKSPACE").icon("open").noundo().doc_only().params("document?: selected stable identity; otherwise active managed design"),
-    CommandSpec::new("pdm.cancel_checkout", "Undo Checkout", cancel_checkout).at("PDM", "WORKSPACE").icon("undo").noundo().doc_only().params("document?: selected stable identity; discard:true explicitly restores archived content, preserving a recovery copy"),
+    CommandSpec::new("pdm.cancel_checkout", "Undo Checkout", cancel_checkout).at("PDM", "WORKSPACE").icon("undo").noundo().doc_only().params("document?: selected stable identity; discard:true explicitly discards unsaved RAM and restores archived content, preserving a recovery copy"),
     CommandSpec::new("pdm.get_latest", "Get Latest", get_latest).at("PDM", "WORKSPACE").icon("update").noundo().doc_only().params("document?: selected stable identity; refuses unsaved local edits"),
     CommandSpec::new("pdm.open_document", "Open Working Copy", open_document).at("PDM", "ARCHIVE").icon("open").noundo().doc_only().params("document: selected stable identity; opens its normal workspace path"),
     CommandSpec::new("pdm.open_archived", "Open as Archived", retrieve).at("PDM", "ARCHIVE").icon("open").noundo().doc_only().params("document,version; opens a separate read-only historical snapshot"),
@@ -34,7 +34,7 @@ fn err(message: impl Into<String>) -> EngineError {
 }
 /// Validate the entire supported parameter shape BEFORE the engine records a command.
 /// In particular, accidental token/credential fields must never enter the crash journal.
-pub(crate) fn validate_params(id: &str, p: &Value) -> Result<()> {
+pub fn validate_params(id: &str, p: &Value) -> Result<()> {
     let keys: &[&str] = match id {
         "pdm.setup.create" => &["label", "administrator"],
         "pdm.connection.open" => &["connection_id"],
@@ -258,18 +258,48 @@ fn target(s: &Session, p: &Value) -> Result<(Option<String>, Option<String>)> {
     Ok((document, s.path.clone()))
 }
 fn checkout(s: &mut Session, p: &Value) -> Result<Value> {
-    let (document, path) = target(s, p)?;
+    if s.active_sketch.is_some() || !s.pending_moves.is_empty() {
+        return Err(err("Finish active sketch or move operations before checking out this design"));
+    }
+    let document = p.get("document").map(|_| document(p)).transpose()?;
     policy(s, "pdm.checkout", document.as_deref(), None)?;
+    if s.is_dirty() {
+        s.check_pdm_reopen()?;
+        let path = s.path.clone().ok_or_else(|| err("Open the selected working copy before checking out unsaved edits"))?;
+        let status = s.pdm.status().map_err(err)?;
+        let local = status
+            .managed
+            .local
+            .iter()
+            .find(|local| {
+                crate::pdm::cached_path_key(&local.path) == crate::pdm::cached_path_key(&path)
+                    && document.as_ref().is_none_or(|document| *document == local.document)
+            })
+            .ok_or_else(|| err("Open the selected working copy before checking out unsaved edits"))?;
+        return enqueue(
+            s,
+            Task::Managed(ManagedTask::CheckoutPreservingMemory { document: local.document.clone(), path, expected_base: local.base_version }),
+        );
+    }
+    let (document, path) = target(s, p)?;
     enqueue(s, Task::Managed(ManagedTask::Checkout { document, path }))
 }
 fn cancel_checkout(s: &mut Session, p: &Value) -> Result<Value> {
-    // Preserve unsaved RAM separately before any destructive disk operation.
-    if s.is_dirty() || s.active_sketch.is_some() || !s.pending_moves.is_empty() {
-        return Err(err("Save or Save As current edits before undoing checkout; archived bytes will replace the local copy"));
+    // Explicit discard acknowledges both unsaved RAM and local disk edits.
+    if p.get("discard").and_then(Value::as_bool) != Some(true) {
+        return Err(err("Undo Checkout requires explicit discard:true before unsaved edits can be discarded"));
+    }
+    if s.active_sketch.is_some() || !s.pending_moves.is_empty() {
+        return Err(err("Finish active sketch or move operations before undoing checkout"));
     }
     let document = p.get("document").map(|_| document(p)).transpose()?;
     policy(s, "pdm.cancel_checkout", document.as_deref(), None)?;
-    enqueue(s, Task::Managed(ManagedTask::CancelCheckout { document, path: s.path.clone() }))
+    let path = if let Some(document) = &document {
+        s.pdm.status().map_err(err)?.managed.local.iter().find(|local| local.document == *document).map(|local| local.path.clone())
+    } else {
+        s.path.clone()
+    };
+    enqueue(s, Task::Managed(ManagedTask::CancelCheckout { document, path }))
 }
 fn get_latest(s: &mut Session, p: &Value) -> Result<Value> {
     let (document, path) = target(s, p)?;

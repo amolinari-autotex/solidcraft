@@ -117,7 +117,19 @@ fn managed_snapshot(path: &str, workspace: &str, checked_out: bool) -> ManagedSt
 }
 
 fn apply_managed(runtime: &Runtime, managed: ManagedState, refresh: bool) -> Result<(), String> {
-    let id = runtime.enqueue(Task::Connect { port: 48231 })?;
+    let connected = runtime.status()?.port.is_some();
+    let task = if refresh && connected {
+        Task::Refresh
+    } else {
+        if connected {
+            // Workspace-switch fixtures must model the explicit disconnect,
+            // preserving the protection ledger before a new native connection.
+            let id = runtime.enqueue(Task::Disconnect)?;
+            runtime.finish(id, Ok(Outcome::Disconnected))?;
+        }
+        Task::Connect { port: 48231 }
+    };
+    let id = runtime.enqueue(task)?;
     runtime.finish(
         id,
         Ok(if refresh { Outcome::ManagedRefreshed { port: 48231, state: managed } } else { Outcome::Managed { port: 48231, state: managed } }),
@@ -536,8 +548,8 @@ fn saved_inventory_never_establishes_or_replaces_authenticated_identity() {
     let id = runtime.enqueue(Task::Managed(ManagedTask::ListConnections)).unwrap();
     runtime.finish(id, Ok(Outcome::Connections(rows))).unwrap();
     assert_eq!(runtime.status().unwrap().connection, Some(active.clone()));
-    let id = runtime.enqueue(Task::Managed(ManagedTask::OpenConnection { connection_id: "b".repeat(64) })).unwrap();
-    runtime.finish(id, Err(Failure { message: "Authentication failed".into(), disconnect: false })).unwrap();
+    assert_eq!(runtime.enqueue(Task::Managed(ManagedTask::OpenConnection { connection_id: "b".repeat(64) })).unwrap_err(), "ui.pdm_connected");
+    assert!(runtime.take_job().unwrap().is_none());
     assert_eq!(runtime.status().unwrap().connection, Some(active));
     apply_managed(&runtime, managed_snapshot("other.solidcraft", "b", false), true).unwrap();
     assert!(runtime.status().unwrap().connection.is_none(), "a new workspace snapshot must not inherit verified identity");
@@ -556,11 +568,11 @@ fn scoped_recovery_rejects_unsaved_active_work_before_queueing() {
 }
 
 #[test]
-fn opaque_connection_recovery_blocks_saved_editors_until_native_completion() {
-    let mut session = Session::default();
-    session.pdm.set_available(true).unwrap();
-    session.path = Some("not-yet-discovered-workspace/part.solidcraft".into());
+fn opaque_connection_recovery_blocks_registered_saved_editors_until_native_completion() {
+    let mut session = connected();
+    session.path = Some("known-workspace/part.solidcraft".into());
     session.mark_saved();
+    apply_managed(&session.pdm, managed_snapshot("known-workspace/part.solidcraft", "workspace", true), false).unwrap();
     let before = session.doc.clone();
     let id = session.execute("pdm.connection.recover", &json!({"connection_id":"a".repeat(64),"restore":true})).unwrap()["request"].as_u64().unwrap();
     assert!(session.pdm.blocks_path(session.path.as_deref().unwrap()));
@@ -817,7 +829,7 @@ fn action_policy_covers_busy_offline_dirty_stale_initial_archive_and_selection_m
         Some("ui.pdm_reason_open_selected")
     );
     assert_eq!(status.action_unavailable("pdm.checkout", None, None, false, false, None), Some("ui.pdm_reason_select_document"));
-    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), None, true, false, None), Some("ui.pdm_reason_modified"));
+    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), None, true, false, None), Some("ui.pdm_reason_open_selected"));
     assert_eq!(status.action_unavailable("pdm.restore_version", Some("part"), None, false, false, Some(1)), Some("ui.pdm_reason_stale_base"));
     assert_eq!(status.document_state(Some("part"), None, false), "ui.pdm_state_outdated");
     status.connection.as_mut().unwrap().role = "Viewer".into();
@@ -915,4 +927,419 @@ fn native_incomplete_checkout_proof_allows_release_only_and_never_publication() 
     status.managed.catalog[0].checkout.as_mut().unwrap().owner = "alice".into();
     status.managed.catalog[0].checkout.as_mut().unwrap().workspace = "other-device".into();
     assert_eq!(status.action_unavailable("pdm.cancel_checkout", Some("part"), None, false, false, None), Some("ui.pdm_reason_checked_out_elsewhere"));
+}
+
+fn feedback_connection_session(guided: bool) -> Session {
+    let session = Session::default();
+    session.pdm.set_available(true).unwrap();
+    let id = session.pdm.enqueue(Task::Connect { port: 48231 }).unwrap();
+    let outcome = if guided {
+        let status = policy_status();
+        Outcome::ManagedConnected { port: 48231, state: status.managed, connections: vec![], connection: status.connection.unwrap() }
+    } else {
+        Outcome::Connected { port: 48231, versions: vec![] }
+    };
+    session.pdm.finish(id, Ok(outcome)).unwrap();
+    session
+}
+
+#[test]
+fn feedback_connection_shared_policy_disables_connected_and_pending_connection_actions() {
+    let mut status = Status { available: true, ..Default::default() };
+    for command in ["pdm.connect", "pdm.connection.open", "pdm.setup.create"] {
+        assert_eq!(status.action_unavailable(command, None, None, false, false, None), None);
+    }
+    status.busy = Some(1);
+    assert_eq!(status.action_unavailable("pdm.connect", None, None, false, false, None), Some("ui.pdm_reason_busy"));
+    status.busy = None;
+    status.port = Some(48231);
+    for command in ["pdm.connect", "pdm.connection.open", "pdm.setup.create"] {
+        assert_eq!(status.action_unavailable(command, None, None, false, false, None), Some("ui.pdm_connected"));
+    }
+    assert_eq!(status.action_unavailable("pdm.disconnect", None, None, false, false, None), None);
+    assert_eq!(status.action_unavailable("pdm.connections", None, None, false, false, None), None);
+    assert_eq!(status.action_unavailable("pdm.connection.recover", None, None, false, false, None), None);
+    assert_eq!(status.action_unavailable("pdm.recover_workspace", None, None, false, false, None), None);
+}
+
+#[test]
+fn feedback_connection_runtime_rejects_repeated_connection_mutations_after_native_confirmation() {
+    for guided in [false, true] {
+        for task in [
+            Task::Connect { port: 48232 },
+            Task::Managed(ManagedTask::Connect { port: 48232, root: Some("/workspace".into()) }),
+            Task::Managed(ManagedTask::OpenConnection { connection_id: "a".repeat(64) }),
+            Task::Managed(ManagedTask::CreateLocal { label: "Another archive".into(), administrator: "admin".into() }),
+        ] {
+            let session = feedback_connection_session(guided);
+            assert_eq!(session.pdm.enqueue(task).unwrap_err(), "ui.pdm_connected");
+            assert!(session.pdm.take_job().unwrap().is_none());
+            let status = session.pdm.status().unwrap();
+            assert_eq!(status.port, Some(48231));
+            assert!(status.busy.is_none());
+        }
+    }
+}
+
+#[test]
+fn feedback_connection_command_handlers_cannot_queue_a_second_connection() {
+    for guided in [false, true] {
+        for (command, params) in [
+            ("pdm.connect", json!({"port":48232})),
+            ("pdm.connect", json!({"port":48232,"root":"/workspace"})),
+            ("pdm.connection.open", json!({"connection_id":"a".repeat(64)})),
+            ("pdm.setup.create", json!({"label":"Another archive","administrator":"admin"})),
+        ] {
+            let mut session = feedback_connection_session(guided);
+            assert!(session.execute(command, &params).is_err(), "{command}");
+            assert!(session.pdm.take_job().unwrap().is_none());
+            assert!(session.pdm.status().unwrap().busy.is_none());
+        }
+    }
+}
+
+#[test]
+fn feedback_connection_pending_and_real_disconnection_control_reconnect_availability() {
+    let session = Session::default();
+    session.pdm.set_available(true).unwrap();
+    let id = session.pdm.enqueue(Task::Connect { port: 48231 }).unwrap();
+    assert!(session.pdm.enqueue(Task::Connect { port: 48231 }).is_err());
+    session.pdm.finish(id, Err(Failure { message: "Service unavailable".into(), disconnect: true })).unwrap();
+    assert!(session.pdm.status().unwrap().port.is_none());
+    let id = session.pdm.enqueue(Task::Connect { port: 48231 }).unwrap();
+    session.pdm.finish(id, Ok(Outcome::Connected { port: 48231, versions: vec![] })).unwrap();
+    let id = session.pdm.enqueue(Task::Refresh).unwrap();
+    session.pdm.finish(id, Err(Failure { message: "Metadata request failed".into(), disconnect: false })).unwrap();
+    let status = session.pdm.status().unwrap();
+    assert_eq!(status.port, Some(48231));
+    assert_eq!(status.action_unavailable("pdm.connect", None, None, false, false, None), Some("ui.pdm_connected"));
+    assert_eq!(status.action_unavailable("pdm.disconnect", None, None, false, false, None), None);
+    let id = session.pdm.enqueue(Task::Refresh).unwrap();
+    session.pdm.finish(id, Err(Failure { message: "Connection closed".into(), disconnect: true })).unwrap();
+    assert!(session.pdm.status().unwrap().port.is_none());
+    let id = session.pdm.enqueue(Task::Connect { port: 48231 }).unwrap();
+    session.pdm.finish(id, Ok(Outcome::Connected { port: 48231, versions: vec![] })).unwrap();
+}
+
+#[test]
+fn feedback_connection_disconnect_keeps_dirty_design_and_existing_checkout_protection() {
+    let mut session = Session::default();
+    session.pdm.set_available(true).unwrap();
+    let mut state = managed_snapshot("/workspace/owned.solidcraft", "a", true);
+    state.local.push(LocalEntry {
+        document: "archived".into(),
+        path: "/workspace/archived.solidcraft".into(),
+        relative_path: "archived.solidcraft".into(),
+        base_version: 1,
+        sha256: "ab".repeat(32),
+        checked_out: false,
+        modified: false,
+        present: true,
+    });
+    let id = session.pdm.enqueue(Task::Connect { port: 48231 }).unwrap();
+    session.pdm.finish(id, Ok(Outcome::Managed { port: 48231, state })).unwrap();
+    session.execute("solid.box", &json!({"length":1,"width":2,"height":3})).unwrap();
+    let dirty = session.doc.clone();
+    assert!(session.is_dirty());
+    let id = session.execute("pdm.disconnect", &json!({})).unwrap()["request"].as_u64().unwrap();
+    assert!(matches!(session.pdm.take_job().unwrap().unwrap().task, Task::Disconnect));
+    session.pdm.finish(id, Ok(Outcome::Disconnected)).unwrap();
+    assert_eq!(*session.doc, *dirty);
+    assert!(session.is_dirty());
+    assert!(session.pdm.managed_for_path("/workspace/owned.solidcraft").unwrap().checked_out);
+    assert!(session.pdm.may_save("/workspace/owned.solidcraft").is_ok());
+    assert!(session.pdm.may_save("/workspace/archived.solidcraft").is_err());
+    let id = session.pdm.enqueue(Task::Connect { port: 48231 }).unwrap();
+    session.pdm.finish(id, Ok(Outcome::Connected { port: 48231, versions: vec![] })).unwrap();
+    let id = session.pdm.enqueue(Task::Managed(ManagedTask::ListConnections)).unwrap();
+    session.pdm.finish(id, Ok(Outcome::Connections(vec![]))).unwrap();
+    let id = session.pdm.enqueue(Task::Managed(ManagedTask::RecoverConnection { connection_id: "a".repeat(64) })).unwrap();
+    session.pdm.finish(id, Err(Failure { message: "Explicit recovery not performed in this fixture".into(), disconnect: false })).unwrap();
+}
+
+fn autosave_status(checked_out: bool) -> Status {
+    let mut status = policy_status();
+    status.managed.local[0].base_version = 2;
+    status.managed.local[0].checked_out = checked_out;
+    if checked_out {
+        status.managed.catalog[0].checkout =
+            Some(Checkout { owner: "alice".into(), workspace: "a".into(), machine: "desktop".into(), checked_out_unix_ms: 1, base_version: Some(2) });
+    }
+    status
+}
+
+#[test]
+fn autosave_archive_policy_allows_dirty_owned_working_copy_but_never_wrong_target() {
+    let status = autosave_status(true);
+    assert_eq!(status.action_unavailable("pdm.archive", Some("part"), Some("/workspace/part.solidcraft"), true, false, None), None);
+    assert!(status.action_unavailable("pdm.archive", Some("part"), Some("/workspace/other.solidcraft"), true, false, None).is_some());
+    assert!(status.action_unavailable("pdm.archive", Some("part"), Some("/workspace/part.solidcraft"), true, true, None).is_some());
+    assert!(status.action_unavailable("pdm.archive", Some("part"), None, true, false, None).is_some());
+}
+
+#[test]
+fn autosave_archive_raw_handler_refuses_unsaved_memory_without_queueing_saved_disk_bytes() {
+    let temp = EpochTemp::new("archive-memory");
+    let path = temp.0.join("part.solidcraft");
+    let mut session = Session::default();
+    session.execute("file.save", &json!({"path":path})).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    session.pdm.set_available(true).unwrap();
+    let mut status = autosave_status(true);
+    status.managed.local[0].path = path.to_string_lossy().into_owned();
+    let id = session.pdm.enqueue(Task::Connect { port: 48231 }).unwrap();
+    session.pdm.finish(id, Ok(Outcome::Managed { port: 48231, state: status.managed })).unwrap();
+    session.execute("solid.box", &json!({"length":4,"width":5,"height":6})).unwrap();
+    let memory = session.doc.clone();
+    assert!(session.execute("pdm.archive", &json!({"document":"part"})).is_err());
+    assert!(session.pdm.take_job().unwrap().is_none());
+    assert_eq!(*session.doc, *memory);
+    assert!(session.is_dirty());
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn autosave_checkout_policy_preserves_dirty_memory_only_at_the_current_matching_base() {
+    let mut status = autosave_status(false);
+    let path = Some("/workspace/part.solidcraft");
+    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), path, true, false, None), None);
+    assert!(status.action_unavailable("pdm.checkout", Some("part"), Some("/workspace/other.solidcraft"), true, false, None).is_some());
+    status.managed.local[0].modified = true;
+    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), path, true, false, None), Some("ui.pdm_reason_modified"));
+    status.managed.local[0].modified = false;
+    status.managed.local[0].base_version = 1;
+    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), path, true, false, None), Some("ui.pdm_reason_stale_base"));
+    status.managed.local[0].base_version = 2;
+    status.managed.catalog[0].checkout =
+        Some(Checkout { owner: "bob".into(), workspace: "b".into(), machine: "desktop".into(), checked_out_unix_ms: 1, base_version: Some(2) });
+    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), path, true, false, None), Some("ui.pdm_reason_checked_out_other"));
+}
+
+#[test]
+fn discard_checkout_dirty_owned_copy_requires_explicit_acknowledgement_before_queue() {
+    let mut session = Session::default();
+    session.pdm.set_available(true).unwrap();
+    let status = autosave_status(true);
+    let id = session.pdm.enqueue(Task::Connect { port: 48231 }).unwrap();
+    session.pdm.finish(id, Ok(Outcome::Managed { port: 48231, state: status.managed })).unwrap();
+    session.path = Some("/workspace/part.solidcraft".into());
+    session.execute("solid.box", &json!({"length":4,"width":5,"height":6})).unwrap();
+    let memory = session.doc.clone();
+    assert!(session.execute("pdm.cancel_checkout", &json!({"document":"part"})).is_err());
+    assert!(session.pdm.take_job().unwrap().is_none());
+    assert_eq!(
+        session.pdm.status().unwrap().action_unavailable("pdm.cancel_checkout", Some("part"), session.path.as_deref(), true, false, None),
+        None
+    );
+    let id = session.execute("pdm.cancel_checkout", &json!({"document":"part","discard":true})).unwrap()["request"].as_u64().unwrap();
+    assert!(
+        matches!(session.pdm.take_job().unwrap().unwrap().task, Task::Managed(ManagedTask::CancelCheckout { document: Some(document), .. }) if document == "part")
+    );
+    assert_eq!(*session.doc, *memory, "RAM remains intact until the explicitly confirmed native operation succeeds");
+    assert!(session.is_dirty());
+    session.pdm.finish(id, Err(Failure { message: "Offline; checkout was not released".into(), disconnect: false })).unwrap();
+    assert_eq!(*session.doc, *memory);
+    assert!(session.is_dirty());
+    let id = session.execute("pdm.cancel_checkout", &json!({"document":"part","discard":true})).unwrap()["request"].as_u64().unwrap();
+    session.pdm.finish(id, Err(Failure { message: "Server still unavailable; no completion".into(), disconnect: false })).unwrap();
+    assert_eq!(*session.doc, *memory);
+}
+
+fn autosave_editor_with_status(status: Status) -> Session {
+    let mut session = Session::default();
+    session.pdm.set_available(true).unwrap();
+    let id = session.pdm.enqueue(Task::Connect { port: 48231 }).unwrap();
+    session
+        .pdm
+        .finish(id, Ok(Outcome::ManagedConnected { port: 48231, state: status.managed, connections: vec![], connection: status.connection.unwrap() }))
+        .unwrap();
+    session.path = Some("/workspace/part.solidcraft".into());
+    session.execute("solid.box", &json!({"length":4,"width":5,"height":6})).unwrap();
+    session
+}
+
+#[test]
+fn autosave_checkout_handler_queues_exact_base_without_replacing_or_saving_unsaved_memory() {
+    let mut session = autosave_editor_with_status(autosave_status(false));
+    let memory = session.doc.clone();
+    let id = session.execute("pdm.checkout", &json!({"document":"part"})).unwrap()["request"].as_u64().unwrap();
+    assert!(
+        matches!(session.pdm.take_job().unwrap().unwrap().task, Task::Managed(ManagedTask::CheckoutPreservingMemory { document, path, expected_base: 2 }) if document == "part" && path == "/workspace/part.solidcraft")
+    );
+    assert!(session.pdm.blocks_path("/workspace/part.solidcraft"));
+    assert!(session.pdm.may_save("/workspace/part.solidcraft").is_err());
+    assert!(session.execute("solid.box", &json!({"length":1,"width":1,"height":1})).is_err());
+    assert_eq!(*session.doc, *memory);
+    assert!(session.is_dirty());
+    session.pdm.finish(id, Err(Failure { message: "Checkout was not confirmed".into(), disconnect: false })).unwrap();
+    assert_eq!(*session.doc, *memory);
+    assert!(session.is_dirty());
+}
+
+#[test]
+fn autosave_checkout_handler_rejects_stale_other_owner_missing_and_offline_targets() {
+    for case in ["stale", "owner", "missing", "disk", "path", "offline"] {
+        let mut status = autosave_status(false);
+        match case {
+            "stale" => status.managed.local[0].base_version = 1,
+            "owner" => {
+                status.managed.catalog[0].checkout = Some(Checkout {
+                    owner: "bob".into(),
+                    workspace: "b".into(),
+                    machine: "other".into(),
+                    checked_out_unix_ms: 1,
+                    base_version: Some(2),
+                })
+            }
+            "missing" => status.managed.local[0].present = false,
+            "disk" => status.managed.local[0].modified = true,
+            _ => {}
+        }
+        let mut session = autosave_editor_with_status(status);
+        if case == "path" {
+            session.path = Some("/workspace/other.solidcraft".into());
+        }
+        if case == "offline" {
+            let id = session.pdm.enqueue(Task::Refresh).unwrap();
+            session.pdm.finish(id, Err(Failure { message: "Connection closed".into(), disconnect: true })).unwrap();
+        }
+        let memory = session.doc.clone();
+        assert!(session.execute("pdm.checkout", &json!({"document":"part"})).is_err(), "{case}");
+        assert!(session.pdm.take_job().unwrap().is_none());
+        assert_eq!(*session.doc, *memory);
+        assert!(session.is_dirty());
+    }
+}
+
+#[test]
+fn autosave_checkout_preserving_memory_runtime_cannot_bypass_expected_base_or_recovery_fence() {
+    let mut session = autosave_editor_with_status(autosave_status(false));
+    assert!(
+        session
+            .pdm
+            .enqueue(Task::Managed(ManagedTask::CheckoutPreservingMemory {
+                document: "part".into(),
+                path: "/workspace/part.solidcraft".into(),
+                expected_base: 1
+            }))
+            .is_err()
+    );
+    assert!(session.pdm.take_job().unwrap().is_none());
+    let id = session.pdm.enqueue(Task::Managed(ManagedTask::RecoverConnection { connection_id: "a".repeat(64) })).unwrap();
+    session.pdm.finish(id, Ok(Outcome::ManagedRefreshed { port: 48231, state: autosave_status(false).managed })).unwrap();
+    assert!(session.check_pdm_reopen().is_err());
+    assert!(session.execute("pdm.checkout", &json!({"document":"part"})).is_err());
+    assert!(session.pdm.take_job().unwrap().is_none());
+}
+
+#[test]
+fn discard_checkout_policy_allows_owned_retry_but_never_other_owner_or_disconnected_discard() {
+    let mut status = autosave_status(true);
+    status.error = Some("Previous server response was not confirmed".into());
+    assert_eq!(status.action_unavailable("pdm.cancel_checkout", Some("part"), Some("/workspace/part.solidcraft"), true, false, None), None);
+    assert_eq!(status.action_unavailable("pdm.cancel_checkout", Some("part"), Some("/workspace/other.solidcraft"), true, false, None), None);
+    status.managed.catalog[0].checkout.as_mut().unwrap().owner = "bob".into();
+    assert_eq!(
+        status.action_unavailable("pdm.cancel_checkout", Some("part"), Some("/workspace/part.solidcraft"), true, false, None),
+        Some("ui.pdm_reason_checked_out_other")
+    );
+    status.managed.catalog[0].checkout.as_mut().unwrap().owner = "alice".into();
+    status.port = None;
+    assert_eq!(
+        status.action_unavailable("pdm.cancel_checkout", Some("part"), Some("/workspace/part.solidcraft"), true, false, None),
+        Some("ui.pdm_reason_disconnected")
+    );
+}
+
+#[test]
+fn discard_checkout_explicit_selected_document_keeps_unrelated_active_dirty_memory() {
+    let mut session = autosave_editor_with_status(autosave_status(true));
+    session.path = Some("/workspace/other.solidcraft".into());
+    let active_memory = session.doc.clone();
+    assert!(session.is_dirty());
+    assert_eq!(
+        session.pdm.status().unwrap().action_unavailable("pdm.cancel_checkout", Some("part"), session.path.as_deref(), true, false, None),
+        None
+    );
+    let id = session.execute("pdm.cancel_checkout", &json!({"document":"part","discard":true})).unwrap()["request"].as_u64().unwrap();
+    assert!(
+        matches!(session.pdm.take_job().unwrap().unwrap().task, Task::Managed(ManagedTask::CancelCheckout { document: Some(document), path: Some(path) }) if document == "part" && path == "/workspace/part.solidcraft")
+    );
+    assert_eq!(session.path.as_deref(), Some("/workspace/other.solidcraft"));
+    assert_eq!(*session.doc, *active_memory);
+    assert!(session.is_dirty());
+    session.pdm.finish(id, Ok(Outcome::Managed { port: 48231, state: autosave_status(false).managed })).unwrap();
+    assert_eq!(*session.doc, *active_memory);
+    assert_eq!(session.path.as_deref(), Some("/workspace/other.solidcraft"));
+    assert!(session.is_dirty());
+}
+
+#[test]
+fn opt_in_ordinary_saved_editor_survives_recovery_of_managed_files_in_the_same_folder() {
+    for success in [false, true] {
+        let temp = EpochTemp::new("ordinary-opt-in");
+        let managed_path = temp.0.join("managed.solidcraft");
+        let ordinary_path = temp.0.join("ordinary.solidcraft");
+        let managed = epoch_editor(&managed_path);
+        let mut ordinary = Session { pdm: managed.pdm.clone(), ..Default::default() };
+        ordinary.execute("file.save", &json!({"path":ordinary_path})).unwrap();
+        let old_epoch = ordinary.pdm_recovery_epoch;
+        let captured = ordinary.pdm.begin_pdm_reload().unwrap();
+        let mut ordinary_candidate = Session::new(solidcraft_io::read_design(&std::fs::read(&ordinary_path).unwrap()).unwrap());
+        ordinary_candidate.path = ordinary.path.clone();
+        ordinary_candidate.pdm = ordinary.pdm.clone();
+        let id = managed.pdm.enqueue(Task::Managed(ManagedTask::RecoverConnection { connection_id: "a".repeat(64) })).unwrap();
+        // Until opaque native preflight identifies the affected paths, repair
+        // intentionally serializes file IO. This is temporary, not opt-in state.
+        assert!(managed.pdm.blocks_path(managed_path.to_str().unwrap()));
+        assert!(ordinary.pdm.blocks_path(ordinary_path.to_str().unwrap()));
+        assert!(ordinary_candidate.mark_pdm_reloaded_from(captured).is_err());
+        let result = if success {
+            Ok(Outcome::ManagedRefreshed { port: 48231, state: managed_snapshot(managed_path.to_str().unwrap(), "workspace", true) })
+        } else {
+            Err(Failure { message: "Managed recovery did not complete".into(), disconnect: false })
+        };
+        managed.pdm.finish(id, result).unwrap();
+        assert!(managed.check_pdm_reopen().is_err());
+        assert!(ordinary.check_pdm_reopen().is_ok());
+        assert!(ordinary_candidate.mark_pdm_reloaded_from(captured).is_ok(), "unrelated completed recovery must not invalidate ordinary file IO");
+        ordinary.execute("solid.box", &json!({"length":2,"width":3,"height":4})).unwrap();
+        ordinary.execute("file.save", &json!({})).unwrap();
+        assert_eq!(ordinary.pdm_recovery_epoch, old_epoch, "ordinary editing does not need a PDM reload stamp");
+        assert_eq!(solidcraft_io::read_design(&std::fs::read(&ordinary_path).unwrap()).unwrap(), *ordinary.doc);
+        assert!(ordinary.pdm.managed_for_path(ordinary_path.to_str().unwrap()).is_none());
+        assert!(!ordinary.pdm_read_only);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn opt_in_managed_and_historical_hardlink_aliases_keep_recovery_fences() {
+    let temp = EpochTemp::new("scoped-aliases");
+    let managed_path = temp.0.join("managed.solidcraft");
+    let alias_path = temp.0.join("alias.solidcraft");
+    let history_path = temp.0.join("history.solidcraft");
+    let managed = epoch_editor(&managed_path);
+    std::fs::hard_link(&managed_path, &alias_path).unwrap();
+    let mut alias = Session { pdm: managed.pdm.clone(), ..Default::default() };
+    alias.execute("doc.open", &json!({"path":alias_path})).unwrap();
+    let mut historical = Session::default();
+    historical.execute("file.save", &json!({"path":history_path})).unwrap();
+    historical.pdm = managed.pdm.clone();
+    let mut state = managed_snapshot(managed_path.to_str().unwrap(), "workspace", true);
+    state.historical_paths.push(history_path.to_string_lossy().into_owned());
+    let refresh = managed.pdm.enqueue(Task::Refresh).unwrap();
+    managed.pdm.finish(refresh, Ok(Outcome::ManagedRefreshed { port: 48231, state })).unwrap();
+    let captured = managed.pdm.begin_pdm_reload().unwrap();
+    let id = managed.pdm.enqueue(Task::Managed(ManagedTask::RecoverConnection { connection_id: "a".repeat(64) })).unwrap();
+    assert!(managed.pdm.blocks_path(alias_path.to_str().unwrap()));
+    assert!(managed.pdm.blocks_path(history_path.to_str().unwrap()));
+    assert!(alias.mark_pdm_reloaded_from(captured).is_err());
+    assert!(historical.mark_pdm_reloaded_from(captured).is_err());
+    assert!(managed.pdm.may_save(alias_path.to_str().unwrap()).is_err());
+    managed.pdm.finish(id, Err(Failure { message: "Recovery interrupted".into(), disconnect: false })).unwrap();
+    assert!(alias.check_pdm_reopen().is_err());
+    assert!(historical.check_pdm_reopen().is_err());
+    assert!(alias.execute("file.save", &json!({})).is_err());
+    assert!(historical.execute("file.save", &json!({})).is_err());
 }

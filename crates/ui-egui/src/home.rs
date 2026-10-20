@@ -459,8 +459,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                 ui.label(RichText::new(crate::i18n::tr_label("Start")).size(16.0).color(t.text_dim));
             });
             ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                let big = |ui: &mut egui::Ui, icon: &str, label: &str, primary: bool| -> bool {
+            ui.horizontal_wrapped(|ui| {
+                let big = |ui: &mut egui::Ui, icon: &str, label: &str, primary: bool, handle: &str| -> bool {
                     // The label sets the width: a translation longer than the English one widens
                     // the button instead of running past its edge.
                     let ink_text = if primary { Color32::WHITE } else { t.text };
@@ -485,13 +485,14 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                         ink,
                     );
                     ui.painter().galley(r.left_center() + vec2(56.0, -galley.size().y / 2.0), galley, ink_text);
+                    crate::scenario::publish_handle(handle, r.center());
                     resp.clicked()
                 };
-                if big(ui, "new", app.tr("ui.new_design"), true) {
+                if big(ui, "new", app.tr("ui.new_design"), true, "home:new") {
                     action = Some(Box::new(|app: &mut SolveApp| crate::documents::new_design(app)));
                 }
                 ui.add_space(10.0);
-                if big(ui, "open", app.tr("home.open"), false) {
+                if big(ui, "open", app.tr("home.open"), false, "home:open") {
                     action = Some(Box::new(|app: &mut SolveApp| {
                         app.pick_open(|app, path| {
                             if let Some(path) = path {
@@ -499,6 +500,15 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                                 app.open_path_async(&path);
                             }
                         });
+                    }));
+                }
+                ui.add_space(10.0);
+                let pdm_icon = solidcraft_engine::find_command("pdm.panel").map_or("library", |command| command.icon);
+                if big(ui, pdm_icon, app.tr("ui.pdm_title"), false, "home:pdm") {
+                    action = Some(Box::new(|app: &mut SolveApp| {
+                        if let Err(error) = crate::pdm_panel::enter(app) {
+                            app.set_status(error, true);
+                        }
                     }));
                 }
             });

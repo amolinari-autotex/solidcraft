@@ -718,6 +718,35 @@ mod tests {
         original.execute("solid.box", &json!({"length":10,"width":20,"height":3})).unwrap();
         original.path = Some("original.solidcraft".into());
         original.pdm.set_available(true).unwrap();
+        let local = ["original", "replacement"]
+            .into_iter()
+            .map(|document| crate::pdm::LocalEntry {
+                document: document.into(),
+                path: format!("{document}.solidcraft"),
+                relative_path: format!("{document}.solidcraft"),
+                base_version: 1,
+                sha256: "ab".repeat(32),
+                checked_out: true,
+                modified: false,
+                present: true,
+            })
+            .collect();
+        let connected = original.pdm.enqueue(crate::pdm::Task::Connect { port: 48231 }).unwrap();
+        original
+            .pdm
+            .finish(
+                connected,
+                Ok(crate::pdm::Outcome::Managed {
+                    port: 48231,
+                    state: crate::pdm::ManagedState {
+                        server_id: Some("race-server".into()),
+                        workspace: Some("race-workspace".into()),
+                        local,
+                        ..Default::default()
+                    },
+                }),
+            )
+            .unwrap();
         let captured_before_read = original.pdm.begin_pdm_reload().unwrap();
         let loaded_doc = solidcraft_io::read_design(&solidcraft_io::write_design(&Session::default().doc)).unwrap();
         let candidate = Session::new(loaded_doc);

@@ -11,6 +11,8 @@ use crate::SolveApp;
 /// A save being written on a worker thread.
 pub struct Saving {
     command: &'static str,
+    stamp: crate::documents::EditorStamp,
+    archive: Option<Value>,
     done: std::sync::mpsc::Receiver<(Session, Result<Value, String>)>,
 }
 
@@ -18,8 +20,18 @@ pub struct Saving {
 /// taken up by [`tick`] (true: it is under way); in the browser, or when no thread can start, it
 /// runs here and is finished on return (false).
 pub fn start(app: &mut SolveApp, command: &'static str, params: Value) -> bool {
+    start_with(app, command, params, None).unwrap_or(false)
+}
+
+pub(crate) fn archive(app: &mut SolveApp, params: Value) -> Result<Value, String> {
+    let pending = start_with(app, "file.save", serde_json::json!({}), Some(params))?;
+    Ok(serde_json::json!({"saving":pending,"pending":pending}))
+}
+
+fn start_with(app: &mut SolveApp, command: &'static str, params: Value, archive: Option<Value>) -> Result<bool, String> {
     #[cfg(not(target_arch = "wasm32"))]
     if app.saving.is_none() && app.file_picker.is_none() && !app.file_load.busy() {
+        let stamp = crate::documents::EditorStamp::active(app)?;
         let mut copy = app.session.scratch();
         // The copy has no file: the command saves to this session's (and names the design after it).
         copy.path.clone_from(&app.session.path);
@@ -35,13 +47,16 @@ pub fn start(app: &mut SolveApp, command: &'static str, params: Value) -> bool {
             let _ = tx.send((copy, r));
         });
         if job.is_ok() {
-            app.saving = Some(Saving { command, done: rx });
-            return true;
+            app.saving = Some(Saving { command, done: rx, stamp, archive });
+            return Ok(true);
         }
         // No thread to write on: save here, as before.
     }
-    let _ = app.run(command, params);
-    false
+    app.run(command, params)?;
+    if let Some(params) = archive {
+        app.run("pdm.archive", params)?;
+    }
+    Ok(false)
 }
 
 /// Take up a finished save (`wait`: wait for a running one).
@@ -56,8 +71,9 @@ pub fn tick(app: &mut SolveApp, wait: bool) {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
         }
     };
-    let Some(Saving { command, .. }) = app.saving.take() else { return };
+    let Some(Saving { command, stamp, archive, .. }) = app.saving.take() else { return };
     let r = match outcome {
+        Some((_, Ok(_))) if !stamp.matches_active(app) => Err("The editor changed while saving; check in was not started".into()),
         Some((copy, Ok(v))) => {
             app.session.adopt_save(&copy);
             app.session.pdm_read_only = copy.pdm_read_only;
@@ -68,6 +84,15 @@ pub fn tick(app: &mut SolveApp, wait: bool) {
         None => Err(format!("{command}: the save stopped")),
     };
     app.finish_command(command, &r);
+    if let Some(params) = archive {
+        let result = match &r {
+            Ok(_) => app.run("pdm.archive", params.clone()).map(|_| ()),
+            Err(error) => Err(error.clone()),
+        };
+        if let Err(error) = result {
+            crate::pdm_panel::archive_save_failed(app, &params, error);
+        }
+    }
     crate::documents::saved_for_close(app);
 }
 
@@ -135,6 +160,12 @@ mod tests {
     fn connect(h: &mut crate::scenario::Harness, state: solidcraft_engine::pdm::ManagedState) {
         use solidcraft_engine::pdm::{Outcome, Task};
         h.app.pdm.runtime.set_available(true).unwrap();
+        if h.app.pdm.runtime.status().unwrap().port.is_some() {
+            // Reconnect fixtures follow the same explicit disconnect as users,
+            // while the runtime retains the protected destination ledger.
+            let id = h.app.pdm.runtime.enqueue(Task::Disconnect).unwrap();
+            h.app.pdm.runtime.finish(id, Ok(Outcome::Disconnected)).unwrap();
+        }
         let id = h.app.pdm.runtime.enqueue(Task::Connect { port: 48231 }).unwrap();
         h.app.pdm.runtime.finish(id, Ok(Outcome::Managed { port: 48231, state })).unwrap();
         h.app.session.pdm = h.app.pdm.runtime.clone();

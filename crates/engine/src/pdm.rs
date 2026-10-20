@@ -162,6 +162,12 @@ pub enum ManagedTask {
         document: Option<String>,
         path: Option<String>,
     },
+    /// Keep unsaved RAM only at the installed base confirmed by native authority.
+    CheckoutPreservingMemory {
+        document: String,
+        path: String,
+        expected_base: u64,
+    },
     CancelCheckout {
         document: Option<String>,
         path: Option<String>,
@@ -310,10 +316,16 @@ impl Status {
         if self.busy.is_some() {
             return Some("ui.pdm_reason_busy");
         }
-        if matches!(
-            command,
-            "pdm.connections" | "pdm.setup.create" | "pdm.connection.open" | "pdm.connect" | "pdm.connection.recover" | "pdm.recover_workspace"
-        ) {
+        if matches!(command, "pdm.connect" | "pdm.connection.open" | "pdm.setup.create") {
+            return if self.port.is_some() {
+                Some("ui.pdm_connected")
+            } else if !self.available {
+                Some("ui.pdm_reason_unavailable")
+            } else {
+                None
+            };
+        }
+        if matches!(command, "pdm.connections" | "pdm.connection.recover" | "pdm.recover_workspace") {
             return None;
         }
         if !self.available || self.port.is_none() {
@@ -327,14 +339,14 @@ impl Status {
         if writes && self.connection.as_ref().is_some_and(|connection| connection.role.eq_ignore_ascii_case("viewer")) {
             return Some("ui.pdm_reason_viewer");
         }
-        if writes && self.error.is_some() {
+        if writes && command != "pdm.cancel_checkout" && self.error.is_some() {
             return Some("ui.pdm_reason_refresh_required");
         }
         if historical && matches!(command, "pdm.archive" | "pdm.check_in") {
             return Some("ui.pdm_reason_historical");
         }
         if command == "pdm.archive" {
-            if path.is_none() || dirty {
+            if path.is_none() {
                 return Some("ui.pdm_reason_save_first");
             }
             if let (Some(root), Some(path)) = (self.managed.root.as_deref(), path) {
@@ -377,16 +389,27 @@ impl Status {
                 if remote.checkout.is_some() {
                     return Some(self.lock_reason(remote, local));
                 }
-                if dirty || local.is_some_and(|local| local.modified) {
+                if local.is_some_and(|local| local.modified) {
                     return Some("ui.pdm_reason_modified");
+                }
+                if dirty {
+                    if local.is_none_or(|local| path.is_none_or(|path| cached_path_key(path) != cached_path_key(&local.path))) {
+                        return Some("ui.pdm_reason_open_selected");
+                    }
+                    if local.is_none_or(|local| !local.present || Some(local.base_version) != remote.head) {
+                        return Some("ui.pdm_reason_stale_base");
+                    }
                 }
             }
             "pdm.cancel_checkout" => {
                 if !self.owns_here(remote, local) && !self.recoverable_here(remote, local) {
                     return Some(if remote.checkout.is_some() { self.lock_reason(remote, local) } else { "ui.pdm_reason_checkout_required" });
                 }
-                if dirty {
-                    return Some("ui.pdm_reason_save_first");
+                if dirty
+                    && document.is_none()
+                    && local.is_some_and(|local| path.is_none_or(|path| cached_path_key(path) != cached_path_key(&local.path)))
+                {
+                    return Some("ui.pdm_reason_open_selected");
                 }
             }
             "pdm.get_latest" | "pdm.restore_version" => {
@@ -475,6 +498,14 @@ const MAX_PROTECTED_PATHS: usize = 8192;
 const MAX_PROTECTED_PATH_BYTES: usize = 4096;
 
 impl State {
+    /// Membership in the bounded native path ledger, including filesystem aliases.
+    fn protects_path(&self, path: &str) -> bool {
+        let key = cached_path_key(path);
+        self.known_paths.contains_key(&key)
+            || self.historical_paths.contains_key(&key)
+            || self.known_paths.values().any(|known| same_file_path(&known.entry.path, path))
+            || self.historical_paths.values().any(|historical| same_file_path(historical, path))
+    }
     fn remember(&mut self, managed: &ManagedState) -> Result<(), String> {
         let additions = managed.local.len().saturating_add(managed.historical_paths.len());
         if additions > MAX_PROTECTED_PATHS {
@@ -605,9 +636,15 @@ impl Runtime {
         }
         Ok(state.recovery_epoch)
     }
-    /// Saved editors are fenced individually. An unnamed design has no disk state.
+    /// Recovery fences registered managed/historical editors individually. Ordinary
+    /// files remain independent after recovery; opaque repair temporarily serializes IO.
     pub fn requires_reopen(&self, epoch: u64, path: Option<&str>) -> bool {
-        path.is_some() && self.0.lock().map_or(true, |state| state.protection_failed || state.recovery_epoch != epoch)
+        path.is_some_and(|path| {
+            self.0.lock().map_or(true, |state| {
+                state.protection_failed
+                    || (state.recovery_epoch != epoch && ((state.status.blocking && state.block_all_paths) || state.protects_path(path)))
+            })
+        })
     }
     /// Capture BEFORE fresh file I/O. Reuse this exact token after the read,
     /// including across asynchronous native work; never sample after reading.
@@ -621,13 +658,16 @@ impl Runtime {
         }
         Ok(state.recovery_epoch)
     }
-    fn validate_reload_epoch(&self, expected: u64) -> Result<(), String> {
+    fn validate_reload_epoch(&self, expected: u64, path: Option<&str>) -> Result<(), String> {
         let state = self.0.lock().map_err(|_| "PDM recovery protection unavailable")?;
-        if state.protection_failed || state.recovery_epoch != expected {
+        if state.protection_failed {
             return Err("PDM recovery changed files while loading; reopen this design again".into());
         }
         if state.status.blocking && state.block_all_paths {
             return Err("Wait for PDM recovery before reopening this design".into());
+        }
+        if state.recovery_epoch != expected && path.is_some_and(|path| state.protects_path(path)) {
+            return Err("PDM recovery changed files while loading; reopen this design again".into());
         }
         Ok(())
     }
@@ -666,10 +706,21 @@ impl Runtime {
             return Err("Connect to a local PDM service first".into());
         }
         let action = match &task {
+            Task::Connect { .. } | Task::Managed(ManagedTask::Connect { .. }) => Some(("pdm.connect", None, None, None)),
+            Task::Managed(ManagedTask::OpenConnection { .. }) => Some(("pdm.connection.open", None, None, None)),
+            Task::Managed(ManagedTask::CreateLocal { .. }) => Some(("pdm.setup.create", None, None, None)),
             Task::Managed(ManagedTask::Archive { path, .. } | ManagedTask::ReconcileArchive { path, .. }) => {
                 Some(("pdm.archive", None, Some(path.as_str()), None))
             }
             Task::Managed(ManagedTask::Checkout { document, path }) => Some(("pdm.checkout", document.as_deref(), path.as_deref(), None)),
+            Task::Managed(ManagedTask::CheckoutPreservingMemory { document, path, expected_base }) => {
+                if !state.status.managed.local.iter().any(|local| {
+                    local.document == *document && cached_path_key(&local.path) == cached_path_key(path) && local.base_version == *expected_base
+                }) {
+                    return Err("ui.pdm_reason_stale_base".into());
+                }
+                Some(("pdm.checkout", Some(document.as_str()), Some(path.as_str()), None))
+            }
             Task::Managed(ManagedTask::CancelCheckout { document, path }) => {
                 Some(("pdm.cancel_checkout", document.as_deref(), path.as_deref(), None))
             }
@@ -684,7 +735,14 @@ impl Runtime {
             policy_status.error = None;
         }
         if let Some((command, document, path, version)) = action
-            && let Some(reason) = policy_status.action_unavailable(command, document, path, false, false, version)
+            && let Some(reason) = policy_status.action_unavailable(
+                command,
+                document,
+                path,
+                matches!(&task, Task::Managed(ManagedTask::CheckoutPreservingMemory { .. })),
+                false,
+                version,
+            )
         {
             // A lost restore acknowledgement is reconciled against the native
             // durable receipt before any new checkout/publication. Cached lock or
@@ -723,7 +781,11 @@ impl Runtime {
         state.next = state.next.checked_add(1).ok_or("Local PDM request limit reached")?;
         let id = state.next;
         state.blocked_paths = state.status.managed.local.iter().map(|entry| entry.path.clone()).collect();
-        if let Task::Managed(ManagedTask::Archive { path, .. } | ManagedTask::ReconcileArchive { path, .. }) | Task::CheckIn { path, .. } = &task {
+        if let Task::Managed(
+            ManagedTask::Archive { path, .. } | ManagedTask::ReconcileArchive { path, .. } | ManagedTask::CheckoutPreservingMemory { path, .. },
+        )
+        | Task::CheckIn { path, .. } = &task
+        {
             state.blocked_paths.push(path.clone());
         }
         // A connection ID keeps native paths out of commands. Until native
@@ -738,6 +800,7 @@ impl Runtime {
                         ManagedTask::Archive { .. }
                             | ManagedTask::ReconcileArchive { .. }
                             | ManagedTask::Checkout { .. }
+                            | ManagedTask::CheckoutPreservingMemory { .. }
                             | ManagedTask::CancelCheckout { .. }
                             | ManagedTask::GetLatest { .. }
                             | ManagedTask::Open { .. }
@@ -910,7 +973,7 @@ impl crate::Session {
     /// Trusted fresh-I/O/replacement boundary only, with the token captured BEFORE
     /// I/O. Never call for a cached tab or per-frame shared-runtime binding.
     pub fn mark_pdm_reloaded_from(&mut self, expected_epoch: u64) -> Result<(), String> {
-        self.pdm.validate_reload_epoch(expected_epoch)?;
+        self.pdm.validate_reload_epoch(expected_epoch, self.path.as_deref())?;
         self.pdm_recovery_epoch = expected_epoch;
         Ok(())
     }

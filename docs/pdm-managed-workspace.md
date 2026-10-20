@@ -69,7 +69,7 @@ when a caller bypasses a disabled button.
 | No file selected | Disabled | Only explicit first publication of a saved unmanaged active design | Disabled | Disabled |
 | Unmanaged saved native design inside the working folder | Disabled | Explicit first publication | Disabled | Disabled |
 | Archived, clean and current | Enabled for a writable role | Disabled; checkout required | Disabled | Disabled when the required graph is current |
-| Authenticated checkout here, matching workspace and base | Disabled; already extracted | Enabled after saving memory edits | Enabled with explicit discard confirmation | Disabled |
+| Authenticated checkout here, matching workspace and base | Disabled; already extracted | Enabled; pending memory edits are saved before publication | Enabled with explicit discard confirmation | Disabled |
 | Verified checkout here whose download failed before manifest installation | Disabled | Disabled | Release only, with explicit no-local-file-replacement confirmation | Disabled |
 | Checkout in another workspace/device, or owned by someone else | Disabled with owner/workspace explanation | Disabled | Disabled | Disabled |
 | Locally modified without valid checkout, or stale base | Disabled with reconciliation guidance | Disabled | Only an authentic owned checkout can be released | Disabled until local changes are preserved |
@@ -101,6 +101,53 @@ a bounded cache keys them by immutable document/version/hash. Missing previews
 remain explicit. A captured operation target keeps success/error feedback tied
 to the file acted on, even if selection changes before the response. Background
 refreshes and previews do not replace the last user-operation result.
+
+The central list groups immediate subfolders before immediate files, including
+when filtering by name. A folder selection clears file/version actions; double
+click enters it and synchronizes the tree and breadcrumb. Double-clicking a file
+uses the guarded normal working-copy Open command, without acquiring a checkout.
+Only a successful load activates its existing or new document tab and enters
+DESIGN. History sorts by numeric version descending; selection and restore
+confirmation retain the exact document/version identity when a new head arrives.
+
+The PDM ribbon places original large icons above their labels in whole clickable
+buttons, with horizontal scrolling when necessary. Connect is disabled while
+pending or already connected; Disconnect is separate. The engine also rejects
+duplicate connection mutations. A failed operation that retains its verified
+connection does not enable Connect; a real disconnection permits reconnecting.
+
+PDM is optional. A clean native startup constructs only an inert callback and
+controller: it does not start a PDM worker/service, inspect an archive, read OS
+credentials, log in, or make PDM network requests. The document tab appears only
+after an explicit choice of PDM from Home or the workspace selector. Standard
+local designs can be edited, saved and reopened without configuring PDM. Saved
+connections are reopened only by an explicit action; the disposable trial launcher
+performs that action for its own separate profile. An active PDM connection polls
+status every ten seconds and keeps bounded metadata/thumbnail caches; disconnected
+startup does neither. Recovery fencing does not permanently affect unrelated
+ordinary editors. Explicit recovery temporarily serializes file operations while
+native authentication identifies the affected files; unavailable protection
+metadata still fails closed.
+
+PDM has one application tab next to Home and the document tabs. Home and the
+workspace selector both open that tab, including when no design is open. Returning
+to a document preserves its workspace, camera, in-memory edits and undo history.
+Closing the last document keeps the PDM browser and connection available; closing
+the PDM tab with the keyboard returns to Home.
+
+Archive automatically saves the active owned working copy before publishing.
+The continuation captures its document, native path, revision and connection;
+a failed save or changed editor cancels publication and preserves local work.
+Checkout can preserve current unsaved editor changes only after fresh base and
+on-disk checks prove the matching working copy. Undo Checkout requires an explicit
+discard confirmation for both unsaved memory and saved local changes. Declining
+preserves both; release errors retain a truthful reservation state for retry.
+
+The file context menu targets the clicked row and uses the same action policy:
+Open, Archive, Download Latest, Check Out, Undo Checkout, Go to Server Folder and
+Open Working Folder. Native folder opening validates the working-root boundary.
+Rename and Delete require separate server operations and reference-integrity
+rules; this increment does not offer those actions.
 
 Italian labels use Estrai, Archivia and Annulla estrazione; initial publication
 has its own label. Local Save remains distinct from publishing to the archive.
@@ -440,7 +487,7 @@ New reservations still require the user's explicit Check Out action.
 
 Workspace recovery repairs an interrupted local transaction after explicit
 confirmation and fresh authentication; recorded base hashes must match the
-bound server. It preserves replaced current bytes in recovery files. Every saved
+bound server. It preserves replaced current bytes in recovery files. Every managed saved
 editor sharing the runtime then requires a verified disk reopen before edits or
 writes to its original destination, even if recovery later fails or status is
 refreshed. Reopening one tab does not authorize another cached tab. A separate

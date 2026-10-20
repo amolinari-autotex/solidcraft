@@ -99,19 +99,25 @@ impl Host {
                 relative_path: entry.relative_path.clone(),
                 base_version: entry.base_version,
                 sha256: entry.base_sha256.clone(),
-                checked_out: entry.checked_out
-                    && self.grants.get(document).is_some_and(|grant| {
-                        catalog.entries.iter().any(|remote| {
-                            remote.document == *document
-                                && remote.head == Some(entry.base_version)
-                                && remote.checkout.as_ref().is_some_and(|checkout| {
-                                    checkout.workspace == ws.manifest().workspace_id
-                                        && checkout.machine == self.machine
-                                        && checkout.base_version == Some(entry.base_version)
-                                })
-                                && remote.checkout == grant.entry.checkout
-                        })
-                    }),
+                checked_out: self.grants.get(document).is_some_and(|grant| {
+                    catalog.entries.iter().any(|remote| {
+                        remote.document == *document
+                            && remote.head == Some(entry.base_version)
+                            && remote.checkout.as_ref().is_some_and(|checkout| {
+                                checkout.workspace == ws.manifest().workspace_id
+                                    && checkout.machine == self.machine
+                                    && checkout.base_version == Some(entry.base_version)
+                            })
+                            && remote.checkout == grant.entry.checkout
+                    }) && (entry.checked_out
+                        // A completed local discard can precede a failed server release.
+                        // Its read-only convenience flag must not hide the still-valid
+                        // reservation needed to retry cancellation. Confirm the exact
+                        // capability rather than inferring ownership from public metadata.
+                        || client
+                            .managed_resume_checkout(document.clone(), ws.manifest().workspace_id.clone(), self.machine.clone())
+                            .is_ok_and(|fresh| fresh == *grant))
+                }),
                 modified: actual.as_ref().is_ok_and(|hash| hash != &entry.base_sha256),
                 present: actual.is_ok(),
             });
@@ -481,6 +487,65 @@ impl Host {
                 self.grants.remove(&entry.document);
                 Some(entry.document)
             }
+            ManagedTask::CheckoutPreservingMemory { document, path, expected_base } => {
+                let local = ws
+                    .manifest()
+                    .documents
+                    .get(&document)
+                    .cloned()
+                    .ok_or_else(|| fail("Open an existing managed working copy before checking out in-memory changes"))?;
+                let working_path = ws.path(&document).map_err(error)?;
+                if expected_base == 0
+                    || local.checked_out
+                    || local.base_version != expected_base
+                    || !solidcraft_engine::pdm::same_file_path(&path, &working_path.to_string_lossy())
+                    || self.local_digest(&ws, &document)?.is_none_or(|actual| actual != local.base_sha256)
+                {
+                    return Err(fail("Checkout refused: the saved working copy changed; preserve in-memory changes and refresh its status"));
+                }
+                let remote = client
+                    .managed_catalog()
+                    .map_err(error)?
+                    .entries
+                    .into_iter()
+                    .find(|entry| entry.document == document)
+                    .ok_or_else(|| fail("The archived document is missing"))?;
+                if remote.checkout.is_some() {
+                    return Err(fail("This design is already checked out; refresh to see its owner and working folder"));
+                }
+                if remote.head != Some(expected_base) {
+                    return Err(fail("Checkout refused: a newer archived base exists; preserve in-memory changes before updating"));
+                }
+                let grant = client.managed_checkout(document.clone(), ws.manifest().workspace_id.clone(), self.machine.clone()).map_err(error)?;
+                self.grants.insert(document.clone(), grant.clone());
+                if grant.entry.head != Some(expected_base)
+                    || grant.entry.checkout.as_ref().is_none_or(|checkout| {
+                        checkout.base_version != Some(expected_base)
+                            || checkout.workspace != ws.manifest().workspace_id
+                            || checkout.machine != self.machine
+                    })
+                {
+                    // Another publication may win between the catalog read and this
+                    // atomic grant. Never install its bytes over the editor's base.
+                    if client.managed_cancel_checkout(document.clone(), ws.manifest().workspace_id.clone(), self.machine.clone(), grant.token).is_ok()
+                    {
+                        self.grants.remove(&document);
+                        return Err(fail(
+                            "Checkout refused: the archived base changed; the temporary reservation was released and in-memory changes are preserved",
+                        ));
+                    }
+                    return Err(fail(
+                        "Checkout refused: the archived base changed and the temporary reservation could not be released; preserve in-memory changes and recover this working folder",
+                    ));
+                }
+                // This rechecks the original base hash before changing permissions.
+                // A concurrent disk edit remains intact and keeps this grant available
+                // for explicit reconciliation; it is never replaced by a download.
+                ws.checkout(&document).map_err(error)?;
+                // The editor owns newer in-memory changes. Returning no loaded session
+                // prevents replacing it with the older on-disk document.
+                Some(document)
+            }
             ManagedTask::Checkout { document, path } => {
                 let document = self.target(&ws, document, path)?;
                 let remote = client
@@ -559,18 +624,12 @@ impl Host {
                 let entry = ws.manifest().documents.get(&document).cloned().ok_or_else(|| fail("Working copy is missing"))?;
                 let (_, bytes) = client.download(&VersionRef { document: document.clone(), version: entry.base_version }).map_err(error)?;
                 ws.undo_checkout(&document, &bytes, true).map_err(error)?;
-                let reserved = client
-                    .managed_catalog()
-                    .map_err(error)?
-                    .entries
-                    .into_iter()
-                    .find(|e| e.document == document)
-                    .is_some_and(|e| e.checkout.as_ref().is_some_and(|checkout| Some(checkout) == grant.entry.checkout.as_ref()));
-                if reserved {
-                    client
-                        .managed_cancel_checkout(document.clone(), ws.manifest().workspace_id.clone(), self.machine.clone(), grant.token)
-                        .map_err(error)?;
-                }
+                // Only the authenticated server release acknowledges cancellation.
+                // A changed or missing reservation is an error, never a silent success
+                // inferred from a later catalog read. Retain the grant on failure.
+                client
+                    .managed_cancel_checkout(document.clone(), ws.manifest().workspace_id.clone(), self.machine.clone(), grant.token)
+                    .map_err(error)?;
                 self.grants.remove(&document);
                 opened = Some(load(&ws.path(&document).map_err(error)?)?);
                 Some(document)
@@ -1210,6 +1269,204 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), before);
         assert!(host.grants.contains_key(&document));
     }
+    #[test]
+    fn autosave_checkout_preserving_memory_returns_no_loaded_session_and_archives_current_saved_bytes() {
+        let trial = Trial::new();
+        let mut host = trial.host("working");
+        let path = host.root.as_ref().unwrap().join("part.solidcraft");
+        let mut editor = part(&path);
+        let archived = fs::read(&path).unwrap();
+        let document = archive(&mut host, &editor);
+        editor.execute("solid.box", &serde_json::json!({"length":2,"width":2,"height":2})).unwrap();
+        assert!(editor.is_dirty());
+        let (outcome, loaded) = run(
+            &mut host,
+            ManagedTask::CheckoutPreservingMemory { document: document.clone(), path: path.to_string_lossy().into_owned(), expected_base: 1 },
+        );
+        assert!(loaded.is_none(), "checkout must not supply an older disk session that could replace the dirty editor");
+        assert_eq!(fs::read(&path).unwrap(), archived);
+        assert!(!fs::metadata(&path).unwrap().permissions().readonly());
+        let Outcome::Managed { state, .. } = outcome else { panic!("expected managed checkout") };
+        assert!(state.local.iter().any(|entry| entry.document == document && entry.checked_out && entry.base_version == 1));
+        assert!(host.grants.contains_key(&document));
+        assert_eq!(host.client().unwrap().managed_history(document.clone()).unwrap().len(), 1);
+        // The UI's existing asynchronous save writes this editor before publication.
+        // Native archive validates that exact saved document, rather than old disk bytes.
+        editor.execute("file.save", &serde_json::json!({})).unwrap();
+        let current = fs::read(&path).unwrap();
+        assert_ne!(current, archived);
+        assert_eq!(archive(&mut host, &editor), document);
+        let (version, published) = host.client().unwrap().download(&VersionRef { document: document.clone(), version: 2 }).unwrap();
+        assert_eq!(published, current);
+        assert_eq!(version.sha256, hash(&current));
+        assert_eq!(host.client().unwrap().managed_history(document).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn autosave_checkout_preserving_memory_rejects_stale_base_without_installing_or_reserving() {
+        let trial = Trial::new();
+        let mut producer = trial.host("producer");
+        let source = producer.root.as_ref().unwrap().join("part.solidcraft");
+        let original = part(&source);
+        let document = archive(&mut producer, &original);
+        let mut consumer = trial.host("consumer");
+        let (_, loaded) = run(&mut consumer, ManagedTask::Open { document: document.clone() });
+        let consumer_path = PathBuf::from(loaded.unwrap().path.unwrap());
+        let before = fs::read(&consumer_path).unwrap();
+        let (_, loaded) = run(&mut producer, ManagedTask::Checkout { document: Some(document.clone()), path: None });
+        let mut newer = *loaded.unwrap();
+        newer.execute("solid.box", &serde_json::json!({"length":2,"width":2,"height":2})).unwrap();
+        newer.execute("file.save", &serde_json::json!({})).unwrap();
+        archive(&mut producer, &newer);
+        for expected_base in [1, 2] {
+            assert!(
+                consumer
+                    .execute(
+                        ManagedTask::CheckoutPreservingMemory {
+                            document: document.clone(),
+                            path: consumer_path.to_string_lossy().into_owned(),
+                            expected_base,
+                        },
+                        None
+                    )
+                    .is_err()
+            );
+            assert_eq!(fs::read(&consumer_path).unwrap(), before);
+            assert!(consumer.grants.is_empty());
+        }
+        assert_eq!(consumer.workspace().unwrap().manifest().documents[&document].base_version, 1);
+        assert!(
+            consumer
+                .client()
+                .unwrap()
+                .managed_catalog()
+                .unwrap()
+                .entries
+                .into_iter()
+                .find(|entry| entry.document == document)
+                .unwrap()
+                .checkout
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn autosave_checkout_preserving_memory_rejects_modified_disk_or_unregistered_path() {
+        let trial = Trial::new();
+        let mut host = trial.host("working");
+        let path = host.root.as_ref().unwrap().join("part.solidcraft");
+        let design = part(&path);
+        let document = archive(&mut host, &design);
+        let original = fs::read(&path).unwrap();
+        let unrelated = trial.root.join("other.solidcraft");
+        fs::write(&unrelated, &original).unwrap();
+        assert!(
+            host.execute(
+                ManagedTask::CheckoutPreservingMemory {
+                    document: document.clone(),
+                    path: unrelated.to_string_lossy().into_owned(),
+                    expected_base: 1,
+                },
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        remove_copy(&path);
+        fs::write(&path, b"externally modified local content").unwrap();
+        assert!(
+            host.execute(
+                ManagedTask::CheckoutPreservingMemory { document: document.clone(), path: path.to_string_lossy().into_owned(), expected_base: 1 },
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"externally modified local content");
+        assert_eq!(fs::read(&unrelated).unwrap(), original);
+        assert!(host.grants.is_empty());
+        assert!(
+            host.client()
+                .unwrap()
+                .managed_catalog()
+                .unwrap()
+                .entries
+                .into_iter()
+                .find(|entry| entry.document == document)
+                .unwrap()
+                .checkout
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn discard_failed_release_keeps_verified_checkout_visible_for_safe_retry() {
+        let trial = Trial::new();
+        let mut host = trial.host("working");
+        let path = host.root.as_ref().unwrap().join("part.solidcraft");
+        let design = part(&path);
+        let archived = fs::read(&path).unwrap();
+        let document = archive(&mut host, &design);
+        let (_, opened) = run(&mut host, ManagedTask::Checkout { document: Some(document.clone()), path: None });
+        let mut edited = *opened.unwrap();
+        edited.execute("solid.box", &serde_json::json!({"length":2,"width":2,"height":2})).unwrap();
+        edited.execute("file.save", &serde_json::json!({})).unwrap();
+        let changed = fs::read(&path).unwrap();
+        assert_ne!(changed, archived);
+        let grant = host.grants.get(&document).unwrap().clone();
+        let generation = host.workspace().unwrap().manifest().generation;
+        // A real metadata-storage failure: reads remain available, but the next
+        // immutable server generation cannot be staged until this obstacle is removed.
+        let blocked_staging = trial.root.join("store/managed/generations/pending");
+        fs::write(&blocked_staging, b"temporarily unavailable metadata storage").unwrap();
+        assert!(host.execute(ManagedTask::CancelCheckout { document: Some(document.clone()), path: None }, None).is_err());
+        assert_eq!(fs::read(&path).unwrap(), archived);
+        assert_eq!(fs::read(host.root.as_ref().unwrap().join(format!(".solidcraft-pdm/backup-{generation}"))).unwrap(), changed);
+        assert_eq!(host.grants.get(&document), Some(&grant));
+        let client = host.client().unwrap();
+        assert_eq!(
+            client.managed_catalog().unwrap().entries.into_iter().find(|entry| entry.document == document).unwrap().checkout,
+            grant.entry.checkout
+        );
+        let workspace = host.workspace().unwrap();
+        assert!(!workspace.manifest().documents[&document].checked_out, "the local restore finished before server release failed");
+        let state = host.state(&workspace, Some(&document)).unwrap();
+        assert!(
+            state.local.iter().any(|entry| entry.document == document && entry.checked_out),
+            "the still-valid server grant must remain visible for cancellation retry"
+        );
+        drop(workspace);
+        fs::remove_file(&blocked_staging).unwrap();
+        let (_, opened) = run(&mut host, ManagedTask::CancelCheckout { document: Some(document.clone()), path: None });
+        assert!(opened.is_some());
+        assert_eq!(fs::read(&path).unwrap(), archived);
+        assert!(fs::metadata(&path).unwrap().permissions().readonly());
+        assert!(host.grants.is_empty());
+        assert!(client.managed_catalog().unwrap().entries.into_iter().find(|entry| entry.document == document).unwrap().checkout.is_none());
+        assert_eq!(client.managed_history(document).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn discard_restore_failure_keeps_server_grant_and_unrelated_local_data() {
+        let trial = Trial::new();
+        let mut host = trial.host("working");
+        let path = host.root.as_ref().unwrap().join("part.solidcraft");
+        let design = part(&path);
+        let document = archive(&mut host, &design);
+        run(&mut host, ManagedTask::Checkout { document: Some(document.clone()), path: None });
+        let grant = host.grants.get(&document).unwrap().clone();
+        remove_copy(&path);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep.txt"), b"unrelated local data").unwrap();
+        assert!(host.execute(ManagedTask::CancelCheckout { document: Some(document.clone()), path: None }, None).is_err());
+        assert_eq!(fs::read(path.join("keep.txt")).unwrap(), b"unrelated local data");
+        assert_eq!(host.grants.get(&document), Some(&grant));
+        assert_eq!(
+            host.client().unwrap().managed_catalog().unwrap().entries.into_iter().find(|entry| entry.document == document).unwrap().checkout,
+            grant.entry.checkout
+        );
+        assert_eq!(host.client().unwrap().managed_history(document).unwrap().len(), 1);
+    }
+
     #[test]
     fn managed_native_https_action_authority_rejects_duplicates_other_workspaces_and_offline_cancel() {
         use sha2::{Digest, Sha256};

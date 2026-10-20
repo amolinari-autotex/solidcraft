@@ -59,7 +59,7 @@ pub(crate) use measure_sel::measure_items;
 mod kernel_heal_tests;
 mod parameters;
 mod pdm;
-pub(crate) use pdm::validate_params as validate_pdm_params;
+pub use pdm::validate_params as validate_pdm_params;
 mod plastic;
 mod render;
 #[cfg(test)]

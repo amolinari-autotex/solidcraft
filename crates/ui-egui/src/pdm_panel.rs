@@ -15,7 +15,7 @@ mod guided;
 
 pub struct Completion {
     pub result: Result<Outcome, Failure>,
-    /// A separately loaded design; opening it always uses a NEW tab.
+    /// A separately loaded design; managed loads reuse their existing editor.
     pub open: Option<Box<Session>>,
 }
 pub type Start = Arc<dyn Fn(Job) -> Receiver<Completion> + Send + Sync>;
@@ -68,6 +68,10 @@ pub struct Panel {
     pub guided: guided::GuidedState,
     pub open: bool,
     pub workspace_active: bool,
+    return_tab: Option<String>,
+    tab_open: bool,
+    pub(crate) discard_ack: Option<(u64, documents::EditorStamp)>,
+    cancel_editor: Option<documents::EditorStamp>,
     pub root: String,
     pub logical_path: String,
     pub folder: String,
@@ -75,6 +79,7 @@ pub struct Panel {
     pub cancel_confirmation: bool,
     cancel_target: Option<ActionTarget>,
     search: String,
+    selected_folder: Option<String>,
     expanded: std::collections::BTreeSet<String>,
     tree_width: f32,
     details_height: f32,
@@ -87,6 +92,7 @@ pub struct Panel {
     reconcile_target: Option<ActionTarget>,
     preview_requested: std::collections::BTreeSet<(String, u64, String)>,
     history_requested: Option<String>,
+    metadata_not_before: f64,
     detail_context: Option<(String, Option<u64>)>,
     pending_detail_context: Option<(u64, String, Option<u64>)>,
     pub recovery_confirmation: bool,
@@ -108,6 +114,14 @@ pub struct Panel {
     pending: Option<(u64, Receiver<Completion>)>,
     ready: Option<(u64, Completion)>,
     pending_open_epoch: Option<u64>,
+    working_open_job: Option<u64>,
+}
+
+impl Panel {
+    /// The dedicated browser tab exists only after explicit entry in this run.
+    pub(crate) fn tab_open(&self) -> bool {
+        self.tab_open
+    }
 }
 
 impl Default for Panel {
@@ -116,6 +130,10 @@ impl Default for Panel {
             guided: guided::GuidedState::default(),
             open: false,
             workspace_active: false,
+            return_tab: None,
+            tab_open: false,
+            discard_ack: None,
+            cancel_editor: None,
             root: String::new(),
             logical_path: String::new(),
             folder: String::new(),
@@ -123,6 +141,7 @@ impl Default for Panel {
             cancel_confirmation: false,
             cancel_target: None,
             search: String::new(),
+            selected_folder: None,
             expanded: Default::default(),
             tree_width: 214.0,
             details_height: 238.0,
@@ -135,6 +154,7 @@ impl Default for Panel {
             reconcile_target: None,
             preview_requested: Default::default(),
             history_requested: None,
+            metadata_not_before: 0.0,
             detail_context: None,
             pending_detail_context: None,
             recovery_confirmation: false,
@@ -156,6 +176,7 @@ impl Default for Panel {
             pending: None,
             ready: None,
             pending_open_epoch: None,
+            working_open_job: None,
         }
     }
 }
@@ -197,6 +218,8 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     if (can_open || !needs_open)
         && let Some((id, mut completion)) = app.pdm.ready.take()
     {
+        let working_open = app.pdm.working_open_job.take() == Some(id);
+        let discard_stamp = app.pdm.discard_ack.take().filter(|(request, _)| *request == id).map(|(_, stamp)| stamp);
         let next_parent = match &completion.result {
             Ok(Outcome::CheckedIn(version)) if app.pdm.document == version.reference.document => Some(version.reference.version),
             _ => None,
@@ -247,6 +270,7 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
             app.pdm.parent.clear();
             app.pdm.logical_path.clear();
             app.pdm.folder.clear();
+            app.pdm.selected_folder = None;
             app.pdm.detail_tab = 0;
             app.pdm.selected = None;
             app.pdm.dependencies.clear();
@@ -278,19 +302,33 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
             && success
             && let Some(mut session) = completion.open.take()
         {
+            let loaded_path = session.path.clone();
             let applied = app
                 .pdm
                 .pending_open_epoch
                 .take()
                 .ok_or_else(|| "Reopen this design from disk after workspace recovery".to_string())
                 .and_then(|epoch| documents::bind_fresh_pdm_load(app, &mut session, epoch))
-                .and_then(|()| documents::apply_managed(app, *session));
+                .and_then(|()| {
+                    if let Some(stamp) = discard_stamp.as_ref() {
+                        documents::apply_acknowledged_discard(app, *session, stamp)
+                    } else {
+                        documents::apply_managed(app, *session)
+                    }
+                });
             if let Err(error) = applied {
                 let message = format!("PDM copy was saved but could not open: {error}");
                 if let Some(notice) = app.pdm.notice.as_mut() {
                     notice.error = Some(message.clone());
                 }
                 app.set_status(message, true);
+            } else if working_open {
+                if let Some(path) = loaded_path {
+                    documents::activate_managed_path(app, &path);
+                }
+                leave(app);
+                let _ = crate::render_workspace::enter(app, false);
+                app.ui.tab = if app.session.active_sketch.is_some() { "SKETCH".into() } else { "SOLID".into() };
             }
         }
     }
@@ -311,6 +349,7 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
         match app.pdm.runtime.take_job() {
             Ok(Some(job)) => {
                 let id = job.id;
+                app.pdm.working_open_job = matches!(&job.task, Task::Managed(ManagedTask::Open { .. })).then_some(id);
                 app.pdm.pending_detail_context = match &job.task {
                     Task::Managed(ManagedTask::History { document }) => Some((id, document.clone(), None)),
                     Task::Managed(ManagedTask::Preview { reference }) => Some((id, reference.document.clone(), Some(reference.version))),
@@ -354,6 +393,7 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
                             | ManagedTask::Archive { .. }
                             | ManagedTask::ReconcileArchive { .. }
                             | ManagedTask::Checkout { .. }
+                            | ManagedTask::CheckoutPreservingMemory { .. }
                             | ManagedTask::CancelCheckout { .. }
                             | ManagedTask::GetLatest { .. }
                             | ManagedTask::Open { .. }
@@ -379,6 +419,8 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     {
         let remaining = app.pdm.refresh_delay.saturating_sub(app.pdm.last_activity.elapsed());
         if remaining.is_zero()
+            && !app.file_picker_busy()
+            && !app.file_load.busy()
             && status.busy.is_none()
             && app.pdm.pending.is_none()
             && app.pdm.ready.is_none()
@@ -446,7 +488,10 @@ pub fn enter(app: &mut SolveApp) -> Result<(), String> {
     if app.tool.is_some() || app.dialog.is_some() || app.session.active_sketch.is_some() || app.file_load.busy() {
         return Err("Finish the current operation before entering PDM".into());
     }
-    crate::render_workspace::enter(app, false)?;
+    if !app.pdm.workspace_active {
+        app.pdm.return_tab = Some(app.ui.tab.clone());
+    }
+    app.pdm.tab_open = true;
     app.pdm.workspace_active = true;
     app.pdm.open = false;
     app.ui.tab = "PDM".into();
@@ -454,8 +499,25 @@ pub fn enter(app: &mut SolveApp) -> Result<(), String> {
     Ok(())
 }
 
+/// Return to the existing editor workspace without changing its document or view.
+pub(crate) fn leave(app: &mut SolveApp) {
+    if app.pdm.workspace_active {
+        app.pdm.workspace_active = false;
+        if let Some(tab) = app.pdm.return_tab.take() {
+            app.ui.tab = tab;
+        }
+    }
+}
+
+pub(crate) fn archive_save_failed(app: &mut SolveApp, params: &serde_json::Value, error: String) {
+    let file = target_label(app, params.get("document").and_then(serde_json::Value::as_str), app.session.path.as_deref());
+    app.pdm.notice = Some(Notice { action: "ui.pdm_archive", file, path: app.session.path.clone(), error: Some(error.clone()) });
+    app.set_status(error, true);
+}
+
 fn action_key(id: &str) -> &'static str {
     match id {
+        "pdm.disconnect" => "ui.pdm_disconnect",
         "pdm.checkout" => "ui.pdm_checkout",
         "pdm.archive" | "pdm.check_in" => "ui.pdm_archive",
         "pdm.cancel_checkout" => "ui.pdm_cancel_checkout",
@@ -474,6 +536,7 @@ fn action_key(id: &str) -> &'static str {
 fn task_notice(task: &Task) -> Option<(&'static str, Option<&str>, Option<&str>)> {
     let (command, document, path) = match task {
         Task::Managed(task) => match task {
+            ManagedTask::CheckoutPreservingMemory { document, path, .. } => ("pdm.checkout", Some(document.as_str()), Some(path.as_str())),
             ManagedTask::Checkout { document, path } => ("pdm.checkout", document.as_deref(), path.as_deref()),
             ManagedTask::CancelCheckout { document, path } => ("pdm.cancel_checkout", document.as_deref(), path.as_deref()),
             ManagedTask::GetLatest { document, path } => ("pdm.get_latest", document.as_deref(), path.as_deref()),
@@ -489,6 +552,7 @@ fn task_notice(task: &Task) -> Option<(&'static str, Option<&str>, Option<&str>)
         Task::CheckIn { document, path, .. } => ("pdm.check_in", Some(document.as_str()), Some(path.as_str())),
         Task::Retrieve { reference, .. } => ("pdm.retrieve", Some(reference.document.as_str()), None),
         Task::Connect { .. } => ("pdm.connect", None, None),
+        Task::Disconnect => ("pdm.disconnect", None, None),
         _ => return None,
     };
     Some((action_key(command), document, path))
@@ -543,6 +607,12 @@ fn unavailable(app: &SolveApp, status: &Status, id: &str, target: &ActionTarget,
     if app.file_picker_busy() || app.file_load.busy() {
         return Some("ui.pdm_reason_busy");
     }
+    if matches!(id, "pdm.connect" | "pdm.disconnect") {
+        return status.action_unavailable(id, None, None, false, false, None);
+    }
+    if app.pdm.workspace_active && app.pdm.selected_folder.is_some() && id != "pdm.refresh" {
+        return Some("ui.pdm_reason_select_document");
+    }
     let unmanaged_initial = id == "pdm.archive"
         && target.path.as_ref().is_some_and(|path| !status.managed.local.iter().any(|entry| cached_path_key(&entry.path) == cached_path_key(path)));
     if app.pdm.workspace_active && target.document.is_none() && id != "pdm.refresh" && !unmanaged_initial {
@@ -557,6 +627,8 @@ pub(crate) fn command_unavailable(app: &SolveApp, command: &str) -> Option<&'sta
     if !matches!(
         command,
         "pdm.panel"
+            | "pdm.connect"
+            | "pdm.disconnect"
             | "pdm.checkout"
             | "pdm.archive"
             | "pdm.cancel_checkout"
@@ -585,11 +657,13 @@ pub(crate) fn command_unavailable(app: &SolveApp, command: &str) -> Option<&'sta
 }
 
 /// Interactive command surfaces route through the same captured explorer target.
-/// Returning false leaves connection/setup commands with their guided host flow.
+/// Returning false leaves the remaining setup commands with their guided host flow.
 pub(crate) fn start_action(app: &mut SolveApp, command: &str) -> bool {
     if !matches!(
         command,
-        "pdm.checkout"
+        "pdm.connect"
+            | "pdm.disconnect"
+            | "pdm.checkout"
             | "pdm.archive"
             | "pdm.cancel_checkout"
             | "pdm.get_latest"
@@ -605,6 +679,11 @@ pub(crate) fn start_action(app: &mut SolveApp, command: &str) -> bool {
     };
     let target = active_target(app, &status, app.pdm.workspace_active);
     let reference = app.pdm.selected.as_ref().filter(|reference| Some(reference.document.as_str()) == target.document.as_deref()).cloned();
+    start_target_action(app, command, target, reference)
+}
+
+fn start_target_action(app: &mut SolveApp, command: &str, target: ActionTarget, reference: Option<Reference>) -> bool {
+    let Ok(status) = app.pdm.runtime.status() else { return true };
     if let Some(reason) = unavailable(app, &status, command, &target, reference.as_ref().map(|reference| reference.version)) {
         let error = app.tr(reason).to_string();
         app.pdm.notice = Some(Notice { action: action_key(command), file: target.label, path: target.path.clone(), error: Some(reason.into()) });
@@ -612,7 +691,10 @@ pub(crate) fn start_action(app: &mut SolveApp, command: &str) -> bool {
         return true;
     }
     match command {
+        "pdm.connect" => app.pdm.open = true,
+        "pdm.disconnect" => dispatch(app, command, json!({})),
         "pdm.cancel_checkout" => {
+            app.pdm.cancel_editor = documents::managed_editor_stamp(app, target.document.as_deref());
             app.pdm.cancel_target = Some(target);
             app.pdm.cancel_confirmation = true;
         }
@@ -656,17 +738,61 @@ pub fn actions(app: &mut SolveApp, ui: &mut egui::Ui) {
     toolbar(app, ui, app.pdm.workspace_active);
 }
 
+fn ribbon_button(app: &SolveApp, ui: &mut egui::Ui, id: &str, key: &str, icon: &str, reason: Option<&str>, name: &str, help: &str) -> bool {
+    let font = egui::FontId::proportional(12.0);
+    let color = ui.visuals().text_color().gamma_multiply(if reason.is_none() { 1.0 } else { 0.4 });
+    let label = ui.painter().layout_no_wrap(app.tr(key).to_string(), font, color);
+    let size = egui::vec2((label.size().x + 12.0).max(70.0), 54.0);
+    let response = ui.add_enabled(reason.is_none(), egui::Button::new("").min_size(size));
+    let icon_rect = egui::Rect::from_center_size(egui::pos2(response.rect.center().x, response.rect.top() + 19.0), egui::vec2(30.0, 30.0));
+    crate::icons::paint_icon(ui.painter(), icon_rect, icon, if reason.is_none() { 1.0 } else { 0.4 });
+    let label_rect = egui::Rect::from_center_size(egui::pos2(response.rect.center().x, response.rect.top() + 43.0), label.size());
+    ui.painter().galley(label_rect.min, label, color);
+    handle(name, &response);
+    crate::scenario::publish_rect(&format!("pdm_action_button:{id}"), response.rect);
+    crate::scenario::publish_rect(&format!("pdm_action:{id}"), icon_rect);
+    crate::scenario::publish_rect(&format!("pdm_action_label:{id}"), label_rect);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, reason.is_none(), app.tr(key)));
+    let clicked = response.clicked();
+    let help = reason.map_or_else(|| format!("{}\n{help}", app.tr(key)), |reason| app.tr(reason).to_string());
+    response.on_hover_text(&help).on_disabled_hover_text(help);
+    clicked
+}
+
 fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui, selected: bool) {
-    let Ok(status) = app.pdm.runtime.status() else {
-        return;
-    };
+    let Ok(status) = app.pdm.runtime.status() else { return };
     let target = active_target(app, &status, selected);
+    let help = format!("{}: {}", app.tr(if selected { "ui.pdm_selected_file" } else { "ui.pdm_active_file" }), target.label);
     let mut action = None;
-    egui::ScrollArea::horizontal().id_salt(("pdm_toolbar", selected)).max_height(42.0).show(ui, |ui| {
+    egui::ScrollArea::horizontal().id_salt(("pdm_toolbar", selected)).max_height(62.0).show(ui, |ui| {
         ui.horizontal(|ui| {
-            let reason = (status.busy.is_some() || app.file_picker_busy() || app.file_load.busy()).then_some("ui.pdm_reason_busy");
-            if action_button(app, ui, "pdm.panel", "ui.pdm_connect", "library", reason, "connect_settings") {
-                app.pdm.open = true;
+            let connection =
+                status.connection.as_ref().map_or_else(String::new, |connection| format!("{} · {}", connection.label, connection.account));
+            if ribbon_button(
+                app,
+                ui,
+                "pdm.connect",
+                "ui.pdm_connect",
+                "library",
+                unavailable(app, &status, "pdm.connect", &target, None),
+                "connect_settings",
+                &connection,
+            ) {
+                action = Some("pdm.connect");
+            }
+            if status.port.is_some()
+                && ribbon_button(
+                    app,
+                    ui,
+                    "pdm.disconnect",
+                    "ui.pdm_disconnect",
+                    "library",
+                    unavailable(app, &status, "pdm.disconnect", &target, None),
+                    "disconnect_toolbar",
+                    &connection,
+                )
+            {
+                action = Some("pdm.disconnect");
             }
             ui.separator();
             for (id, key, icon, name) in [
@@ -677,13 +803,13 @@ fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui, selected: bool) {
             ] {
                 let initial = id == "pdm.archive"
                     && target.document.is_none()
+                    && (!selected || app.pdm.selected_folder.is_none())
                     && target
                         .path
                         .as_ref()
                         .is_some_and(|path| !status.managed.local.iter().any(|entry| cached_path_key(&entry.path) == cached_path_key(path)));
                 let key = if initial { "ui.pdm_archive_initial" } else { key };
-                let reason = unavailable(app, &status, id, &target, None);
-                if action_button(app, ui, id, key, icon, reason, name) {
+                if ribbon_button(app, ui, id, key, icon, unavailable(app, &status, id, &target, None), name, &help) {
                     action = Some(id);
                 }
             }
@@ -691,30 +817,47 @@ fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui, selected: bool) {
             for (id, key, icon, name) in
                 [("pdm.get_latest", "ui.pdm_get_latest", "update", "get_latest"), ("pdm.refresh", "ui.pdm_refresh", "update", "refresh")]
             {
-                if action_button(app, ui, id, key, icon, unavailable(app, &status, id, &target, None), name) {
+                if ribbon_button(app, ui, id, key, icon, unavailable(app, &status, id, &target, None), name, &help) {
                     action = Some(id);
                 }
             }
-            if selected && ui.selectable_label(app.pdm.details_visible, app.tr("ui.pdm_details")).clicked() {
+            if selected && ribbon_button(app, ui, "pdm.details", "ui.pdm_details", "library", None, "details", &help) {
                 app.pdm.details_visible = !app.pdm.details_visible;
             }
         });
     });
-    let caption = format!("{}: {}", app.tr(if selected { "ui.pdm_selected_file" } else { "ui.pdm_active_file" }), target.label);
-    ui.add(egui::Label::new(egui::RichText::new(caption).small().color(Tokens::get().text_dim)).truncate()).on_hover_text(&target.label);
     if let Some(id) = action {
-        if id == "pdm.cancel_checkout" {
-            app.pdm.cancel_target = Some(target);
-            app.pdm.cancel_confirmation = true;
-        } else {
-            let params = target.document.as_ref().filter(|_| id != "pdm.refresh").map_or_else(|| json!({}), |document| json!({"document":document}));
-            dispatch(app, id, params);
-        }
+        start_action(app, id);
     }
 }
 
 fn folder_icon(ui: &egui::Ui, rect: egui::Rect, name: &str) {
     crate::icons::paint_icon(ui.painter(), rect, name, 1.0);
+}
+
+fn clear_file_selection(app: &mut SolveApp) {
+    app.pdm.document.clear();
+    app.pdm.parent.clear();
+    app.pdm.logical_path.clear();
+    app.pdm.selected = None;
+    app.pdm.dependencies.clear();
+    app.pdm.restore_confirmation = None;
+    app.pdm.cancel_confirmation = false;
+    app.pdm.cancel_target = None;
+    app.pdm.history_requested = None;
+    app.pdm.detail_context = None;
+    app.pdm.preview_requested.clear();
+}
+
+fn navigate_folder(app: &mut SolveApp, folder: String) {
+    clear_file_selection(app);
+    let parts: Vec<_> = folder.split('/').filter(|part| !part.is_empty()).collect();
+    for n in 1..=parts.len() {
+        app.pdm.expanded.insert(parts[..n].join("/"));
+    }
+    app.pdm.selected_folder = Some(folder.clone());
+    app.pdm.folder = folder;
+    app.pdm.search.clear();
 }
 
 fn folder_tree(app: &mut SolveApp, ui: &mut egui::Ui, catalog: &[CatalogEntry]) {
@@ -737,7 +880,7 @@ fn folder_tree(app: &mut SolveApp, ui: &mut egui::Ui, catalog: &[CatalogEntry]) 
         folder_icon(ui, egui::Rect::from_center_size(root.rect.left_center() + egui::vec2(12.0, 0.0), egui::vec2(19.0, 19.0)), "folder");
         handle("folder:root", &root);
         if root.clicked() {
-            app.pdm.folder.clear();
+            navigate_folder(app, String::new());
         }
         for folder in &folders {
             let parts: Vec<_> = folder.split('/').collect();
@@ -766,7 +909,7 @@ fn folder_tree(app: &mut SolveApp, ui: &mut egui::Ui, catalog: &[CatalogEntry]) 
                 folder_icon(ui, egui::Rect::from_center_size(response.rect.left_center() + egui::vec2(12.0, 0.0), egui::vec2(19.0, 19.0)), "folder");
                 handle(&format!("folder:{folder}"), &response);
                 if response.clicked() {
-                    app.pdm.folder = folder.clone();
+                    navigate_folder(app, folder.clone());
                 }
             });
         }
@@ -784,7 +927,12 @@ fn cell(ui: &mut egui::Ui, rect: egui::Rect, text: impl Into<egui::WidgetText>, 
     child.add(egui::Label::new(text).truncate().selectable(false));
 }
 
-fn file_table(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, compact: bool) -> Option<String> {
+enum CatalogClick {
+    File(String, bool),
+    Folder(String, bool),
+}
+
+fn file_table(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, compact: bool) -> Option<CatalogClick> {
     let t = Tokens::get();
     let search = app.pdm.search.to_lowercase();
     let mut entries: Vec<_> = status
@@ -793,11 +941,7 @@ fn file_table(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, compact: b
         .iter()
         .filter(|entry| {
             let parent = entry.logical_path.rsplit_once('/').map_or("", |(parent, _)| parent);
-            (if search.is_empty() {
-                parent == app.pdm.folder
-            } else {
-                app.pdm.folder.is_empty() || parent == app.pdm.folder || parent.starts_with(&format!("{}/", app.pdm.folder))
-            }) && entry.logical_path.to_lowercase().contains(&search)
+            parent == app.pdm.folder && entry.logical_path.rsplit('/').next().unwrap_or_default().to_lowercase().contains(&search)
         })
         .collect();
     entries.sort_by(|a, b| {
@@ -810,8 +954,25 @@ fn file_table(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, compact: b
         };
         if app.pdm.sort_descending { order.reverse() } else { order }
     });
+    let prefix = if app.pdm.folder.is_empty() { String::new() } else { format!("{}/", app.pdm.folder) };
+    let mut folders: Vec<_> = status
+        .managed
+        .catalog
+        .iter()
+        .filter_map(|entry| {
+            let tail = entry.logical_path.strip_prefix(&prefix)?;
+            let (name, _) = tail.split_once('/')?;
+            name.to_lowercase().contains(&search).then(|| format!("{prefix}{name}"))
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    folders.sort_by_key(|folder| folder.to_lowercase());
+    if app.pdm.sort_descending {
+        folders.reverse();
+    }
     let mut selected = None;
-    egui::ScrollArea::both().id_salt("pdm_catalog").auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::both().id_salt(("pdm_catalog", app.pdm.folder.clone())).auto_shrink([false, false]).show(ui, |ui| {
         let width: f32 = app.pdm.column_widths.iter().sum();
         let (header, _) = ui.allocate_exact_size(egui::vec2(width, if compact { 28.0 } else { 32.0 }), egui::Sense::hover());
         ui.painter().rect_filled(header, 0.0, t.panel_header);
@@ -847,13 +1008,29 @@ fn file_table(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, compact: b
             ui.painter().line_segment([rect.right_top(), rect.right_bottom()], egui::Stroke::new(1.0, t.border));
             x += w;
         }
-        if entries.is_empty() {
+        if entries.is_empty() && folders.is_empty() {
             ui.add_space(28.0);
             ui.label(egui::RichText::new(app.tr(if status.port.is_none() { "ui.pdm_connect_hint" } else { "ui.pdm_no_files" })).color(t.text_dim));
         }
+        for folder in &folders {
+            let (row, _) = ui.allocate_exact_size(egui::vec2(width, if compact { 28.0 } else { 31.0 }), egui::Sense::hover());
+            let response = ui.interact(row, ui.id().with(("pdm_folder", folder)), egui::Sense::click());
+            if app.pdm.selected_folder.as_ref() == Some(folder) || response.hovered() {
+                ui.painter().rect_filled(row, 0.0, t.hover);
+            }
+            folder_icon(ui, egui::Rect::from_center_size(row.left_center() + egui::vec2(18.0, 0.0), egui::vec2(21.0, 21.0)), "folder");
+            let name_rect =
+                egui::Rect::from_min_max(row.min + egui::vec2(27.0, 0.0), egui::pos2(row.left() + app.pdm.column_widths[0], row.bottom()));
+            cell(ui, name_rect, folder.rsplit('/').next().unwrap_or(folder), t.text);
+            handle(&format!("folder_row:{folder}"), &response);
+            if response.clicked() {
+                selected = Some(CatalogClick::Folder(folder.clone(), response.double_clicked()));
+            }
+        }
         for (index, entry) in entries.iter().enumerate() {
             let document = &entry.document;
-            let (row, response) = ui.allocate_exact_size(egui::vec2(width, if compact { 28.0 } else { 31.0 }), egui::Sense::click());
+            let (row, _) = ui.allocate_exact_size(egui::vec2(width, if compact { 28.0 } else { 31.0 }), egui::Sense::hover());
+            let response = ui.interact(row, ui.id().with(("pdm_file", document)), egui::Sense::click());
             let is_selected = app.pdm.document == *document;
             let fill = if is_selected {
                 t.accent_soft
@@ -867,7 +1044,7 @@ fn file_table(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, compact: b
             ui.painter().rect_filled(row, 0.0, fill);
             handle(&format!("file:{document}"), &response);
             if response.clicked() {
-                selected = Some(document.clone());
+                selected = Some(CatalogClick::File(document.clone(), response.double_clicked()));
             }
             let local = status.managed.local.iter().find(|local| local.document == *document);
             let dirty = documents::managed_target_dirty(app, Some(document));
@@ -906,10 +1083,57 @@ fn file_table(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, compact: b
                 }
                 x += w;
             }
+            if response.secondary_clicked() {
+                selected = Some(CatalogClick::File(document.clone(), false));
+            }
+            response.clone().context_menu(|ui| file_context_menu(app, ui, status, entry));
             response.on_hover_text(&entry.logical_path);
         }
     });
     selected
+}
+
+fn local_working_file(status: &Status, document: &str) -> Option<std::path::PathBuf> {
+    status.port?;
+    let root = std::fs::canonicalize(status.managed.root.as_ref()?).ok()?;
+    let local = status.managed.local.iter().find(|entry| entry.document == document && entry.present)?;
+    let file = std::fs::canonicalize(&local.path).ok()?;
+    let parent = file.parent()?;
+    (root.is_dir() && file.is_file() && parent.is_dir() && parent.starts_with(root)).then_some(file)
+}
+
+fn file_context_menu(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, entry: &CatalogEntry) {
+    let target = ActionTarget { document: Some(entry.document.clone()), path: app.session.path.clone(), label: entry.logical_path.clone() };
+    for (id, key, icon, name) in [
+        ("pdm.open_document", "ui.open", "open", "context_open"),
+        ("pdm.archive", "ui.pdm_archive", "save", "context_archive"),
+        ("pdm.get_latest", "ui.pdm_load", "update", "context_load"),
+        ("pdm.checkout", "ui.pdm_checkout", "open", "context_checkout"),
+        ("pdm.cancel_checkout", "ui.pdm_cancel_checkout", "undo", "context_cancel_checkout"),
+    ] {
+        let reason = unavailable(app, status, id, &target, None);
+        if action_button(app, ui, &format!("context:{id}"), key, icon, reason, name) {
+            start_target_action(app, id, target.clone(), None);
+            ui.close();
+        }
+    }
+    ui.separator();
+    if action_button(app, ui, "context:folder", "ui.pdm_go_to_folder", "folder", None, "context_folder") {
+        let folder = entry.logical_path.rsplit_once('/').map_or("", |(parent, _)| parent).to_string();
+        navigate_folder(app, folder);
+        app.pdm.selected_folder = None;
+        app.pdm.document = entry.document.clone();
+        app.pdm.metadata_not_before = ui.input(|input| input.time) + ui.ctx().options(|options| options.input_options.max_double_click_delay);
+        ui.close();
+    }
+    let file = local_working_file(status, &entry.document);
+    let reason = (file.is_none() || app.services.show_in_folder.is_none()).then_some("ui.pdm_reason_working_folder");
+    if action_button(app, ui, "context:working_folder", "ui.pdm_go_to_working_folder", "folder", reason, "context_working_folder") {
+        if let (Some(file), Some(show)) = (file, app.services.show_in_folder.as_ref()) {
+            show(&file.to_string_lossy());
+        }
+        ui.close();
+    }
 }
 
 fn detail_context_matches(app: &SolveApp) -> bool {
@@ -943,8 +1167,9 @@ fn details(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status) -> Option<(&'
     });
     ui.separator();
     app.pdm.preview_cache.update(ui.ctx(), status.managed.preview.as_ref());
-    let versions: Vec<_> =
+    let mut versions: Vec<_> =
         if status.managed.history.is_empty() { status.versions.clone() } else { status.managed.history.iter().map(|v| v.version.clone()).collect() };
+    versions.sort_by_key(|version| std::cmp::Reverse(version.reference.version));
     let body_gap = if compact { 2.0 } else { 4.0 };
     let body_rect = egui::Rect::from_min_max(ui.cursor().min, egui::pos2(bounds.right(), (actions_rect.top() - body_gap).max(ui.cursor().min.y)));
     let height = body_rect.height();
@@ -1086,9 +1311,9 @@ fn status_bar(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status) {
             let count = if app.pdm.document.is_empty() { "0" } else { "1" };
             ui.separator();
             ui.label(crate::i18n::format("ui.pdm_selection_count", &[("count", count)]));
-            if status.busy.is_some() {
+            if status.busy.is_some() || app.saving.is_some() {
                 ui.spinner();
-                ui.label(app.tr("ui.pdm_busy"));
+                ui.label(app.tr(if app.saving.is_some() { "ui.pdm_saving" } else { "ui.pdm_busy" }));
             }
         });
     });
@@ -1179,8 +1404,9 @@ pub fn workspace(app: &mut SolveApp, ui: &mut egui::Ui) {
                 ui.separator();
             }
             let root = ui.selectable_label(app.pdm.folder.is_empty(), "/");
+            handle("breadcrumb:root", &root);
             if root.clicked() {
-                app.pdm.folder.clear();
+                navigate_folder(app, String::new());
             }
             let mut path = String::new();
             for part in app.pdm.folder.clone().split('/') {
@@ -1192,12 +1418,16 @@ pub fn workspace(app: &mut SolveApp, ui: &mut egui::Ui) {
                 }
                 path.push_str(part);
                 ui.label("›");
-                if ui.link(part).clicked() {
-                    app.pdm.folder = path.clone();
+                let response = ui.link(part);
+                handle(&format!("breadcrumb:{path}"), &response);
+                if response.clicked() {
+                    navigate_folder(app, path.clone());
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.pdm.search).hint_text(crate::i18n::tr("ui.pdm_search")).desired_width(240.0));
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut app.pdm.search).hint_text(crate::i18n::tr("ui.pdm_search")).desired_width(240.0));
+                handle("search", &response);
             });
         });
         ui.separator();
@@ -1252,13 +1482,30 @@ pub fn workspace(app: &mut SolveApp, ui: &mut egui::Ui) {
             let details_height = if app.pdm.details_visible { app.pdm.details_height.max(96.0).min(maximum_details) } else { 0.0 };
             let table_height = (remaining - details_height - if app.pdm.details_visible { divider_height } else { 0.0 }).max(0.0);
             let table = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), table_height));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(table), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().id_salt("pdm_file_table").max_rect(table), |ui| {
                 ui.set_clip_rect(table.intersect(ui.clip_rect()));
-                if let Some(document) = file_table(app, ui, &status, compact) {
-                    app.pdm.document = document;
-                    app.pdm.selected = None;
-                    app.pdm.history_requested = None;
-                    app.pdm.preview_requested.clear();
+                if let Some(clicked) = file_table(app, ui, &status, compact) {
+                    clear_file_selection(app);
+                    match clicked {
+                        CatalogClick::File(document, open) => {
+                            app.pdm.selected_folder = None;
+                            app.pdm.document = document;
+                            // A first click must not start background IO before a
+                            // physical second click can request the working copy.
+                            let delay = ui.ctx().options(|options| options.input_options.max_double_click_delay);
+                            app.pdm.metadata_not_before = ui.input(|input| input.time) + delay;
+                            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(delay));
+                            if open {
+                                start_action(app, "pdm.open_document");
+                            }
+                        }
+                        CatalogClick::Folder(folder, enter) => {
+                            app.pdm.selected_folder = Some(folder.clone());
+                            if enter {
+                                navigate_folder(app, folder);
+                            }
+                        }
+                    }
                 }
             });
             if app.pdm.details_visible {
@@ -1285,7 +1532,9 @@ pub fn workspace(app: &mut SolveApp, ui: &mut egui::Ui) {
             ui.set_clip_rect(footer.intersect(ui.clip_rect()));
             status_bar(app, ui, &status);
         });
-        let metadata_idle = !app.pdm.cancel_confirmation
+        let metadata_idle = ui.input(|input| input.time) >= app.pdm.metadata_not_before
+            && app.pdm.runtime.status().is_ok_and(|current| current.busy.is_none())
+            && !app.pdm.cancel_confirmation
             && app.pdm.restore_confirmation.is_none()
             && !app.pdm.recovery_confirmation
             && !app.pdm.open
@@ -1324,11 +1573,12 @@ pub fn workspace(app: &mut SolveApp, ui: &mut egui::Ui) {
         if action.is_none() && metadata_idle && status.busy.is_none() && app.pdm.details_visible && app.pdm.detail_tab == 0 {
             // Request at most one immutable thumbnail per frame/job, bounded to
             // the first sixteen history rows. A missing image is remembered too.
-            let versions: Vec<_> = if status.managed.history.is_empty() {
+            let mut versions: Vec<_> = if status.managed.history.is_empty() {
                 status.versions.clone()
             } else {
                 status.managed.history.iter().map(|item| item.version.clone()).collect()
             };
+            versions.sort_by_key(|version| std::cmp::Reverse(version.reference.version));
             for version in versions.iter().filter(|version| version.reference.document == app.pdm.document).take(16) {
                 let identity = (version.reference.document.clone(), version.reference.version, version.sha256.clone());
                 if status
@@ -1425,6 +1675,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if app.pdm.cancel_confirmation {
         let status = app.pdm.runtime.status().ok();
         let target = app.pdm.cancel_target.clone().or_else(|| status.as_ref().map(|status| active_target(app, status, app.pdm.workspace_active)));
+        let stale_consent = app.pdm.cancel_editor.as_ref().is_some_and(|stamp| !stamp.matches(app));
         let incomplete = status
             .as_ref()
             .zip(target.as_ref())
@@ -1438,12 +1689,13 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             let reason =
                 status.as_ref().zip(target.as_ref()).and_then(|(status, target)| unavailable(app, status, "pdm.cancel_checkout", target, None));
             let response = ui.add_enabled(
-                status.is_some() && target.is_some() && reason.is_none(),
+                status.is_some() && target.is_some() && reason.is_none() && !stale_consent,
                 egui::Button::new(app.tr(if incomplete { "ui.pdm_cancel_checkout" } else { "ui.pdm_discard_confirm" })),
             );
             let response = if let Some(reason) = reason { response.on_disabled_hover_text(app.tr(reason)) } else { response };
             handle("cancel_checkout_confirm", &response);
             if response.clicked() {
+                app.pdm.cancel_editor = None;
                 app.pdm.cancel_confirmation = false;
                 app.pdm.cancel_target = None;
                 let mut params = json!({"discard":true});
@@ -1452,9 +1704,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 }
                 dispatch(app, "pdm.cancel_checkout", params);
             }
-            if ui.button(app.tr("ui.cancel")).clicked() {
+            let cancel = ui.button(app.tr("ui.cancel"));
+            handle("cancel_checkout_cancel", &cancel);
+            if cancel.clicked() {
                 app.pdm.cancel_confirmation = false;
                 app.pdm.cancel_target = None;
+                app.pdm.cancel_editor = None;
             }
         });
     }

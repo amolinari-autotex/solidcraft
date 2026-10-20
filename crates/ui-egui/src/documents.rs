@@ -128,6 +128,7 @@ pub fn switch(app: &mut SolveApp, i: usize) {
     if app.file_picker_busy() {
         return;
     }
+    crate::pdm_panel::leave(app);
     app.home.open = false;
     if i == app.docs.active || i >= app.docs.slots.len() {
         return;
@@ -212,6 +213,10 @@ pub(crate) fn bind_fresh_pdm_load(app: &SolveApp, session: &mut Session, expecte
 
 /// Refresh a managed path in its existing tab. Never discard an unsaved editor.
 pub fn apply_managed(app: &mut SolveApp, mut session: Session) -> Result<(), String> {
+    if app.docs.slots.is_empty() && active_is_blank(app) {
+        adopt(app, session);
+        return Ok(());
+    }
     let Some(path) = session.path.as_ref() else { return open_tab(app, session) };
     if same_managed_path(app.session.path.as_ref(), path) {
         if app.session.is_dirty() {
@@ -236,6 +241,102 @@ pub fn apply_managed(app: &mut SolveApp, mut session: Session) -> Result<(), Str
     open_tab(app, session)
 }
 
+/// Consent is bound to one editor, its exact memory, path and authority epoch.
+#[derive(Clone)]
+pub(crate) struct EditorStamp {
+    index: usize,
+    document: std::sync::Arc<solidcraft_engine::doc::Document>,
+    revision: u64,
+    visibility: solidcraft_engine::Visibility,
+    path: Option<String>,
+    load_epoch: u64,
+    read_only: bool,
+    runtime_epoch: u64,
+    context: (Option<u16>, Option<String>, Option<String>),
+}
+impl EditorStamp {
+    fn capture(app: &SolveApp, index: usize, session: &Session) -> Result<Self, String> {
+        let status = app.pdm.runtime.status()?;
+        Ok(Self {
+            index,
+            document: session.doc.clone(),
+            revision: session.revision,
+            visibility: session.visibility.clone(),
+            path: session.path.clone(),
+            load_epoch: session.pdm_recovery_epoch,
+            read_only: session.pdm_read_only,
+            runtime_epoch: app.pdm.runtime.recovery_epoch()?,
+            context: (status.port, status.managed.server_id, status.managed.workspace),
+        })
+    }
+    pub(crate) fn active(app: &SolveApp) -> Result<Self, String> {
+        Self::capture(app, app.docs.active, &app.session)
+    }
+    pub(crate) fn matches(&self, app: &SolveApp) -> bool {
+        let session = if self.index == app.docs.active {
+            Some(&app.session)
+        } else {
+            app.docs.slots.get(self.index).and_then(Option::as_ref).map(|slot| &slot.session)
+        };
+        session.is_some_and(|session| {
+            std::sync::Arc::ptr_eq(&self.document, &session.doc)
+                && self.revision == session.revision
+                && self.visibility == session.visibility
+                && self.path.as_ref().map(|p| solidcraft_engine::pdm::cached_path_key(p))
+                    == session.path.as_ref().map(|p| solidcraft_engine::pdm::cached_path_key(p))
+                && self.load_epoch == session.pdm_recovery_epoch
+                && self.read_only == session.pdm_read_only
+        }) && app.pdm.runtime.recovery_epoch().ok() == Some(self.runtime_epoch)
+            && app.pdm.runtime.status().is_ok_and(|status| self.context == (status.port, status.managed.server_id, status.managed.workspace))
+    }
+    pub(crate) fn matches_active(&self, app: &SolveApp) -> bool {
+        self.index == app.docs.active && self.matches(app)
+    }
+}
+
+pub(crate) fn managed_editor_stamp(app: &SolveApp, document: Option<&str>) -> Option<EditorStamp> {
+    let path = document.map_or_else(
+        || app.session.path.clone(),
+        |document| app.pdm.runtime.status().ok()?.managed.local.into_iter().find(|entry| entry.document == document).map(|entry| entry.path),
+    )?;
+    if same_managed_path(app.session.path.as_ref(), &path) {
+        return EditorStamp::active(app).ok();
+    }
+    app.docs.slots.iter().enumerate().find_map(|(index, slot)| {
+        slot.as_ref()
+            .filter(|slot| same_managed_path(slot.session.path.as_ref(), &path))
+            .and_then(|slot| EditorStamp::capture(app, index, &slot.session).ok())
+    })
+}
+
+/// Only the exact editor covered by an explicit discard acknowledgement may be
+/// replaced while dirty. Ordinary managed refresh never calls this boundary.
+pub(crate) fn apply_acknowledged_discard(app: &mut SolveApp, mut session: Session, consent: &EditorStamp) -> Result<(), String> {
+    if !consent.matches(app) || consent.path.as_deref().is_none_or(|path| !same_managed_path(session.path.as_ref(), path)) {
+        return Err("The editor changed after discard was confirmed; reopen the restored working copy".into());
+    }
+    session.pdm = app.pdm.runtime.clone();
+    if consent.index == app.docs.active {
+        app.session.replace_design(session);
+        crate::render_workspace::reset_document(app);
+        app.preview.reset();
+    } else if let Some(Some(slot)) = app.docs.slots.get_mut(consent.index) {
+        slot.session = session;
+    } else {
+        return Err("The confirmed editor is no longer open".into());
+    }
+    Ok(())
+}
+
+/// Activate an already loaded managed path without opening a duplicate editor.
+/// Call only after the native load was accepted and applied successfully.
+pub(crate) fn activate_managed_path(app: &mut SolveApp, path: &str) {
+    let index = app.docs.slots.iter().position(|slot| slot.as_ref().is_some_and(|slot| same_managed_path(slot.session.path.as_ref(), path)));
+    if let Some(index) = index {
+        switch(app, index);
+    }
+}
+
 /// A new, empty design in its own tab. One that is already empty keeps its tab and still
 /// takes Units of new designs (#1205): a launch starts on that empty design, so returning
 /// here used to leave it in millimetres.
@@ -243,6 +344,7 @@ pub fn new_design(app: &mut SolveApp) {
     if app.file_picker_busy() {
         return;
     }
+    crate::pdm_panel::leave(app);
     app.home.open = false;
     if active_is_blank(app) {
         crate::prefs::apply_new_design(app);
@@ -265,6 +367,7 @@ pub fn new_tab(app: &mut SolveApp) {
         new_design(app);
         return;
     }
+    crate::pdm_panel::leave(app);
     app.home.open = false;
     if let Err(e) = open_tab(app, Session::default()) {
         app.set_status(e, true);
@@ -302,7 +405,11 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
         return;
     }
     app.docs.closing = None;
+    let browser = app.pdm.workspace_active;
     if n <= 1 {
+        if browser {
+            crate::pdm_panel::leave(app);
+        }
         // The last design: a blank one takes its place.
         crate::sketch_text_move::cancel_drag(app);
         let rev = app.session.revision;
@@ -315,7 +422,13 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
         app.fit_view();
         put_view(app, DocView::default());
         app.docs = Documents::default();
-        app.home.open = true;
+        if browser {
+            app.ui.tab = "SOLID".into();
+            if let Err(error) = crate::pdm_panel::enter(app) {
+                app.set_status(error, true);
+            }
+        }
+        app.home.open = !browser;
         return;
     }
     if i == app.docs.active {
@@ -326,6 +439,26 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
     app.docs.slots.remove(i);
     if app.docs.active > i {
         app.docs.active -= 1;
+    }
+    if browser
+        && !app.pdm.workspace_active
+        && let Err(error) = crate::pdm_panel::enter(app)
+    {
+        app.set_status(error, true);
+    }
+}
+
+/// Close the visible page. PDM is a reusable application tab, so leaving it
+/// returns to Home without changing any document or server reservation.
+pub fn close_active_tab(app: &mut SolveApp) {
+    if app.file_picker_busy() || app.file_load.busy() {
+        return;
+    }
+    if app.pdm.workspace_active {
+        crate::pdm_panel::leave(app);
+        app.home.show(app.session.revision);
+    } else if !app.home.open {
+        close(app, app.docs.active, false);
     }
 }
 
@@ -432,11 +565,36 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
         if app.home.open { t.text } else { t.app_bar_text },
     );
     crate::scenario::publish_handle("tab:home", home.center());
-    if response.clicked() && !app.file_load.busy() {
+    if response.clicked() && !app.file_picker_busy() && !app.file_load.busy() {
+        crate::pdm_panel::leave(app);
         app.home.show(app.session.revision);
     }
-    let x0 = x0 + 70.0;
-    let info = tabs_info(app);
+    let mut x0 = x0 + 70.0;
+    if app.pdm.tab_open() {
+        let pdm = Rect::from_min_size(pos2(x0, r.top() + 5.0), vec2(66.0, r.height() - 5.0));
+        let response = ui.interact(pdm, ui.id().with("pdm_tab"), Sense::click());
+        tab_shape(ui.painter(), &t, pdm, app.pdm.workspace_active && !app.home.open, response.hovered());
+        ui.painter().text(
+            pdm.center(),
+            Align2::CENTER_CENTER,
+            app.tr("ui.pdm_title"),
+            FontId::proportional(13.0),
+            if app.pdm.workspace_active && !app.home.open { t.text } else { t.app_bar_text },
+        );
+        crate::scenario::publish_handle("tab:pdm", pdm.center());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !app.file_picker_busy(), app.tr("ui.pdm_title")));
+        if response.clicked()
+            && !app.file_picker_busy()
+            && let Err(error) = crate::pdm_panel::enter(app)
+        {
+            app.set_status(error, true);
+        }
+        x0 += 70.0;
+    }
+    // Home and PDM can be used before a real design exists. The startup session
+    // remains internal; no dummy file or extra document tab is created.
+    let info =
+        if app.docs.slots.is_empty() && active_is_blank(app) && (app.home.open || app.pdm.workspace_active) { Vec::new() } else { tabs_info(app) };
     let n = info.len();
     let (first, shown, w) = layout(n, app.docs.active, x1 - x0);
     let mut x = x0;
@@ -444,7 +602,7 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
     let mut shut: Option<usize> = None;
     for (i, (name, dirty)) in info.iter().enumerate().skip(first).take(shown) {
         let tr = Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(w - 2.0, r.height() - 5.0));
-        let active = !app.home.open && (i == app.docs.active || app.docs.slots.is_empty());
+        let active = !app.home.open && !app.pdm.workspace_active && (i == app.docs.active || app.docs.slots.is_empty());
         let resp = ui.interact(tr, ui.id().with(("doc_tab", i)), Sense::click_and_drag());
         crate::scenario::publish_handle(&format!("tab:design:{i}"), tr.center());
         // The tabs are part of the title bar: dragging one moves the window, a double click
@@ -690,6 +848,98 @@ pub(crate) fn saved_for_close(app: &mut SolveApp) {
 mod tests {
     use super::*;
     use crate::Services;
+
+    #[test]
+    fn pdm_tab_home_opens_one_browser_without_creating_a_design_file() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.show(h.app.session.revision);
+        h.frames(3);
+        assert!(crate::scenario::handles("tab:pdm").is_empty(), "PDM does not occupy a document tab before explicit use");
+        let original = h.app.session.doc.clone();
+        let count = h.app.docs.count();
+        h.step(&json!({"click":{"handle":"home:pdm"}})).unwrap();
+        h.frames(3);
+        assert!(h.app.pdm.workspace_active && !h.app.home.open);
+        assert_eq!(h.app.docs.count(), count);
+        assert_eq!(*h.app.session.doc, *original);
+        assert!(h.app.session.path.is_none() && !h.app.session.is_dirty());
+        for _ in 0..2 {
+            h.step(&json!({"click":{"handle":"tab:pdm"}})).unwrap();
+            h.frames(2);
+        }
+        assert_eq!(crate::scenario::handles("tab:pdm").len(), 1);
+        assert_eq!(h.app.docs.count(), count);
+        h.step(&json!({"click":{"handle":"tab:home"}})).unwrap();
+        h.frames(2);
+        assert!(h.app.home.open && !h.app.pdm.workspace_active);
+        assert!(crate::scenario::handle_at("home:pdm").is_some());
+    }
+
+    #[test]
+    fn pdm_tab_preserves_document_render_workspace_memory_and_browser_navigation() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        h.app.ui.tab = "RENDER".into();
+        h.app.cam.distance = 42.0;
+        let original = h.app.session.doc.clone();
+        let undo = h.app.session.undo.len();
+        h.app.pdm.folder = "Projects".into();
+        h.app.pdm.document = "part".into();
+        crate::pdm_panel::enter(&mut h.app).unwrap();
+        h.frames(2);
+        h.step(&json!({"click":{"handle":"tab:design:0"}})).unwrap();
+        h.frames(2);
+        assert!(!h.app.pdm.workspace_active && !h.app.home.open);
+        assert_eq!(h.app.ui.tab, "RENDER");
+        assert_eq!(*h.app.session.doc, *original);
+        assert_eq!(h.app.session.undo.len(), undo);
+        assert_eq!(h.app.cam.distance, 42.0);
+        assert!(h.app.session.is_dirty());
+        h.step(&json!({"click":{"handle":"tab:pdm"}})).unwrap();
+        h.frames(2);
+        assert!(h.app.pdm.workspace_active);
+        assert_eq!(h.app.pdm.folder, "Projects");
+        assert_eq!(h.app.pdm.document, "part");
+    }
+
+    #[test]
+    fn pdm_tab_first_native_working_load_does_not_create_a_dummy_document_tab() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.show(h.app.session.revision);
+        crate::pdm_panel::enter(&mut h.app).unwrap();
+        let mut loaded = Session::default();
+        loaded.path = Some("Working/part.solidcraft".into());
+        loaded.mark_saved();
+        apply_managed(&mut h.app, loaded).unwrap();
+        assert_eq!(h.app.docs.count(), 1);
+        assert_eq!(h.app.session.path.as_deref(), Some("Working/part.solidcraft"));
+        assert!(!h.app.home.open);
+    }
+
+    #[test]
+    fn pdm_tab_last_document_close_and_ctrl_w_preserve_the_connection() {
+        use solidcraft_engine::pdm::{Outcome, Task};
+        let mut h = crate::scenario::Harness::new();
+        h.app.services.pdm = Some(std::sync::Arc::new(|_| std::sync::mpsc::channel().1));
+        h.app.pdm.runtime.set_available(true).unwrap();
+        let id = h.app.pdm.runtime.enqueue(Task::Connect { port: 48231 }).unwrap();
+        h.app.pdm.runtime.finish(id, Ok(Outcome::Connected { port: 48231, versions: vec![] })).unwrap();
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        h.app.pdm.folder = "Projects".into();
+        crate::pdm_panel::enter(&mut h.app).unwrap();
+        close(&mut h.app, 0, true);
+        h.frames(2);
+        assert!(h.app.pdm.workspace_active && !h.app.home.open);
+        assert!(h.app.session.path.is_none() && h.app.session.doc.features.is_empty());
+        assert_eq!(h.app.pdm.runtime.status().unwrap().port, Some(48231));
+        h.step(&json!({"key":"W","cmd":true})).unwrap();
+        h.frames(2);
+        assert!(h.app.home.open && !h.app.pdm.workspace_active);
+        assert_eq!(h.app.pdm.runtime.status().unwrap().port, Some(48231));
+        h.step(&json!({"click":{"handle":"tab:pdm"}})).unwrap();
+        h.frames(2);
+        assert_eq!(h.app.pdm.folder, "Projects");
+    }
 
     fn app() -> SolveApp {
         SolveApp::new(Session::default(), Services::default())

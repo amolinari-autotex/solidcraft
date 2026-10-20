@@ -689,8 +689,16 @@ impl SolveApp {
         if matches!(id, "pdm.connection.recover" | "pdm.recover_workspace") && documents::any_dirty(self) {
             return Err("Save or Save As all unsaved editors before recovering a working folder".into());
         }
+        let managed_dirty = matches!(id, "pdm.checkout" | "pdm.get_latest" | "pdm.cancel_checkout" | "pdm.open_document" | "pdm.restore_version")
+            && documents::managed_target_dirty(self, params.get("document").and_then(Value::as_str));
+        let preserving_checkout = id == "pdm.checkout"
+            && self.session.is_dirty()
+            && documents::managed_editor_stamp(self, params.get("document").and_then(Value::as_str)).is_some_and(|stamp| stamp.matches_active(self));
+        let explicit_discard = id == "pdm.cancel_checkout" && params.get("discard").and_then(Value::as_bool) == Some(true);
         if matches!(id, "pdm.checkout" | "pdm.get_latest" | "pdm.cancel_checkout" | "pdm.open_document" | "pdm.restore_version")
-            && documents::managed_target_dirty(self, params.get("document").and_then(Value::as_str))
+            && managed_dirty
+            && !preserving_checkout
+            && !explicit_discard
         {
             return Err("Save or Save As the unsaved editor before replacing its managed working copy".into());
         }
@@ -706,8 +714,41 @@ impl SolveApp {
         if self.file_load.busy() || self.file_picker.is_some() || self.saving.is_some() {
             return Err("a file operation is in progress".into());
         }
+        if id == "pdm.archive" && self.session.is_dirty() && params.get("reconcile").and_then(Value::as_bool) != Some(true) {
+            solidcraft_engine::cmd::validate_pdm_params(id, &params).map_err(|error| error.to_string())?;
+            if self.dialog.is_some()
+                || self.tool.is_some()
+                || self.applying.is_some()
+                || self.deferred.is_some()
+                || self.docs.closing.is_some()
+                || self.docs.quitting.is_some()
+                || self.session.active_sketch.is_some()
+                || !self.session.pending_moves.is_empty()
+            {
+                return Err("Finish or cancel interactive edits before checking in the design".into());
+            }
+            let status = self.pdm.runtime.status()?;
+            if let Some(reason) = status.action_unavailable(
+                id,
+                params.get("document").and_then(Value::as_str),
+                self.session.path.as_deref(),
+                true,
+                self.session.pdm_read_only,
+                None,
+            ) {
+                return Err(reason.into());
+            }
+            self.session.check_pdm_reopen().map_err(|error| error.to_string())?;
+            return save_job::archive(self, params);
+        }
+        let discard_stamp = explicit_discard.then(|| documents::managed_editor_stamp(self, params.get("document").and_then(Value::as_str))).flatten();
         let t0 = now_ms();
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
+        if let (Some(stamp), Ok(value)) = (discard_stamp, &r)
+            && let Some(request) = value.get("request").and_then(Value::as_u64)
+        {
+            self.pdm.discard_ack = Some((request, stamp));
+        }
         self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
         if let Ok(v) = &r {
             if matches!(id, "view.ambient_occlusion" | "view.graphics_preset") {

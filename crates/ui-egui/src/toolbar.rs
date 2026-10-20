@@ -591,7 +591,7 @@ fn file_menu(app: &mut SolveApp, ctx: &egui::Context) {
 /// Whether the open design is on screen. Home hides it, so commands that act on it (save,
 /// undo, insert, export, tool shortcuts) are off there.
 pub fn design_shown(app: &SolveApp) -> bool {
-    !app.home.open
+    !app.home.open && !app.pdm.workspace_active
 }
 
 pub fn save(app: &mut SolveApp) {
@@ -1425,6 +1425,7 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
         if mods.command {
             match k {
                 Key::N => crate::documents::new_design(app),
+                Key::W if !mods.shift && !mods.alt => crate::documents::close_active_tab(app),
                 Key::Comma => crate::prefs::open_at(app, 0),
                 Key::O => {
                     app.pick_open(|app, path| {
