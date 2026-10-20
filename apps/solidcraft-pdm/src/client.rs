@@ -142,6 +142,100 @@ fn validate_identity(identity: crate::AuthenticatedIdentity, expected: &str) -> 
 }
 
 impl Client {
+    /// Negotiate only the separate extension route on a direct pinned HTTPS peer.
+    /// An old peer's 404 means unavailable, without sending a new legacy operation.
+    pub fn capabilities(&self) -> Result<crate::administration::Capabilities, Error> {
+        use crate::administration::{AdminResponse, CAPABILITIES_PATH, CAPABILITIES_PROTOCOL, CapabilityRequest};
+        self.direct_extension_origin()?;
+        let identity = self.authenticated_identity()?;
+        let body = serde_json::to_vec(&CapabilityRequest { protocol: CAPABILITIES_PROTOCOL.into(), server_id: identity.server_id.clone() })?;
+        match self.extension_exchange(CAPABILITIES_PATH, &body)? {
+            AdminResponse::Capabilities { capabilities }
+                if capabilities.server_id == identity.server_id && capabilities.protocol == CAPABILITIES_PROTOCOL =>
+            {
+                Ok(capabilities)
+            }
+            _ => Err(Error::Invalid("capabilities response")),
+        }
+    }
+
+    /// The caller captures any new bearer in private native storage before
+    /// submitting its verifier. This method never receives or returns that secret.
+    pub fn admin(&self, request: crate::administration::AdminRequest) -> Result<crate::administration::AdminResponse, Error> {
+        use crate::administration::{ADMIN_PATH, ADMIN_PROTOCOL, AdminEnvelope};
+        let capabilities = self.capabilities()?;
+        if !capabilities.features.users_admin_v1 {
+            return Err(Error::Server("capability_unavailable".into()));
+        }
+        if !capabilities.permissions.iter().any(|permission| permission == "users.manage") {
+            return Err(Error::Server("forbidden".into()));
+        }
+        let body = serde_json::to_vec(&AdminEnvelope { protocol: ADMIN_PROTOCOL.into(), server_id: capabilities.server_id, request })?;
+        self.extension_exchange(ADMIN_PATH, &body)
+    }
+
+    fn direct_extension_origin(&self) -> Result<(&str, &ureq::Agent), Error> {
+        match &self.transport {
+            Transport::Https { endpoint, agent, .. } => endpoint
+                .strip_suffix(crate::HTTP_RPC_PATH)
+                .map(|origin| (origin, agent))
+                .ok_or_else(|| Error::Server("capability_unavailable".into())),
+            _ => Err(Error::Server("capability_unavailable".into())),
+        }
+    }
+
+    fn extension_exchange(&self, path: &str, body: &[u8]) -> Result<crate::administration::AdminResponse, Error> {
+        use crate::administration::{AdminResponse, MAX_BODY};
+        if body.len() > MAX_BODY {
+            return Err(Error::Invalid("administration request size"));
+        }
+        let (origin, agent) = self.direct_extension_origin()?;
+        let mut response = agent
+            .post(format!("{origin}{path}"))
+            .header(ureq::http::header::AUTHORIZATION, authorization_header(&self.token)?)
+            .header(ureq::http::header::CONTENT_TYPE, "application/json")
+            .header(ureq::http::header::ACCEPT, "application/json")
+            .send(body)
+            .map_err(|_| https_network_error())?;
+        let status = response.status().as_u16();
+        let content_type =
+            response.headers().get(ureq::http::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).and_then(|value| value.split(';').next());
+        if !content_type.is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json")) {
+            return Err(Error::Invalid("administration response content type"));
+        }
+        let bytes = response.body_mut().with_config().limit(crate::MAX_FRAME).read_to_vec().map_err(|_| https_network_error())?;
+        let decoded: AdminResponse = match serde_json::from_slice(&bytes) {
+            Ok(decoded) => decoded,
+            Err(_) if status == 404 => return Err(Error::Server("capability_unavailable".into())),
+            Err(_) if status == 503 => return Err(Error::Server("storage_error".into())),
+            Err(_) => return Err(Error::Invalid("administration response JSON")),
+        };
+        if decoded.status() != status {
+            return Err(Error::Invalid("administration response status"));
+        }
+        match decoded {
+            AdminResponse::Error { code } => match code.as_str() {
+                "invalid_request"
+                | "unsupported_protocol"
+                | "unauthorized"
+                | "forbidden"
+                | "not_found"
+                | "storage_error"
+                | "conflict"
+                | "self_lockout"
+                | "last_administrator"
+                | "principal_exists"
+                | "duplicate_credential"
+                | "idempotency_conflict"
+                | "capability_unavailable"
+                | "quota"
+                | "server_identity_mismatch" => Err(Error::Server(code)),
+                _ => Err(Error::Invalid("administration response error code")),
+            },
+            response => Ok(response),
+        }
+    }
+
     pub fn new(port: u16, token: AuthToken) -> Self {
         Self { transport: Transport::Loopback(port), token }
     }

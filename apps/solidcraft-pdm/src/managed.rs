@@ -13,6 +13,7 @@ use std::{
 const MAX_STATE: usize = 4 * 1024 * 1024;
 const MAX_GENERATIONS: u64 = 4096;
 const MAX_METADATA_STORAGE: u64 = 64 * 1024 * 1024;
+mod administration;
 mod metadata_db;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,7 +498,13 @@ impl ManagedStore {
             return None;
         }
         let hash = digest(token.as_bytes());
-        self.credentials.iter().find(|item| bool::from(hash.as_bytes().ct_eq(item.token_sha256.as_bytes()))).map(|item| item.principal.clone())
+        self.credentials
+            .iter()
+            .find(|item| {
+                bool::from(hash.as_bytes().ct_eq(item.token_sha256.as_bytes()))
+                    && self.metadata.as_ref().is_none_or(|metadata| !metadata.image.disabled(&item.principal.id))
+            })
+            .map(|item| item.principal.clone())
     }
 
     fn publish(&mut self, state: State) -> Result<(), Error> {

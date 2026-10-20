@@ -85,6 +85,237 @@ fn rpc(address: SocketAddr, token: &str, request: Request) -> Response {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
 }
+
+fn extension(address: SocketAddr, token: &str, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+    let body = serde_json::to_vec(&body).unwrap();
+    let mut wire = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).into_bytes();
+    wire.extend(body);
+    let response = raw(address, &wire);
+    let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap())
+}
+
+#[test]
+fn capabilities_negotiate_without_changing_legacy_rpc_or_migrating_json() {
+    let root = Temp::new();
+    let service = server(&root);
+    let id = match rpc(service.address(), ALICE, Request::ManagedCatalog) {
+        Response::ManagedCatalog { catalog } => catalog.server_id,
+        _ => panic!(),
+    };
+    let (status, response) =
+        extension(service.address(), VIEWER, "/pdm/v1/capabilities", serde_json::json!({"protocol":"solidcraft-pdm-capabilities/1","server_id":id}));
+    assert_eq!(status, 200);
+    assert_eq!(response["capabilities"]["principal"]["role"], "viewer");
+    assert_eq!(response["capabilities"]["features"]["users_admin_v1"], false);
+    assert!(!response.to_string().contains("token_sha256"));
+    assert!(!root.0.join("managed/metadata.redb").exists());
+    assert!(matches!(rpc(service.address(), ALICE, Request::Identity {}), Response::Identity { .. }));
+    service.shutdown().unwrap();
+}
+
+fn database_admin_server(root: &Temp) -> HttpsServer {
+    let seed = root.0.join("seed");
+    fs::create_dir(&seed).unwrap();
+    let users: Vec<_> = [("actual-admin", "administrator", ALICE), ("bob", "contributor", BOB), ("reader", "viewer", VIEWER)]
+        .into_iter().map(|(id,role,token)| serde_json::json!({"principal":{"id":id,"role":role},"token_sha256":format!("{:x}",Sha256::digest(token.as_bytes()))})).collect();
+    fs::write(seed.join("managed-principals.json"), serde_json::to_vec(&users).unwrap()).unwrap();
+    Store::open(&seed).unwrap().backup(&root.0.join("backup")).unwrap();
+    solidcraft_pdm::backup_restore::restore_backup_to_redb(&root.0.join("backup"), &root.0.join("database")).unwrap();
+    HttpsServer::start(Store::open(&root.0.join("database")).unwrap(), config()).unwrap()
+}
+fn admin(address: SocketAddr, token: &str, id: &str, request: serde_json::Value) -> (u16, serde_json::Value) {
+    extension(address, token, "/pdm/v1/admin", serde_json::json!({"protocol":"solidcraft-pdm-admin/1","server_id":id,"request":request}))
+}
+fn identity(address: SocketAddr) -> String {
+    match rpc(address, ALICE, Request::ManagedCatalog) {
+        Response::ManagedCatalog { catalog } => catalog.server_id,
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn administration_enforces_roles_cas_retry_and_revokes_existing_document_access() {
+    let root = Temp::new();
+    let service = database_admin_server(&root);
+    let address = service.address();
+    let id = identity(address);
+    let (status, caps) =
+        extension(address, ALICE, "/pdm/v1/capabilities", serde_json::json!({"protocol":"solidcraft-pdm-capabilities/1","server_id":id}));
+    assert_eq!(status, 200);
+    assert_eq!(caps["capabilities"]["features"]["users_admin_v1"], true);
+    assert_eq!(caps["capabilities"]["principal"]["id"], "actual-admin");
+    for token in [BOB, VIEWER] {
+        let (status, response) = admin(address, token, &id, serde_json::json!({"operation":"list_users"}));
+        assert_eq!(status, 403);
+        assert_eq!(response["code"], "forbidden");
+    }
+    let (status, list) = admin(address, ALICE, &id, serde_json::json!({"operation":"list_users"}));
+    assert_eq!(status, 200);
+    assert_eq!(list["revision"], 0);
+    assert_eq!(list["users"].as_array().unwrap().len(), 3);
+    assert!(!list.to_string().contains("sha256"));
+    let new_token = "d".repeat(64);
+    let verifier = format!("{:x}", Sha256::digest(new_token.as_bytes()));
+    let create = serde_json::json!({"operation":"create_user","request_id":"new-reader","expected_revision":0,"id":"new-reader","role":"viewer","credential_sha256":verifier});
+    let (status, created) = admin(address, ALICE, &id, create.clone());
+    assert_eq!(status, 200);
+    assert_eq!(created["revision"], 1);
+    assert!(!created.to_string().contains(&verifier));
+    assert_eq!(admin(address, ALICE, &id, create.clone()).1, created);
+    let mut changed = create;
+    changed["role"] = "administrator".into();
+    assert_eq!(admin(address, ALICE, &id, changed).1["code"], "idempotency_conflict");
+    assert!(matches!(rpc(address, &new_token, Request::Identity {}), Response::Identity { .. }));
+    assert_eq!(
+        admin(address, ALICE, &id, serde_json::json!({"operation":"set_role","request_id":"stale","expected_revision":0,"id":"bob","role":"viewer"}))
+            .1["code"],
+        "conflict"
+    );
+    assert_eq!(
+        admin(
+            address,
+            ALICE,
+            &id,
+            serde_json::json!({"operation":"set_role","request_id":"demote-bob","expected_revision":1,"id":"bob","role":"viewer"})
+        )
+        .1["revision"],
+        2
+    );
+    assert!(
+        matches!(rpc(address, BOB, Request::ManagedCreate { logical_path:"denied.txt".into() }), Response::Error { code } if code == "forbidden")
+    );
+    assert_eq!(
+        admin(
+            address,
+            ALICE,
+            &id,
+            serde_json::json!({"operation":"set_enabled","request_id":"disable-bob","expected_revision":2,"id":"bob","enabled":false})
+        )
+        .1["revision"],
+        3
+    );
+    assert!(matches!(rpc(address, BOB, Request::ManagedCatalog), Response::Error { code } if code == "unauthorized"));
+    let list = admin(address, ALICE, &id, serde_json::json!({"operation":"list_users"})).1;
+    let bob = list["users"].as_array().unwrap().iter().find(|user| user["id"] == "bob").unwrap();
+    assert_eq!(bob["permissions"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        admin(
+            address,
+            ALICE,
+            &id,
+            serde_json::json!({"operation":"set_enabled","request_id":"enable-bob","expected_revision":3,"id":"bob","enabled":true})
+        )
+        .1["revision"],
+        4
+    );
+    let replacement = "e".repeat(64);
+    let reset = serde_json::json!({"operation":"replace_credential","request_id":"reset-bob","expected_revision":4,"id":"bob","credential_sha256":format!("{:x}",Sha256::digest(replacement.as_bytes()))});
+    assert_eq!(admin(address, ALICE, &id, reset).1["revision"], 5);
+    assert!(matches!(rpc(address, BOB, Request::ManagedCatalog), Response::Error { code } if code == "unauthorized"));
+    assert!(matches!(rpc(address, &replacement, Request::Identity {}), Response::Identity { identity } if identity.principal.id == "bob"));
+    let (status, audit) = admin(address, ALICE, &id, serde_json::json!({"operation":"list_audit","after_generation":null,"limit":128}));
+    assert_eq!(status, 200);
+    assert_eq!(audit["events"].as_array().unwrap().len(), 6);
+    assert_eq!(audit["events"][5]["operation"], "user.replace_credential");
+    assert_eq!(audit["events"][5]["subject"], "bob");
+    assert!(!audit.to_string().contains("sha256"));
+    assert_eq!(
+        admin(
+            address,
+            ALICE,
+            &id,
+            serde_json::json!({"operation":"set_enabled","request_id":"disable-new-reader","expected_revision":5,"id":"new-reader","enabled":false})
+        )
+        .1["revision"],
+        6
+    );
+    let client =
+        solidcraft_pdm::client::Client::https_with_ca(&format!("https://{address}"), solidcraft_pdm::AuthToken::parse(ALICE.into()).unwrap(), CA)
+            .unwrap()
+            .bind_server(&id)
+            .unwrap();
+    assert!(client.capabilities().unwrap().features.users_admin_v1);
+    assert!(matches!(
+        client.admin(solidcraft_pdm::administration::AdminRequest::ListUsers {}).unwrap(),
+        solidcraft_pdm::administration::AdminResponse::Users { revision: 6, .. }
+    ));
+    assert!(
+        matches!(client.admin(solidcraft_pdm::administration::AdminRequest::SetRole { request_id: "missing-user".into(), expected_revision: 6, id: "missing-user".into(), role: solidcraft_pdm::managed::Role::Viewer }), Err(solidcraft_pdm::Error::Server(code)) if code == "not_found")
+    );
+    let disabled = solidcraft_pdm::client::Client::https_with_ca(
+        &format!("https://{address}"),
+        solidcraft_pdm::AuthToken::parse(new_token.clone()).unwrap(),
+        CA,
+    )
+    .unwrap()
+    .bind_server(&id)
+    .unwrap();
+    assert!(matches!(disabled.capabilities(), Err(solidcraft_pdm::Error::Server(code)) if code == "unauthorized"));
+    service.shutdown().unwrap();
+    let database = root.0.join("database");
+    Store::open(&database).unwrap().backup(&root.0.join("admin-backup")).unwrap();
+    let restored = root.0.join("restored");
+    solidcraft_pdm::backup_restore::restore_backup(&root.0.join("admin-backup"), &restored).unwrap();
+    let service = HttpsServer::start(Store::open(&restored).unwrap(), config()).unwrap();
+    assert_eq!(admin(service.address(), ALICE, &id, serde_json::json!({"operation":"list_users"})).1["revision"], 6);
+    assert!(matches!(rpc(service.address(), BOB, Request::ManagedCatalog), Response::Error { code } if code == "unauthorized"));
+    assert!(matches!(rpc(service.address(), &replacement, Request::Identity {}), Response::Identity { .. }));
+    assert!(matches!(rpc(service.address(), &new_token, Request::ManagedCatalog), Response::Error { code } if code == "unauthorized"));
+    service.shutdown().unwrap();
+}
+
+#[test]
+fn administration_protects_last_admin_self_lockout_and_hostile_inputs() {
+    let root = Temp::new();
+    let service = database_admin_server(&root);
+    let address = service.address();
+    let id = identity(address);
+    let mutate = |request| admin(address, ALICE, &id, request);
+    for request in [
+        serde_json::json!({"operation":"set_role","request_id":"last-role","expected_revision":0,"id":"actual-admin","role":"viewer"}),
+        serde_json::json!({"operation":"set_enabled","request_id":"last-enabled","expected_revision":0,"id":"actual-admin","enabled":false}),
+    ] {
+        assert_eq!(mutate(request).1["code"], "last_administrator");
+    }
+    assert_eq!(
+        mutate(serde_json::json!({"operation":"set_role","request_id":"promote","expected_revision":0,"id":"bob","role":"administrator"})).1["revision"],
+        1
+    );
+    assert_eq!(
+        mutate(serde_json::json!({"operation":"set_enabled","request_id":"self","expected_revision":1,"id":"actual-admin","enabled":false})).1["code"],
+        "self_lockout"
+    );
+    for bad in ["", "../user", "Admin", "owner", "with space"] {
+        assert_eq!(mutate(serde_json::json!({"operation":"create_user","request_id":"bad-id","expected_revision":1,"id":bad,"role":"viewer","credential_sha256":"a".repeat(64)})).0, 400);
+    }
+    assert_eq!(mutate(serde_json::json!({"operation":"create_user","request_id":"duplicate","expected_revision":1,"id":"duplicate","role":"viewer","credential_sha256":format!("{:x}",Sha256::digest(BOB.as_bytes()))})).1["code"], "duplicate_credential");
+    assert_eq!(mutate(serde_json::json!({"operation":"list_audit","limit":0,"after_generation":null})).0, 400);
+    assert_eq!(mutate(serde_json::json!({"operation":"list_users","unexpected":true})).0, 400);
+    assert_eq!(admin(address, ALICE, &"f".repeat(64), serde_json::json!({"operation":"list_users"})).1["code"], "server_identity_mismatch");
+    let response = extension(
+        address,
+        ALICE,
+        "/pdm/v1/admin",
+        serde_json::json!({"protocol":"solidcraft-pdm-admin/9","server_id":id,"request":{"operation":"list_users"}}),
+    );
+    assert_eq!(response.1["code"], "unsupported_protocol");
+    let audit = mutate(serde_json::json!({"operation":"list_audit","limit":1,"after_generation":null})).1;
+    assert_eq!(audit["events"].as_array().unwrap().len(), 1);
+    assert!(audit["next_after_generation"].is_u64());
+    let noop = serde_json::json!({"operation":"set_role","request_id":"noop-admin","expected_revision":1,"id":"bob","role":"administrator"});
+    let response = mutate(noop.clone()).1;
+    assert_eq!(response["revision"], 1);
+    assert_eq!(
+        mutate(serde_json::json!({"operation":"set_role","request_id":"bob-viewer","expected_revision":1,"id":"bob","role":"viewer"})).1["revision"],
+        2
+    );
+    assert_eq!(mutate(noop).1, response);
+    assert!(
+        matches!(rpc(address, BOB, Request::Identity {}), Response::Identity { identity } if identity.principal.role == solidcraft_pdm::managed::Role::Viewer)
+    );
+    service.shutdown().unwrap();
+}
 #[test]
 fn startup_requires_credentials_and_valid_tls() {
     let root = Temp::new();

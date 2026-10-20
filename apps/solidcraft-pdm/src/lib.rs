@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod administration;
 pub mod backup_restore;
 pub mod blob_store;
 pub mod bootstrap;

@@ -1,5 +1,6 @@
 //! Bounded aggregate adapter. Blob bytes never enter the database.
 use super::{MAX_GENERATIONS, PrincipalCredential, State, label, now};
+use crate::administration::{AdminResponse, AuditChange, PublicAuditEvent};
 use crate::{Error, digest};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,26 @@ pub(super) struct AuditEvent {
     operation: String,
     unix_ms: u64,
     state_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    change: Option<AuditChange>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminReceipt {
+    pub owner: String,
+    pub fingerprint: String,
+    pub response: AdminResponse,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminState {
+    pub revision: u64,
+    pub disabled: BTreeSet<String>,
+    pub receipts: std::collections::BTreeMap<String, AdminReceipt>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -30,6 +51,8 @@ pub(super) struct Image {
     pub state: State,
     pub credentials: Vec<PrincipalCredential>,
     pub audit: Vec<AuditEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub administration: Option<AdminState>,
 }
 
 pub(super) fn validate_credentials(credentials: &[PrincipalCredential]) -> Result<(), Error> {
@@ -54,7 +77,7 @@ pub(super) fn validate_credentials(credentials: &[PrincipalCredential]) -> Resul
 
 impl Image {
     pub(super) fn imported(generation: u64, state: State, credentials: Vec<PrincipalCredential>) -> Result<Self, Error> {
-        let mut image = Self { format: FORMAT.into(), generation, state, credentials, audit: vec![] };
+        let mut image = Self { format: FORMAT.into(), generation, state, credentials, audit: vec![], administration: None };
         image.record("migration", "import")?;
         image.validate()?;
         Ok(image)
@@ -68,6 +91,9 @@ impl Image {
         Ok(image)
     }
     fn fingerprint(&self) -> Result<String, Error> {
+        if let Some(admin) = &self.administration {
+            return Ok(digest(&serde_json::to_vec(&(&self.state, &self.credentials, admin))?));
+        }
         Ok(digest(&serde_json::to_vec(&(&self.state, &self.credentials))?))
     }
     fn record(&mut self, actor: &str, operation: &str) -> Result<(), Error> {
@@ -77,6 +103,8 @@ impl Image {
             operation: operation.into(),
             unix_ms: now()?,
             state_sha256: self.fingerprint()?,
+            subject: None,
+            change: None,
         });
         Ok(())
     }
@@ -91,13 +119,56 @@ impl Image {
         }
         self.state.validate()?;
         validate_credentials(&self.credentials)?;
+        if let Some(admin) = &self.administration {
+            if admin.revision > self.generation
+                || admin.receipts.len() > 256
+                || admin.disabled.iter().any(|id| !self.credentials.iter().any(|item| item.principal.id == *id))
+                || !self
+                    .credentials
+                    .iter()
+                    .any(|item| item.principal.role == super::Role::Administrator && !admin.disabled.contains(&item.principal.id))
+            {
+                return Err(Error::Integrity);
+            }
+            for (id, receipt) in &admin.receipts {
+                if !crate::valid_id(id) || !label(&receipt.owner) || !super::hash_id(&receipt.fingerprint) {
+                    return Err(Error::Integrity);
+                }
+                match &receipt.response {
+                    AdminResponse::UserChanged { revision, user }
+                        if *revision <= admin.revision
+                            && label(&user.id)
+                            && user.id != "owner"
+                            && user.permissions == if user.enabled { crate::administration::permissions(user.role) } else { vec![] } => {}
+                    _ => return Err(Error::Integrity),
+                }
+            }
+        }
         if serde_json::to_vec(&self.state)?.len() > super::MAX_STATE {
             return Err(Error::Invalid("metadata quota"));
         }
         let mut previous = None;
         for event in &self.audit {
+            if event.operation.starts_with("user.") != event.subject.is_some()
+                || event.subject.is_some() != event.change.is_some()
+                || event.subject.as_ref().is_some_and(|subject| !label(subject) || subject == "owner")
+            {
+                return Err(Error::Integrity);
+            }
             if !label(&event.actor)
-                || !matches!(event.operation.as_str(), "import" | "create" | "checkout" | "cancel_checkout" | "check_in")
+                || !matches!(
+                    event.operation.as_str(),
+                    "import"
+                        | "create"
+                        | "checkout"
+                        | "cancel_checkout"
+                        | "check_in"
+                        | "user.create"
+                        | "user.set_role"
+                        | "user.set_enabled"
+                        | "user.replace_credential"
+                        | "user.noop"
+                )
                 || !super::hash_id(&event.state_sha256)
                 || event.generation == 0
                 || previous.is_some_and(|value: u64| value.checked_add(1) != Some(event.generation))
@@ -130,6 +201,42 @@ impl Image {
     }
     pub(super) fn from_file(path: &Path) -> Result<Self, Error> {
         Self::parse(&crate::client::read_file(path, MAX_IMAGE)?)
+    }
+    pub(super) fn disabled(&self, id: &str) -> bool {
+        self.administration.as_ref().is_some_and(|admin| admin.disabled.contains(id))
+    }
+    pub(super) fn admin_next(
+        &self,
+        credentials: Vec<PrincipalCredential>,
+        administration: AdminState,
+        actor: &str,
+        operation: &str,
+        subject: String,
+        change: AuditChange,
+    ) -> Result<Self, Error> {
+        let mut image = self.clone();
+        image.generation = image.generation.checked_add(1).ok_or(Error::Integrity)?;
+        image.credentials = credentials;
+        image.administration = Some(administration);
+        image.record(actor, operation)?;
+        let event = image.audit.last_mut().ok_or(Error::Integrity)?;
+        event.subject = Some(subject);
+        event.change = Some(change);
+        image.validate()?;
+        Ok(image)
+    }
+    pub(super) fn public_audit(&self) -> Vec<PublicAuditEvent> {
+        self.audit
+            .iter()
+            .map(|event| PublicAuditEvent {
+                generation: event.generation,
+                actor: event.actor.clone(),
+                operation: event.operation.clone(),
+                unix_ms: event.unix_ms,
+                subject: event.subject.clone(),
+                change: event.change.clone(),
+            })
+            .collect()
     }
 }
 
@@ -301,5 +408,94 @@ mod tests {
             assert!(crate::Store::open(&root).is_err());
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn failed_administration_commit_preserves_authority_revision_receipt_and_audit() {
+        use super::super::{Principal, PrincipalCredential, Role};
+        use crate::administration::{AdminRequest, AdminResponse};
+        let root = std::env::temp_dir().join(format!("pdm-admin-abort-{}", crate::AuthToken::generate().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let token = "a".repeat(64);
+        let credentials = vec![PrincipalCredential {
+            principal: Principal { id: "administrator".into(), role: Role::Administrator },
+            token_sha256: digest(token.as_bytes()),
+        }];
+        fs::write(root.join("managed-principals.json"), serde_json::to_vec(&credentials).unwrap()).unwrap();
+        let mut store = crate::Store::open(&root).unwrap();
+        store.managed.convert_restored_to_database().unwrap();
+        let id = store.managed.server_id().to_owned();
+        let new_token = "b".repeat(64);
+        let request = AdminRequest::CreateUser {
+            request_id: "new-user".into(),
+            expected_revision: 0,
+            id: "new-user".into(),
+            role: Role::Contributor,
+            credential_sha256: digest(new_token.as_bytes()),
+        };
+        store.managed.metadata.as_mut().unwrap().abort_next = true;
+        assert!(matches!(store.execute_extension(Some(request.clone()), &token, &id), AdminResponse::Error { code } if code == "storage_error"));
+        assert!(store.managed.authenticate(&new_token).is_none());
+        assert!(store.managed.metadata.as_ref().unwrap().image.administration.is_none());
+        assert_eq!(store.managed.metadata.as_ref().unwrap().image.audit.len(), 1);
+        drop(store);
+        let mut store = crate::Store::open(&root).unwrap();
+        assert!(store.managed.authenticate(&new_token).is_none());
+        let expected = store.execute_extension(Some(request.clone()), &token, &id);
+        assert!(matches!(expected, AdminResponse::UserChanged { revision: 1, .. }));
+        assert_eq!(store.execute_extension(Some(request), &token, &id), expected);
+        assert!(store.managed.authenticate(&new_token).is_some());
+        assert_eq!(store.managed.metadata.as_ref().unwrap().image.audit.len(), 2);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn administration_audit_response_can_exceed_the_request_body_limit() {
+        use super::super::{Principal, PrincipalCredential, Role};
+        use crate::administration::{AdminRequest, AdminResponse};
+        let root = std::env::temp_dir().join(format!("pdm-admin-page-{}", crate::AuthToken::generate().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let token = "a".repeat(64);
+        let target = "\"".repeat(128);
+        let credentials = vec![
+            PrincipalCredential { principal: Principal { id: "\\".repeat(128), role: Role::Administrator }, token_sha256: digest(token.as_bytes()) },
+            PrincipalCredential { principal: Principal { id: target.clone(), role: Role::Viewer }, token_sha256: digest("b".repeat(64).as_bytes()) },
+        ];
+        fs::write(root.join("managed-principals.json"), serde_json::to_vec(&credentials).unwrap()).unwrap();
+        let mut store = crate::Store::open(&root).unwrap();
+        store.managed.convert_restored_to_database().unwrap();
+        let id = store.managed.server_id().to_owned();
+        for index in 0..128 {
+            assert!(matches!(
+                store.execute_extension(
+                    Some(AdminRequest::SetRole { request_id: format!("noop-{index}"), expected_revision: 0, id: target.clone(), role: Role::Viewer }),
+                    &token,
+                    &id
+                ),
+                AdminResponse::UserChanged { revision: 0, .. }
+            ));
+        }
+        let request = AdminRequest::ListAudit { after_generation: Some(1), limit: 128 };
+        let result = store.execute_extension(Some(request.clone()), &token, &id);
+        assert!(serde_json::to_vec(&result).unwrap().len() > crate::administration::MAX_BODY);
+        let config = crate::http_server::HttpsConfig::from_der(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![include_bytes!("../../tests/fixtures/pdm-https/server.der").to_vec()],
+            include_bytes!("../../tests/fixtures/pdm-https/server-key.der").to_vec(),
+        )
+        .unwrap();
+        let service = crate::http_server::HttpsServer::start(store, config).unwrap();
+        let client = crate::client::Client::https_with_ca(
+            &format!("https://{}", service.address()),
+            crate::AuthToken::parse(token).unwrap(),
+            include_bytes!("../../tests/fixtures/pdm-https/ca.der"),
+        )
+        .unwrap()
+        .bind_server(&id)
+        .unwrap();
+        assert_eq!(client.admin(request).unwrap(), result);
+        service.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }

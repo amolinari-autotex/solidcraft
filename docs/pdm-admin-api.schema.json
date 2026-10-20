@@ -1,0 +1,622 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SolidCraft PDM administration v1",
+  "description": "Separate negotiated HTTPS extension; never a legacy RPC operation. Semantic CAS/idempotency/last-admin rules are specified in server-admin-api-contract.md.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/CapabilityRequest"
+    },
+    {
+      "$ref": "#/$defs/AdminEnvelope"
+    },
+    {
+      "$ref": "#/$defs/AdminResponse"
+    }
+  ],
+  "$defs": {
+    "CapabilityRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "solidcraft-pdm-capabilities/1"
+        },
+        "server_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "protocol",
+        "server_id"
+      ]
+    },
+    "AdminEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "solidcraft-pdm-admin/1"
+        },
+        "server_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "request": {
+          "$ref": "#/$defs/AdminRequest"
+        }
+      },
+      "required": [
+        "protocol",
+        "server_id",
+        "request"
+      ]
+    },
+    "AdminRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "list_users"
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "create_user"
+            },
+            "request_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,64}$"
+            },
+            "expected_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,64}$"
+            },
+            "role": {
+              "enum": [
+                "viewer",
+                "contributor",
+                "administrator"
+              ]
+            },
+            "credential_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "required": [
+            "operation",
+            "request_id",
+            "expected_revision",
+            "id",
+            "role",
+            "credential_sha256"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "set_role"
+            },
+            "request_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,64}$"
+            },
+            "expected_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            },
+            "role": {
+              "enum": [
+                "viewer",
+                "contributor",
+                "administrator"
+              ]
+            }
+          },
+          "required": [
+            "operation",
+            "request_id",
+            "expected_revision",
+            "id",
+            "role"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "set_enabled"
+            },
+            "request_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,64}$"
+            },
+            "expected_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            },
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "operation",
+            "request_id",
+            "expected_revision",
+            "id",
+            "enabled"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "replace_credential"
+            },
+            "request_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]{1,64}$"
+            },
+            "expected_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            },
+            "credential_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "required": [
+            "operation",
+            "request_id",
+            "expected_revision",
+            "id",
+            "credential_sha256"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "list_audit"
+            },
+            "after_generation": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 18446744073709551615
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 128
+            }
+          },
+          "required": [
+            "operation",
+            "after_generation",
+            "limit"
+          ]
+        }
+      ]
+    },
+    "UserSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        },
+        "role": {
+          "enum": [
+            "viewer",
+            "contributor",
+            "administrator"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "catalog.read",
+              "versions.read",
+              "content.read",
+              "references.read",
+              "documents.create",
+              "checkout.manage_own",
+              "versions.publish",
+              "users.manage",
+              "audit.read"
+            ]
+          },
+          "maxItems": 9,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "id",
+        "role",
+        "enabled",
+        "permissions"
+      ]
+    },
+    "Capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "solidcraft-pdm-capabilities/1"
+        },
+        "server_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "principal": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "role": {
+              "enum": [
+                "viewer",
+                "contributor",
+                "administrator"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "role"
+          ]
+        },
+        "metadata_backend": {
+          "enum": [
+            "redb",
+            "json_generations"
+          ]
+        },
+        "features": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "users_admin_v1": {
+              "type": "boolean"
+            },
+            "audit_read_v1": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "users_admin_v1",
+            "audit_read_v1"
+          ]
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "catalog.read",
+              "versions.read",
+              "content.read",
+              "references.read",
+              "documents.create",
+              "checkout.manage_own",
+              "versions.publish",
+              "users.manage",
+              "audit.read"
+            ]
+          },
+          "maxItems": 9,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "protocol",
+        "server_id",
+        "principal",
+        "metadata_backend",
+        "features",
+        "permissions"
+      ]
+    },
+    "PublicAuditEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "actor": {
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "import",
+            "create",
+            "checkout",
+            "cancel_checkout",
+            "check_in",
+            "user.create",
+            "user.set_role",
+            "user.set_enabled",
+            "user.replace_credential",
+            "user.noop"
+          ]
+        },
+        "unix_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "subject": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "change": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "previous_role": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "viewer",
+                        "contributor",
+                        "administrator"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "role": {
+                  "enum": [
+                    "viewer",
+                    "contributor",
+                    "administrator"
+                  ]
+                },
+                "previous_enabled": {
+                  "anyOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "credential_replaced": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "previous_role",
+                "role",
+                "previous_enabled",
+                "enabled",
+                "credential_replaced"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "generation",
+        "actor",
+        "operation",
+        "unix_ms",
+        "subject",
+        "change"
+      ]
+    },
+    "AdminResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "const": "capabilities"
+            },
+            "capabilities": {
+              "$ref": "#/$defs/Capabilities"
+            }
+          },
+          "required": [
+            "result",
+            "capabilities"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "const": "users"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "users": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "$ref": "#/$defs/UserSummary"
+              }
+            }
+          },
+          "required": [
+            "result",
+            "revision",
+            "users"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "const": "user_changed"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "user": {
+              "$ref": "#/$defs/UserSummary"
+            }
+          },
+          "required": [
+            "result",
+            "revision",
+            "user"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "const": "audit"
+            },
+            "events": {
+              "type": "array",
+              "maxItems": 128,
+              "items": {
+                "$ref": "#/$defs/PublicAuditEvent"
+              }
+            },
+            "next_after_generation": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 18446744073709551615
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "result",
+            "events",
+            "next_after_generation"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "const": "error"
+            },
+            "code": {
+              "enum": [
+                "invalid_request",
+                "unsupported_protocol",
+                "unauthorized",
+                "forbidden",
+                "not_found",
+                "storage_error",
+                "conflict",
+                "self_lockout",
+                "last_administrator",
+                "principal_exists",
+                "duplicate_credential",
+                "idempotency_conflict",
+                "capability_unavailable",
+                "quota",
+                "server_identity_mismatch"
+              ]
+            }
+          },
+          "required": [
+            "result",
+            "code"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,7 +1,8 @@
 //! Bounded HTTPS RPC transport. Only configured principals reach the writer.
+use crate::administration::{self, AdminEnvelope, AdminRequest, AdminResponse, CapabilityRequest};
 pub use crate::http_listener::HttpsConfig;
 use crate::http_listener::{Handler, HttpListener};
-use crate::{Error, HTTP_RPC_PATH, MAX_FRAME, PROTOCOL, Request, Response, RpcEnvelope, Store};
+use crate::{Error, HTTP_RPC_PATH, MAX_FRAME, PROTOCOL, Request, RpcEnvelope, Store};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
     Request as HttpRequest, Response as HttpResponse, StatusCode,
@@ -16,7 +17,11 @@ use std::{
 use tokio::sync::oneshot;
 const DEADLINE: Duration = Duration::from_secs(5);
 type Reply = HttpResponse<Full<Bytes>>;
-type Job = (Request, String, Option<String>, oneshot::Sender<Response>);
+enum JobRequest {
+    Rpc(Request),
+    Extension(Option<AdminRequest>),
+}
+type Job = (JobRequest, String, Option<String>, oneshot::Sender<(u16, Vec<u8>)>);
 pub struct HttpsServer {
     address: SocketAddr,
     listener: Option<HttpListener>,
@@ -41,8 +46,18 @@ impl HttpsServer {
         let (send, receive) = mpsc::sync_channel::<Job>(16);
         let writer = thread::Builder::new().name("pdm-writer".into()).spawn(move || {
             while let Ok((request, credential, expected, reply)) = receive.recv() {
-                let response = store.execute_configured_for(request, &credential, expected.as_deref());
-                let _ = reply.send(response);
+                let (status, bytes) = match request {
+                    JobRequest::Rpc(request) => (200, serde_json::to_vec(&store.execute_configured_for(request, &credential, expected.as_deref()))),
+                    JobRequest::Extension(request) => {
+                        let response = store.execute_extension(request, &credential, expected.as_deref().unwrap_or(""));
+                        (response.status(), serde_json::to_vec(&response))
+                    }
+                };
+                let wire = match bytes {
+                    Ok(bytes) if bytes.len() <= MAX_FRAME as usize => (status, bytes),
+                    _ => (500, b"{}".to_vec()),
+                };
+                let _ = reply.send(wire);
             }
         })?;
         let handler: Handler = Arc::new(move |request| {
@@ -100,7 +115,13 @@ async fn rpc(request: HttpRequest<Incoming>, send: mpsc::SyncSender<Job>) -> Res
     if request.method() != hyper::Method::POST {
         return Ok(reply(StatusCode::METHOD_NOT_ALLOWED, "{}"));
     }
-    if request.uri().path() != HTTP_RPC_PATH || request.uri().query().is_some() {
+    let route = match request.uri().path() {
+        HTTP_RPC_PATH => 0,
+        administration::CAPABILITIES_PATH => 1,
+        administration::ADMIN_PATH => 2,
+        _ => return Ok(reply(StatusCode::NOT_FOUND, "{}")),
+    };
+    if request.uri().query().is_some() {
         return Ok(reply(StatusCode::NOT_FOUND, "{}"));
     }
     if request.headers().contains_key(hyper::header::UPGRADE)
@@ -113,36 +134,63 @@ async fn rpc(request: HttpRequest<Incoming>, send: mpsc::SyncSender<Job>) -> Res
     let Some(credential) = credential.filter(|c| c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit())).map(str::to_owned) else {
         return Ok(reply(StatusCode::UNAUTHORIZED, "{}"));
     };
+    let max_body = if route == 0 { MAX_FRAME as usize } else { administration::MAX_BODY };
     if request
         .headers()
         .get(hyper::header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.parse::<u64>().ok())
-        .is_some_and(|n| n > MAX_FRAME)
+        .is_some_and(|n| n > max_body as u64)
     {
         return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, "{}"));
     }
-    let bytes = match tokio::time::timeout(DEADLINE, Limited::new(request.into_body(), MAX_FRAME as usize).collect()).await {
+    let bytes = match tokio::time::timeout(DEADLINE, Limited::new(request.into_body(), max_body).collect()).await {
         Ok(Ok(body)) => body.to_bytes(),
         Ok(Err(_)) => return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, "{}")),
         Err(_) => return Ok(reply(StatusCode::REQUEST_TIMEOUT, "{}")),
     };
-    let envelope: RpcEnvelope = match serde_json::from_slice(&bytes) {
-        Ok(envelope) => envelope,
-        Err(_) => return Ok(reply(StatusCode::BAD_REQUEST, "{}")),
+    let (request, server_id) = if route == 0 {
+        let envelope: RpcEnvelope = match serde_json::from_slice(&bytes) {
+            Ok(envelope) => envelope,
+            Err(_) => return Ok(reply(StatusCode::BAD_REQUEST, "{}")),
+        };
+        if envelope.protocol != PROTOCOL {
+            return Ok(reply(StatusCode::BAD_REQUEST, "{}"));
+        }
+        (JobRequest::Rpc(envelope.request), envelope.server_id)
+    } else if route == 1 {
+        let envelope: CapabilityRequest = match serde_json::from_slice(&bytes) {
+            Ok(envelope) => envelope,
+            Err(_) => return Ok(extension_error("invalid_request")),
+        };
+        if envelope.protocol != administration::CAPABILITIES_PROTOCOL {
+            return Ok(extension_error("unsupported_protocol"));
+        }
+        (JobRequest::Extension(None), Some(envelope.server_id))
+    } else {
+        let envelope: AdminEnvelope = match serde_json::from_slice(&bytes) {
+            Ok(envelope) => envelope,
+            Err(_) => return Ok(extension_error("invalid_request")),
+        };
+        if envelope.protocol != administration::ADMIN_PROTOCOL {
+            return Ok(extension_error("unsupported_protocol"));
+        }
+        (JobRequest::Extension(Some(envelope.request)), Some(envelope.server_id))
     };
-    if envelope.protocol != PROTOCOL {
-        return Ok(reply(StatusCode::BAD_REQUEST, "{}"));
-    }
     let (result, receive) = oneshot::channel();
-    if send.try_send((envelope.request, credential, envelope.server_id, result)).is_err() {
+    if send.try_send((request, credential, server_id, result)).is_err() {
         return Ok(reply(StatusCode::SERVICE_UNAVAILABLE, "{}"));
     }
     match tokio::time::timeout(DEADLINE, receive).await {
-        Ok(Ok(response)) => match serde_json::to_vec(&response) {
-            Ok(bytes) if bytes.len() <= MAX_FRAME as usize => Ok(reply(StatusCode::OK, bytes)),
-            _ => Ok(reply(StatusCode::INTERNAL_SERVER_ERROR, "{}")),
-        },
+        Ok(Ok((status, bytes))) => Ok(reply(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), bytes)),
         _ => Ok(reply(StatusCode::SERVICE_UNAVAILABLE, "{}")),
+    }
+}
+
+fn extension_error(code: &str) -> Reply {
+    let response = AdminResponse::error(code);
+    match serde_json::to_vec(&response) {
+        Ok(bytes) => reply(StatusCode::from_u16(response.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), bytes),
+        Err(_) => reply(StatusCode::INTERNAL_SERVER_ERROR, "{}"),
     }
 }
