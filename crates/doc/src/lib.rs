@@ -47,6 +47,8 @@ mod piece_names;
 mod points;
 mod profile_refs;
 pub mod progress;
+mod thread_catalog;
+pub use thread_catalog::{TappedThread, TappedThreadFamily, parse_tapped_thread, tapped_thread_sizes};
 mod walk;
 pub use profile_refs::{capture_profile_selection, profile_fallback_notes, profile_selection_indices, profile_selection_indices_lenient};
 pub mod plastic;

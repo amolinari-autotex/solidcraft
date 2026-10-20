@@ -381,7 +381,7 @@ fn thread_for(diameter: f64, internal: bool) -> Option<(f64, f64)> {
         .map(|(n, p, _)| (n, p))
 }
 
-fn format_thread(d: f64, p: f64) -> String {
+pub(crate) fn format_thread(d: f64, p: f64) -> String {
     let coarse = ISO_COARSE.iter().any(|(n, q)| (n - d).abs() < 1e-9 && (q - p).abs() < 1e-9);
     let num = |x: f64| if (x - x.round()).abs() < 1e-9 { format!("{}", x.round()) } else { format!("{x}") };
     if coarse { format!("M{}", num(d)) } else { format!("M{}x{}", num(d), num(p)) }
@@ -396,6 +396,20 @@ pub fn suggested_thread(st: &ModelState, p: Vec3) -> Result<String> {
 /// A cosmetic thread on the cylindrical face at `p`. A `turned` (modelled) thread also fits a
 /// shaft thicker than it, which it turns down to its major diameter first.
 fn thread_on(st: &ModelState, feature: u64, p: Vec3, designation: Option<&str>, length: Option<f64>, turned: bool) -> Result<ThreadInfo> {
+    thread_on_impl(st, feature, p, designation, length, false, turned)
+}
+
+// Tapped holes admit verified Unified sizes; the separate Thread feature remains metric,
+// including when an untrusted design requests modelled geometry.
+fn thread_on_impl(
+    st: &ModelState,
+    feature: u64,
+    p: Vec3,
+    designation: Option<&str>,
+    length: Option<f64>,
+    tapped: bool,
+    turned: bool,
+) -> Result<ThreadInfo> {
     let (body, cyl) = st
         .bodies
         .iter()
@@ -406,21 +420,33 @@ fn thread_on(st: &ModelState, feature: u64, p: Vec3, designation: Option<&str>, 
         })
         .ok_or_else(|| DocError::Invalid("no cylindrical face there to thread".into()))?;
     let dia = cyl.radius * 2.0;
-    let (major, pitch) = match designation {
-        Some(s) => parse_metric_thread(s).ok_or_else(|| DocError::Invalid(format!("unknown thread `{s}` (ISO metric, like M8 or M8x1)")))?,
-        None => thread_for(dia, cyl.internal).ok_or_else(|| DocError::Invalid(format!("no metric thread fits a {dia:.2} mm cylinder")))?,
+    let tapped_size = if tapped {
+        let name = designation.ok_or_else(|| DocError::Invalid("a tapped hole needs a designation".into()))?;
+        Some(
+            crate::parse_tapped_thread(name)
+                .ok_or_else(|| DocError::Invalid(format!("unknown tapped thread `{name}` (ISO metric or a catalogued UNC/UNF size)")))?,
+        )
+    } else {
+        None
     };
-    let fits = if cyl.internal {
+    let (major, pitch) = match &tapped_size {
+        Some(size) => (size.major_diameter, size.pitch),
+        None => match designation {
+            Some(s) => parse_metric_thread(s).ok_or_else(|| DocError::Invalid(format!("unknown thread `{s}` (ISO metric, like M8 or M8x1)")))?,
+            None => thread_for(dia, cyl.internal).ok_or_else(|| DocError::Invalid(format!("no metric thread fits a {dia:.2} mm cylinder")))?,
+        },
+    };
+    let name = tapped_size.as_ref().map(|s| s.designation.clone()).unwrap_or_else(|| format_thread(major, pitch));
+    let fits = if let Some(size) = tapped_size.as_ref().filter(|s| s.family != crate::TappedThreadFamily::Metric) {
+        // Fit the recommended physical drill, without borrowing an ISO minor-diameter rule.
+        cyl.internal && (size.tap_drill - dia).abs() < 0.15 * major
+    } else if cyl.internal {
         (major - pitch * 1.0825 - dia).abs() < 0.2 * major || (major - pitch - dia).abs() < 0.15 * major
     } else {
         (major - dia).abs() < 0.15 * major || (turned && dia > major)
     };
     if !fits {
-        return Err(DocError::Invalid(format!(
-            "an {} thread does not fit a {dia:.2} mm {}",
-            format_thread(major, pitch),
-            if cyl.internal { "hole" } else { "shaft" }
-        )));
+        return Err(DocError::Invalid(format!("an {} thread does not fit a {dia:.2} mm {}", name, if cyl.internal { "hole" } else { "shaft" })));
     }
     // From the end of the face nearest the point.
     let s = (p - cyl.axis_point).dot(cyl.axis);
@@ -438,7 +464,7 @@ fn thread_on(st: &ModelState, feature: u64, p: Vec3, designation: Option<&str>, 
     Ok(ThreadInfo {
         feature,
         body,
-        designation: format_thread(major, pitch),
+        designation: name,
         major_diameter: major,
         pitch,
         internal: cyl.internal,
@@ -6240,7 +6266,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 let r = val(vals, diameter, Kind::Length)? / 2.0;
                 for p in spots {
                     let wall = p + dir.any_perp() * r + dir * (r * 0.5);
-                    let t = thread_on(st, f.id, wall, Some(d), None, false)?;
+                    let t = thread_on_impl(st, f.id, wall, Some(d), None, true, false)?;
                     st.threads.push(t);
                 }
             }

@@ -3858,7 +3858,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                     if let Some(error) = opts.custom_thread.as_ref().and_then(|draft| draft.error.as_ref()) {
                         return Err(error.clone());
                     }
-                    solidcraft_engine::doc::parse_metric_thread(&opts.thread).ok_or("select a valid metric thread size")?;
+                    solidcraft_engine::doc::parse_tapped_thread(&opts.thread).ok_or("select a valid metric or catalogued UNC/UNF thread size")?;
                     params["thread"] = json!(opts.thread.trim());
                 }
                 match *kind {
