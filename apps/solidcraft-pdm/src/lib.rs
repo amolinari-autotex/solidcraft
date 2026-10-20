@@ -157,6 +157,7 @@ pub enum Request {
     Identity {},
     ManagedCatalog,
     ManagedCreate { logical_path: String },
+    ManagedCreateNew { logical_path: String },
     ManagedCheckout { document: String, workspace: String, machine: String },
     ManagedResumeCheckout { document: String, workspace: String, machine: String },
     ManagedCancelCheckout { document: String, workspace: String, machine: String, checkout_token: String },
@@ -174,6 +175,7 @@ impl std::fmt::Debug for Request {
             Self::Identity {} => "Identity",
             Self::ManagedCatalog => "ManagedCatalog",
             Self::ManagedCreate { .. } => "ManagedCreate",
+            Self::ManagedCreateNew { .. } => "ManagedCreateNew",
             Self::ManagedCheckout { .. } => "ManagedCheckout",
             Self::ManagedResumeCheckout { .. } => "ManagedResumeCheckout",
             Self::ManagedCancelCheckout { .. } => "ManagedCancelCheckout",
@@ -464,6 +466,9 @@ impl Store {
             }),
             Request::ManagedCatalog => Ok(Response::ManagedCatalog { catalog: self.managed.catalog() }),
             Request::ManagedCreate { logical_path } => self.managed.create(principal, logical_path).map(|entry| Response::ManagedDocument { entry }),
+            Request::ManagedCreateNew { logical_path } => {
+                self.managed.create_new(principal, logical_path).map(|entry| Response::ManagedDocument { entry })
+            }
             Request::ManagedResumeCheckout { document, workspace, machine } => {
                 self.managed.resume_checkout(principal, &document, &workspace, &machine).map(|grant| Response::ManagedCheckout { grant })
             }

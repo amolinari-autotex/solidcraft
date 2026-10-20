@@ -420,6 +420,13 @@ impl Client {
         }
     }
 
+    pub fn managed_create_new(&self, logical_path: String) -> Result<crate::managed::CatalogEntry, Error> {
+        match self.request(Request::ManagedCreateNew { logical_path })? {
+            Response::ManagedDocument { entry } => Ok(entry),
+            _ => Err(Error::Invalid("unexpected exclusive managed create response")),
+        }
+    }
+
     pub fn managed_checkout(&self, document: String, workspace: String, machine: String) -> Result<crate::managed::CheckoutGrant, Error> {
         match self.request(Request::ManagedCheckout { document, workspace, machine })? {
             Response::ManagedCheckout { grant } => Ok(grant),

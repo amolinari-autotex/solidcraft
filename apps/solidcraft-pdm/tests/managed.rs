@@ -288,6 +288,34 @@ fn logical_paths_are_portable_unique_and_never_server_paths() {
 }
 
 #[test]
+fn import_new_reserves_a_path_exclusively_without_touching_existing_content() {
+    let temp = Temp::new();
+    let alice = user("alice");
+    let mut store = Store::open(&temp.0).unwrap();
+    let request = || serde_json::from_value::<Request>(serde_json::json!({"operation":"managed_create_new","logical_path":"parts/import.txt"}));
+    assert!(request().is_ok(), "new-only import reservation must be supported");
+    let entry = match store.execute_as(request().unwrap(), &alice) {
+        Response::ManagedDocument { entry } => entry,
+        other => panic!("{other:?}"),
+    };
+    let grant = checkout(&mut store, &alice, &entry.document, "ws");
+    let published = committed(store.execute_as(Request::ManagedCheckIn { input: input(&grant, "import-first") }, &alice));
+    error(store.execute_as(request().unwrap(), &alice), "conflict");
+    let folded = serde_json::from_value::<Request>(serde_json::json!({"operation":"managed_create_new","logical_path":"Parts/Import.txt"})).unwrap();
+    error(store.execute_as(folded, &alice), "conflict");
+    let history = match store.execute_as(Request::ManagedHistory { document: entry.document.clone() }, &alice) {
+        Response::ManagedHistory { versions } => versions,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0], published);
+    assert_eq!(create(&mut store, &alice, "parts/import.txt").checkout, None);
+    let viewer = Principal { id: "reader".into(), role: Role::Viewer };
+    let denied = serde_json::from_value::<Request>(serde_json::json!({"operation":"managed_create_new","logical_path":"denied.txt"})).unwrap();
+    error(store.execute_as(denied, &viewer), "forbidden");
+}
+
+#[test]
 fn graph_download_list_and_where_used_include_managed_versions() {
     let temp = Temp::new();
     let alice = user("alice");

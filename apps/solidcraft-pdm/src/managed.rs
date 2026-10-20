@@ -605,6 +605,17 @@ impl ManagedStore {
         Ok(entry)
     }
 
+    /// An import reserves a fresh path under the store's exclusive lock. It
+    /// never obtains the identity or checkout of an existing catalog document.
+    pub(crate) fn create_new(&mut self, principal: &Principal, logical_path: String) -> Result<CatalogEntry, Error> {
+        Self::write_permission(principal)?;
+        validate_logical_path(&logical_path)?;
+        if self.state.documents.values().any(|entry| entry.logical_path.to_lowercase() == logical_path.to_lowercase()) {
+            return Err(Error::Conflict);
+        }
+        self.create(principal, logical_path)
+    }
+
     fn write_permission(principal: &Principal) -> Result<(), Error> {
         if principal.role == Role::Viewer { Err(Error::Forbidden) } else { Ok(()) }
     }
