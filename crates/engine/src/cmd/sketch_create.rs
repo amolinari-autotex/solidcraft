@@ -112,7 +112,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(concat!(
             "link: the text's link id (or entity: one of its curves), text?, at?, height?, angle?: deg (numbers or expressions as in sketch.text; a number replaces an expression, and so does moving the text), font?: family or file path (empty: the built-in font), ",
             text_style_doc!(),
-            " (each kept when left out); live?: bool: one frame of an interactive change (the sketch is solved, the features after it stay as they were until `sketch.drag_end`)",
+            " (each kept when left out); or edits: [{link or entity, text?, at?, …}]: several texts changed together, the design rebuilt once \
+             (all or nothing; returns edits: each one's result); live?: bool: one frame of an interactive change (the sketch is solved, the features after it stay as they were until `sketch.drag_end`)",
             created_doc!()
         )),
 ];
@@ -344,6 +345,9 @@ pub(super) fn move_text(sk: &mut Sketch, link: &str, translate: Vec2, rotation: 
     Ok(sk.link_curves(&link))
 }
 
+/// The most texts one `sketch.edit_text {edits}` changes.
+const MAX_TEXT_EDITS: usize = 1000;
+
 fn edit_text(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.edit_text";
     let id = s.active_sketch.ok_or_else(|| bad(cmd, "no sketch is being edited"))?;
@@ -352,7 +356,7 @@ fn edit_text(s: &mut Session, p: &Value) -> Result<Value> {
     // The numbers its expressions give now (a parameter may have changed since the sketch was
     // last stored); one that cannot be evaluated is left as it was, to be replaced by this edit.
     let _ = doc.apply_text_values(&doc.param_values().0, &mut sk);
-    let out = apply_text_edit(&mut sk, &doc, p)?;
+    let out = apply_text_edits(&mut sk, &doc, p)?;
     *doc.sketch_mut(id)? = sk;
     *s.doc_mut() = doc;
     Ok(out)
@@ -363,8 +367,25 @@ fn edit_text(s: &mut Session, p: &Value) -> Result<Value> {
 fn edit_text_live(s: &mut Session, p: &Value) -> Result<(Value, Option<crate::LiveEdit>)> {
     let cmd = "sketch.edit_text";
     let id = s.active_sketch.ok_or_else(|| bad(cmd, "no sketch is being edited"))?;
-    let (out, report) = super::sketch::edit_solved(s, id, false, |sk, doc| Ok((apply_text_edit(sk, doc, p)?, super::sketch::Left::Unsolved)))?;
+    let (out, report) = super::sketch::edit_solved(s, id, false, |sk, doc| Ok((apply_text_edits(sk, doc, p)?, super::sketch::Left::Unsolved)))?;
     Ok((out, report.map(|report| crate::LiveEdit { sketch: id, report })))
+}
+
+/// `sketch.edit_text`'s change: one text's (`link` or `entity`), or each of `edits` in turn.
+/// One command, so the features after the sketch are rebuilt once for all of them.
+fn apply_text_edits(sk: &mut Sketch, doc: &solidcraft_doc::Document, p: &Value) -> Result<Value> {
+    let cmd = "sketch.edit_text";
+    match p.get("edits") {
+        None | Some(Value::Null) => apply_text_edit(sk, doc, p),
+        Some(Value::Array(edits)) => {
+            if edits.is_empty() || edits.len() > MAX_TEXT_EDITS {
+                return Err(bad(cmd, format!("`edits` must hold 1 to {MAX_TEXT_EDITS} edits")));
+            }
+            let outs = edits.iter().map(|e| apply_text_edit(sk, doc, e)).collect::<Result<Vec<_>>>()?;
+            Ok(json!({"edits": outs}))
+        }
+        Some(_) => Err(bad(cmd, "`edits` must be a list of edits")),
+    }
 }
 
 /// `sketch.edit_text`'s change to its sketch: the text source's new values and its outlines

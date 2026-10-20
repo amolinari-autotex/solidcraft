@@ -83,6 +83,8 @@ mod font_tests;
 #[cfg(test)]
 mod least_motion_tests;
 #[cfg(test)]
+mod line_circle_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod thin_tests;

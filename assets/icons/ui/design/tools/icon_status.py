@@ -37,8 +37,11 @@ def art_rev():
     paths += glob.glob(HERE + '/*.py')
     paths += [D + '/palette.toml', D + '/aliases.toml', __file__]
     for path in sorted(paths):
-        st = os.stat(path)
-        h.update(('%s %d %d;' % (os.path.relpath(path, ROOT), st.st_mtime_ns, st.st_size)).encode())
+        # Equal-length edits can share an mtime. Only the content identifies what
+        # the reviewer saw; file metadata must never authorize stale acceptance.
+        h.update(os.path.relpath(path, ROOT).replace(os.sep, '/').encode() + b'\0')
+        with open(path, 'rb') as source:
+            h.update(hashlib.sha256(review_state.lf(source.read())).digest())
     return h.hexdigest()[:16]
 
 

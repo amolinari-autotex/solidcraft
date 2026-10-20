@@ -842,7 +842,7 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
                     if request.kind == Kind::Open {
                         app.home.add_recent(&request.path);
                         if made.thumbnail {
-                            crate::home::remember_session(&mut app.home, &app.session);
+                            crate::home::remember_source(&mut app.home, &app.session, &request.path);
                         }
                     }
                 }

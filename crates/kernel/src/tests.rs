@@ -621,7 +621,7 @@ fn tapered_extrude_swallows_a_short_tip() {
     let meet = |(p0, t0): (Vec2, Vec2), (p1, t1): (Vec2, Vec2)| p0 + t0 * ((p1 - p0).cross(t1) / t0.cross(t1));
     let (low, high, left) = (moved(pts[0], pts[1]), moved(pts[2], pts[3]), moved(pts[3], pts[0]));
     let top = [meet(left, low), meet(low, high), meet(high, left)];
-    let area = |q: &[Vec2]| 0.5 * q.iter().zip(q.iter().cycle().skip(1)).map(|(a, b)| a.cross(*b)).sum::<f64>();
+    let area = |q: &[Vec2]| solidcraft_geom::Ring::from(q.to_vec()).signed_area();
     // Halfway up, each side edge's midpoint (the two tip corners both run to the top's tip).
     let mid = [pts[0].lerp(top[0], 0.5), pts[1].lerp(top[1], 0.5), pts[2].lerp(top[1], 0.5), pts[3].lerp(top[2], 0.5)];
     let v = h / 6.0 * (area(&pts) + 4.0 * area(&mid) + area(&top));
@@ -2962,4 +2962,21 @@ fn loft_pairs_the_vertices_of_matching_non_convex_sections() {
     // skewed quad, one twisted face, 0.3 % under), so the bounds leave room for that.
     assert!(rel(m.volume, want) < 5e-3, "{} vs {want}", m.volume);
     assert!(m.centroid.x.abs() < 0.05, "centre of mass x {}", m.centroid.x);
+}
+
+/// Two cylinders crossing at right angles need the kernel's own intersection: with no tries
+/// left the boolean fails at once, a budget inside another uses the outer one's up, and none
+/// lingers after.
+#[test]
+fn an_attempt_budget_stops_the_boolean_and_is_shared_by_nesting() {
+    let a = cylinder(Vec3::new(0.0, 0.0, -10.0), Vec3::Z, 3.0, 20.0).unwrap();
+    let b = cylinder(Vec3::new(-10.0, 0.0, 0.0), Vec3::X, 2.0, 20.0).unwrap();
+    assert!(with_attempt_budget(0, || boolean(&a, &b, BoolOp::Intersect)).is_err());
+    // The inner budget asks for more than the outer has left: it gets what is left.
+    let (inner, after) = with_attempt_budget(1, || {
+        let inner = with_attempt_budget(10, || boolean(&a, &b, BoolOp::Intersect).is_ok());
+        (inner, boolean(&a, &b, BoolOp::Intersect).is_ok())
+    });
+    assert!(inner && !after);
+    assert!(boolean(&a, &b, BoolOp::Intersect).unwrap().is_some());
 }

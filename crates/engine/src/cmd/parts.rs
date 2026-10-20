@@ -523,13 +523,12 @@ mod tests {
     fn bbox(s: &Session, prefix: &str) -> (solidcraft_geom::Vec3, solidcraft_geom::Vec3) {
         let st = s.world_state();
         let comp = s.doc.components.iter().find(|c| c.name.starts_with(prefix)).map(|c| c.id).unwrap_or(0);
-        let (mut lo, mut hi) = (solidcraft_geom::Vec3::new(f64::MAX, f64::MAX, f64::MAX), solidcraft_geom::Vec3::new(f64::MIN, f64::MIN, f64::MIN));
-        for b in st.bodies.iter().filter(|b| s.doc.model_body_component(b) == comp) {
-            let m = b.mesh().bounds();
-            lo = solidcraft_geom::Vec3::new(lo.x.min(m.min.x), lo.y.min(m.min.y), lo.z.min(m.min.z));
-            hi = solidcraft_geom::Vec3::new(hi.x.max(m.max.x), hi.y.max(m.max.y), hi.z.max(m.max.z));
-        }
-        (lo, hi)
+        let b = st
+            .bodies
+            .iter()
+            .filter(|b| s.doc.model_body_component(b) == comp)
+            .fold(solidcraft_geom::Aabb3::EMPTY, |a, b| a.union(&b.mesh().bounds()));
+        (b.min, b.max)
     }
 
     #[test]

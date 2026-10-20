@@ -14,7 +14,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("pdm.restore_version", "Restore as New Version", restore_version).icon("restore").noundo().doc_only().params("document,version,restore:true; publish historical content as a new head version and restore the clean normal working copy"),
     CommandSpec::new("pdm.recover_workspace", "Recover Interrupted Local Update", recover_workspace).icon("restore").noundo().doc_only().params("port,root,restore:true; explicitly recover an interrupted local update after server verification, preserving recovery copies"),
     CommandSpec::new("pdm.preview", "Preview", preview).icon("render_image").noundo().doc_only().params("document,version; retrieves the embedded thumbnail for that exact version, if available"),
-    CommandSpec::new("pdm.archive", "Check In", archive).at("PDM", "WORKSPACE").icon("save").noundo().doc_only().params("logical_path?: path relative to the managed workspace; automatically discovers document identity and native dependencies"),
+    CommandSpec::new("pdm.archive", "Check In", archive).at("PDM", "WORKSPACE").icon("save").noundo().doc_only().params("document?: selected identity guard; logical_path?: workspace-relative path; reconcile:true only reconciles an existing authenticated publication receipt and never publishes"),
     CommandSpec::new("pdm.checkout", "Check Out", checkout).at("PDM", "WORKSPACE").icon("open").noundo().doc_only().params("document?: selected stable identity; otherwise active managed design"),
     CommandSpec::new("pdm.cancel_checkout", "Undo Checkout", cancel_checkout).at("PDM", "WORKSPACE").icon("undo").noundo().doc_only().params("document?: selected stable identity; discard:true explicitly restores archived content, preserving a recovery copy"),
     CommandSpec::new("pdm.get_latest", "Get Latest", get_latest).at("PDM", "WORKSPACE").icon("update").noundo().doc_only().params("document?: selected stable identity; refuses unsaved local edits"),
@@ -41,7 +41,7 @@ pub(crate) fn validate_params(id: &str, p: &Value) -> Result<()> {
         "pdm.connection.recover" => &["connection_id", "restore"],
         "pdm.connect" => &["port", "root"],
         "pdm.recover_workspace" => &["port", "root", "restore"],
-        "pdm.archive" => &["logical_path"],
+        "pdm.archive" => &["logical_path", "document", "reconcile"],
         "pdm.checkout" | "pdm.get_latest" => &["document"],
         "pdm.cancel_checkout" => &["document", "discard"],
         "pdm.open_document" | "pdm.history" => &["document"],
@@ -127,8 +127,16 @@ pub(crate) fn validate_params(id: &str, p: &Value) -> Result<()> {
         "pdm.open_document" | "pdm.history" => {
             document(p)?;
         }
-        "pdm.archive" if p.get("logical_path").is_some_and(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 1024)) => {
-            return Err(err("Invalid logical archive path"));
+        "pdm.archive" => {
+            if p.get("logical_path").is_some_and(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 1024)) {
+                return Err(err("Invalid logical archive path"));
+            }
+            if p.get("document").is_some() {
+                document(p)?;
+            }
+            if p.get("reconcile").is_some_and(|value| !value.is_boolean()) {
+                return Err(err("reconcile must be boolean"));
+            }
         }
         _ => {}
     }
@@ -187,15 +195,57 @@ fn saved_path(s: &Session) -> Result<String> {
     s.path.clone().filter(|p| solidcraft_io::is_design_path(p)).ok_or_else(|| err("Save a native design in the working folder first"))
 }
 fn archive(s: &mut Session, p: &Value) -> Result<Value> {
+    let selected = p.get("document").map(|_| document(p)).transpose()?;
+    let reconcile = p.get("reconcile").and_then(Value::as_bool) == Some(true);
+    if reconcile {
+        let mut status = s.pdm.status().map_err(err)?;
+        status.error = None; // Receipt-only verification never creates new authority.
+        if let Some(reason) = status.action_unavailable("pdm.archive", selected.as_deref(), s.path.as_deref(), s.is_dirty(), s.pdm_read_only, None)
+            && !matches!(
+                reason,
+                "ui.pdm_reason_checkout_required"
+                    | "ui.pdm_reason_stale_base"
+                    | "ui.pdm_reason_checked_out_here"
+                    | "ui.pdm_reason_checked_out_elsewhere"
+                    | "ui.pdm_reason_checked_out_other"
+            )
+        {
+            return Err(err(reason));
+        }
+    } else {
+        policy(s, "pdm.archive", selected.as_deref(), None)?;
+    }
+    let path = saved_path(s)?;
+    let logical_path = p.get("logical_path").and_then(Value::as_str).map(str::to_string);
+    let saved = s.doc.clone();
+    let visibility = Box::new(s.visibility.clone());
     enqueue(
         s,
-        Task::Managed(ManagedTask::Archive {
-            path: saved_path(s)?,
-            logical_path: p.get("logical_path").and_then(Value::as_str).map(str::to_string),
-            saved: s.doc.clone(),
-            visibility: Box::new(s.visibility.clone()),
+        Task::Managed(if reconcile {
+            ManagedTask::ReconcileArchive { path, logical_path, saved, visibility }
+        } else {
+            ManagedTask::Archive { path, logical_path, saved, visibility }
         }),
     )
+}
+fn policy(s: &Session, command: &str, document: Option<&str>, version: Option<u64>) -> Result<()> {
+    let status = s.pdm.status().map_err(err)?;
+    if let Some(reason) = status.action_unavailable(
+        command,
+        document,
+        s.path.as_deref(),
+        s.is_dirty() || s.active_sketch.is_some() || !s.pending_moves.is_empty(),
+        s.pdm_read_only,
+        version,
+    ) && (command != "pdm.restore_version"
+        || !matches!(
+            reason,
+            "ui.pdm_reason_stale_base" | "ui.pdm_reason_checked_out_here" | "ui.pdm_reason_checked_out_elsewhere" | "ui.pdm_reason_checked_out_other"
+        ))
+    {
+        return Err(err(reason));
+    }
+    Ok(())
 }
 fn target(s: &Session, p: &Value) -> Result<(Option<String>, Option<String>)> {
     if s.is_dirty() || s.active_sketch.is_some() || !s.pending_moves.is_empty() {
@@ -209,6 +259,7 @@ fn target(s: &Session, p: &Value) -> Result<(Option<String>, Option<String>)> {
 }
 fn checkout(s: &mut Session, p: &Value) -> Result<Value> {
     let (document, path) = target(s, p)?;
+    policy(s, "pdm.checkout", document.as_deref(), None)?;
     enqueue(s, Task::Managed(ManagedTask::Checkout { document, path }))
 }
 fn cancel_checkout(s: &mut Session, p: &Value) -> Result<Value> {
@@ -217,10 +268,12 @@ fn cancel_checkout(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(err("Save or Save As current edits before undoing checkout; archived bytes will replace the local copy"));
     }
     let document = p.get("document").map(|_| document(p)).transpose()?;
+    policy(s, "pdm.cancel_checkout", document.as_deref(), None)?;
     enqueue(s, Task::Managed(ManagedTask::CancelCheckout { document, path: s.path.clone() }))
 }
 fn get_latest(s: &mut Session, p: &Value) -> Result<Value> {
     let (document, path) = target(s, p)?;
+    policy(s, "pdm.get_latest", document.as_deref(), None)?;
     enqueue(s, Task::Managed(ManagedTask::GetLatest { document, path }))
 }
 fn open_document(s: &mut Session, p: &Value) -> Result<Value> {
@@ -242,6 +295,7 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
 }
 fn restore_version(s: &mut Session, p: &Value) -> Result<Value> {
     target(s, p)?;
+    policy(s, "pdm.restore_version", Some(&document(p)?), p.get("version").and_then(Value::as_u64))?;
     if p.get("restore").and_then(Value::as_bool) != Some(true) {
         return Err(err("Restore requires explicit restore:true"));
     }

@@ -537,10 +537,9 @@ impl ManagedStore {
             return Err(Error::Invalid("workspace or machine"));
         }
         let entry = self.state.documents.get(document).ok_or(Error::NotFound)?;
-        if let Some(checkout) = &entry.checkout {
-            if checkout.owner == principal.id && checkout.workspace == workspace && checkout.machine == machine {
-                return Ok(CheckoutGrant { entry: entry.clone(), token: self.state.checkout_tokens.get(document).ok_or(Error::Integrity)?.clone() });
-            }
+        // Mutating checkout is never a resume operation. The explicit read-only
+        // resume endpoint recovers an existing authenticated capability.
+        if entry.checkout.is_some() {
             return Err(Error::Conflict);
         }
         let mut entry = entry.clone();

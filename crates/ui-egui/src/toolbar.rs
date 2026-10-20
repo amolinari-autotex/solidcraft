@@ -600,7 +600,7 @@ pub fn save(app: &mut SolveApp) {
         return;
     }
     if app.session.path.is_some() {
-        let _ = app.run("file.save", json!({}));
+        crate::save_job::start(app, "file.save", json!({}));
     } else {
         save_as(app);
     }
@@ -621,8 +621,11 @@ fn save_as_with_extension(app: &mut SolveApp, extension: &str) {
         .filter(|status| status.connection.is_some())
         .and_then(|status| status.managed.root);
     app.pick_save_in(&name, &[solidcraft_engine::io::DESIGN_EXT, "json"], initial_directory.as_deref(), |app, path| {
-        if let Some(path) = path {
-            let _ = app.run("file.save_as", json!({"path": path}));
+        // A save under way answers a closing tab when it ends.
+        if let Some(path) = path
+            && crate::save_job::start(app, "file.save_as", json!({"path": path}))
+        {
+            return;
         }
         crate::documents::saved_for_close(app);
     });
@@ -838,7 +841,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 if family.is_some() {
                     br.max.y -= 12.0;
                 }
-                let info = selected.info(&app.session);
+                let info = app.command_info(selected);
                 let resp = ui.interact(br, ui.id().with(("cmd", c.id)), Sense::click_and_drag());
                 crate::scenario::publish_handle(&format!("toolbar:{}", c.id), br.center());
                 // The button itself (`toolbar:<id>` is also a drop-down row's while one is open).
@@ -1002,7 +1005,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                         // focused: the first or the last), instead of egui's own spatial move.
                         let (down, up) = ui.input(|i| (i.key_pressed(egui::Key::ArrowDown), i.key_pressed(egui::Key::ArrowUp)));
                         if down || up {
-                            let enabled: Vec<&str> = cmds.iter().filter(|c| c.info(&app.session).enabled).map(|c| c.id).collect();
+                            let enabled: Vec<&str> = cmds.iter().filter(|c| app.command_info(c).enabled).map(|c| c.id).collect();
                             let focused = ui.ctx().memory(|m| m.focused());
                             let at = enabled.iter().position(|id| focused == Some(dropdown_row_id(id)));
                             let n = enabled.len();
@@ -1065,7 +1068,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                                 selection_filter(app, ui);
                             }
                             for c in cmds {
-                                let info = c.info(&app.session);
+                                let info = app.command_info(c);
                                 let response = ui.add_enabled(info.enabled, egui::Button::new(c.label).shortcut_text(c.shortcut.unwrap_or("")));
                                 crate::scenario::publish_handle(&format!("toolbar:{}", c.id), response.rect.center());
                                 if response.clicked() {
@@ -1189,7 +1192,7 @@ fn dropdown_width(app: &SolveApp, ui: &egui::Ui, cmds: &[&'static solidcraft_eng
 /// under the pointer or keyboard focus (like every menu).
 fn dropdown_row(app: &SolveApp, ui: &mut egui::Ui, c: &'static solidcraft_engine::CommandSpec, width: f32, pinned: bool) -> RowAction {
     let t = Tokens::get();
-    let info = c.info(&app.session);
+    let info = app.command_info(c);
     let (rect, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
     // Every row drags onto the toolbar (to pin it there); enabled rows also start their command.
     let sense = if info.enabled { Sense::click_and_drag() } else { Sense::drag() };
@@ -1293,7 +1296,7 @@ fn dropdown_keys(app: &SolveApp, ui: &egui::Ui, cmds: &[&'static solidcraft_engi
         return;
     }
     ui.ctx().data_mut(|d| d.insert_temp(handled, pass));
-    let enabled: Vec<_> = cmds.iter().filter(|c| c.info(&app.session).enabled).collect();
+    let enabled: Vec<_> = cmds.iter().filter(|c| app.command_info(c).enabled).collect();
     if enabled.is_empty() {
         return;
     }
@@ -1497,6 +1500,8 @@ mod header_report_tests {
         h.frames(3);
         h.step(&json!({"click":{"handle":"appbar:folder"}})).unwrap();
         h.step(&json!({"widget":"Save As JSON…"})).unwrap();
+        // Written on a worker: the window keeps drawing until it is done.
+        h.settle();
         let saved = h.app.session.path.clone().unwrap();
         let bytes = std::fs::read(&saved).unwrap();
         assert!(!solidcraft_engine::io::is_design_container(&bytes));

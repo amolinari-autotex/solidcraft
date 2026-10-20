@@ -51,7 +51,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("surface.loft", "Surface Loft", surface_loft)
         .at("SURFACE", "CREATE")
         .icon("surface_loft")
-        .params("sections: [{sketch, curves?: [curve ids], profiles?} | {body, edges: [[x,y,z]]}] (2…50 in order; each one chain: a profile without holes, or curves meeting end to end; all open or all closed; a body edge chain takes the face the chain bounds as the surface the end repeats); continuity?: [g0|g1|g2|g3, g0|g1|g2|g3] (each end, default g0: how much of the surface at the first and last section the loft repeats — the tangent plane, the curvature, or how that curvature changes); crown?: [number, number] (default 0: how full each end leaves, -0.9 flattest to 3 fullest); name?, body_name? (a surface body: ruled between two sections, smooth through three or more; no caps)"),
+        .params("sections: [{sketch, curves?: [curve ids], profiles?} | {body, edges: [[x,y,z]]}] (2…50 in order; each one chain: a profile without holes, or curves meeting end to end; all open or all closed; a body edge chain takes the face the chain bounds as the surface the end repeats); continuity?: [g0|g1|g2|g3, g0|g1|g2|g3] (each end, default g0: how much of the surface at the first and last section the loft repeats — the tangent plane, the curvature, or how that curvature changes); crown?: [number, number] (default 0: how full each end leaves, -0.9 flattest to 3 fullest); rails?, rail_fit? (as solid.loft; sketch sections only, both ends g0); name?, body_name? (a surface body: ruled between two sections, smooth through three or more; no caps)"),
     CommandSpec::new("surface.offset", "Offset Surface", offset)
         .at("SURFACE", "CREATE")
         .icon("surface_offset")
@@ -63,7 +63,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("surface.blend", "Blend Surface", blend)
         .at("SURFACE", "CREATE")
         .icon("surface_blend")
-        .params("from, to: {body, edges: [[x,y,z]]} (points on the edges of one chain of each body: two picks on the same edge is that one edge, more chain up); continuity?: [g0|g1|g2|g3, g0|g1|g2|g3] (each end, default g1: how much of the surface at the picked edges the blend repeats — the tangent plane, the curvature, or how that curvature changes); bulge?: [number, number] (default 0: how full each end leaves, -0.9 flattest to 3 fullest); align?: [[x,y,z], [x,y,z]] (a point each end leaves towards, when the faces at the picks do not say); stitch?: bool (sew the blend onto its two bodies where the boundaries meet, replacing them); name?, body_name?"),
+        .params("from, to: {body, edges: [[x,y,z]]} (points on the edges of one chain of each body: two picks on the same edge is that one edge, more chain up); continuity?: [g0|g1|g2|g3, g0|g1|g2|g3] (each end, default g1: how much of the surface at the picked edges the blend repeats — the tangent plane, the curvature, or how that curvature changes); bulge?: [number, number] (default 0: how full each end leaves, -0.9 flattest to 3 fullest); align?: [[x,y,z], [x,y,z]] (a point each end leaves towards, when the faces at the picks do not say); seam?: [[x,y,z], [x,y,z]] (a point on each chain its stations start from: two closed chains otherwise pair the way that keeps the blend from twisting; an open chain starts at the end nearer its point; a closed chain blends only to a closed chain); stitch?: bool (sew the blend onto its two bodies where the boundaries meet, replacing them); name?, body_name?"),
     CommandSpec::new("surface.untrim", "Untrim", untrim)
         .at("SURFACE", "MODIFY")
         .icon("surface_untrim")
@@ -237,18 +237,18 @@ fn blend(s: &mut Session, p: &Value) -> Result<Value> {
             [one(list.first())?, one(list.get(1))?]
         }
     };
-    let align = match p.get("align") {
-        None | Some(Value::Null) => None,
-        Some(v) => {
-            let list = v.as_array().filter(|a| a.len() == 2).ok_or_else(|| bad(cmd, "`align` must be two points, one per end"))?;
-            let point = |x: Option<&Value>| -> Result<solidcraft_geom::Vec3> {
-                x.and_then(vec3).ok_or_else(|| bad(cmd, "each `align` entry must be a point [x,y,z]"))
-            };
-            Some([Position(point(list.first())?), Position(point(list.get(1))?)])
-        }
-    };
+    let align = point_pair(p, cmd, "align", "one per end")?;
+    let seam = point_pair(p, cmd, "seam", "one on each chain")?;
     let stitch = bool_(p, "stitch").unwrap_or(false);
-    add_feature(s, p, FeatureKind::SurfaceBlend { from, to, continuity, bulge, align, stitch })
+    add_feature(s, p, FeatureKind::SurfaceBlend { from, to, continuity, bulge, align, seam, stitch })
+}
+
+/// An optional pair of points `key` (`null` as none): `which` says what each one is.
+fn point_pair(p: &Value, cmd: &str, key: &str, which: &str) -> Result<Option<[Position; 2]>> {
+    let Some(v) = p.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+    let list = v.as_array().filter(|a| a.len() == 2).ok_or_else(|| bad(cmd, format!("`{key}` must be two points, {which}")))?;
+    let point = |x: Option<&Value>| x.and_then(vec3).map(Position).ok_or_else(|| bad(cmd, format!("each `{key}` entry must be a point [x,y,z]")));
+    Ok(Some([point(list.first())?, point(list.get(1))?]))
 }
 
 fn surface_extrude(s: &mut Session, p: &Value) -> Result<Value> {
@@ -431,7 +431,8 @@ fn surface_loft(s: &mut Session, p: &Value) -> Result<Value> {
             [one(list.first())?, one(list.get(1))?]
         }
     };
-    add_feature(s, p, FeatureKind::SurfaceLoft { sections, continuity, crown })
+    let (rails, rail_fit) = super::features::guide_rails(s, p, cmd, "loft", None)?;
+    add_feature(s, p, FeatureKind::SurfaceLoft { sections, continuity, crown, rails, rail_fit })
 }
 
 fn offset(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1804,6 +1805,57 @@ mod tests {
             s.execute("surface.blend", &json!({"from": {"body": "Nope", "edges": [[0, 0, 0]]}, "to": {"body": "Seam", "edges": [[20, 20, 10]]}}))
                 .is_err()
         );
+    }
+
+    /// `surface.blend` between two tube rims: each rim runs along both halves of its tube's wall
+    /// (two faces), the rims are closed, and the blend is the wall between them, straight up the
+    /// axis. Picked `seam` points turn it, are saved with the design, and a closed rim does not
+    /// blend to an open edge.
+    #[test]
+    fn surface_blend_bridges_two_tube_rims() {
+        let mut s = Session::default();
+        run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 30, "body_name": "Low"}));
+        run(&mut s, "surface.unstitch", json!({"body": "Low", "faces": [[0, 0, 30]]}));
+        run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 30, "base": [0, 0, 40], "body_name": "High"}));
+        run(&mut s, "surface.unstitch", json!({"body": "High", "faces": [[0, 0, 40]]}));
+        let rim = |z: f64| -> Value {
+            json!((0..8).map(|k| f64::from(k) * 0.785 + 0.1).map(|a| json!([10.0 * a.cos(), 10.0 * a.sin(), z])).collect::<Vec<_>>())
+        };
+        // Unstitching keeps the wall under the body's own name.
+        let blend = json!({"from": {"body": "Low", "edges": rim(30.0)}, "to": {"body": "High", "edges": rim(40.0)}, "continuity": ["g1", "g1"], "body_name": "Neck"});
+        run(&mut s, "surface.blend", blend.clone());
+        // The wall between: radius 10 and straight up, so 2π·10·10 of area.
+        let want = 2.0 * std::f64::consts::PI * 100.0;
+        assert!((area(&s, "Neck") - want).abs() < want * 1e-3, "{} vs {want}", area(&s, "Neck"));
+        let turn = |s: &Session, name: &str| {
+            let grid = solidcraft_kernel::sample_grid(&s.world_state().body(name).unwrap().body, 17, 5).unwrap();
+            grid.iter()
+                .map(|row| {
+                    let (a, b) = (row[0], row[row.len() - 1]);
+                    (a.y.atan2(a.x) - b.y.atan2(b.x)).rem_euclid(std::f64::consts::TAU).to_degrees()
+                })
+                .map(|d| d.min(360.0 - d))
+                .fold(0.0, f64::max)
+        };
+        assert!(turn(&s, "Neck") < 0.1, "straight up the axis: {}°", turn(&s, "Neck"));
+        // Seams a quarter apart: the blend turns a quarter round, and reads back the same.
+        let mut turned = blend.clone();
+        turned["seam"] = json!([[10, 0, 30], [0, 10, 40]]);
+        turned["body_name"] = json!("Twist");
+        run(&mut s, "surface.blend", turned);
+        assert!((turn(&s, "Twist") - 90.0).abs() < 0.1, "{}°", turn(&s, "Twist"));
+        assert!(s.doc.to_json().contains("\"seam\""), "the seam is saved");
+        let cold = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        assert!((turn(&cold, "Twist") - 90.0).abs() < 0.1, "read back: {}°", turn(&cold, "Twist"));
+        // A closed rim does not blend to an open edge; a seam that is not two points is refused.
+        run(&mut s, "solid.box", json!({"length": 40, "width": 10, "height": 10, "corner": [-20, 30, 30], "body_name": "Block"}));
+        let open = s.execute("surface.blend", &json!({"from": {"body": "Low", "edges": rim(30.0)}, "to": {"body": "Block", "edges": [[0, 30, 40]]}}));
+        assert!(open.as_ref().is_err_and(|e| e.to_string().contains("closed chain")), "{open:?}");
+        for seam in [json!([[0, 0, 0]]), json!("x"), json!([[0, 0, 0], "y"])] {
+            let mut bad = blend.clone();
+            bad["seam"] = seam.clone();
+            assert!(s.execute("surface.blend", &bad).is_err(), "{seam}");
+        }
     }
 
     /// A tube whose top face is taken off (`surface.unstitch`), and points round its rim.

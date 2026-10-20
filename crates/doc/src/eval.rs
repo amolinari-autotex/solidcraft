@@ -123,16 +123,12 @@ impl ModelBody {
 
     /// The display plan at a given display quality, made once per level.
     pub fn display_plan_at(&self, q: crate::display_quality::DisplayQuality) -> Option<Arc<TessPlan>> {
-        self.plan
-            .get(q.index())?
-            .get_or_init(|| match self.body.display_plan_angular(q.chord(self.body.size()), q.angle()) {
-                Ok(plan) => Some(Arc::new(plan)),
-                Err(e) => {
-                    log::debug!("{}: no display plan ({e})", self.name);
-                    None
-                }
-            })
-            .clone()
+        let cell = self.plan.get(q.index())?;
+        match self.mesh_placement.as_deref() {
+            // A placed part shows its definition's plan, moved (planned once for every placement).
+            Some(placed) => cell.get_or_init(|| placed.plan(q, &self.name)).clone(),
+            None => placed_mesh::definition_plan(&self.body, cell, q, &self.name),
+        }
     }
 
     /// The display plan's mesh, evaluated on the CPU once per level: the same triangles a GPU
@@ -147,7 +143,10 @@ impl ModelBody {
     pub fn plan_mesh_at(&self, q: crate::display_quality::DisplayQuality) -> Option<Arc<Mesh>> {
         self.plan_mesh
             .get(q.index())?
-            .get_or_init(|| self.display_plan_at(q).and_then(|plan| self.body.display_mesh_of(&plan).ok()).map(Arc::new))
+            .get_or_init(|| match self.mesh_placement.as_deref() {
+                Some(placed) => placed.plan_mesh(q, &self.name),
+                None => self.display_plan_at(q).and_then(|plan| self.body.display_mesh_of(&plan).ok()).map(Arc::new),
+            })
             .clone()
     }
 
@@ -382,7 +381,21 @@ fn thread_groove(t: &ThreadInfo, radius: f64, open: (bool, bool)) -> Result<soli
         (r_root, p / 8.0, r_out, (p / 4.0 + 2.0 * (r_out - r_root) * slope) / 2.0)
     };
     if w0.max(w1) * 2.0 >= p * 0.98 {
-        return Err(DocError::Invalid("the face is too far from the thread's diameter".into()));
+        // The groove would be wider than a pitch: the face is far inside the thread (a hole
+        // narrower than its minor diameter, a shaft thicker than its major one, #2688).
+        let (m, dia) = (&t.designation, 2.0 * radius);
+        let alt = thread_for(dia, t.internal).map(|(n, q)| format_thread(n, q)).filter(|a| a != m);
+        let shown = show_mm(dia);
+        return Err(DocError::Invalid(if t.internal {
+            let alt = alt.map(|a| format!(", or thread this hole {a}")).unwrap_or_default();
+            format!(
+                "this {shown} mm hole is too narrow for a modelled {m} thread (its teeth would fill the hole); drill {} mm for {m}{alt}",
+                show_mm(d - p)
+            )
+        } else {
+            let alt = alt.map(|a| format!(", or thread this shaft {a}")).unwrap_or_default();
+            format!("this {shown} mm shaft is too thick for a modelled {m} thread; make the shaft {} mm for {m}{alt}", show_mm(d))
+        }));
     }
     let k = t.axis;
     let u = k.cross(if k.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) });
@@ -393,8 +406,19 @@ fn thread_groove(t: &ThreadInfo, radius: f64, open: (bool, bool)) -> Result<soli
     let base = t.axis_point + k * s0;
     let plane = Plane { origin: base, x: u, y: *k };
     let section = [Vec2::new(r0, -w0), Vec2::new(r1, -w1), Vec2::new(r1, w1), Vec2::new(r0, w0)];
-    // Sections 7.5° apart: the chords sag 0.2% of the radius.
-    Ok(kernel::sweep_helix_mesh(&plane, &section, base, *k, p, (s1 - s0) / p, 48)?)
+    // Keep radial chord error below 1% of the pitch, rather than a fixed fraction of the
+    // diameter. At 48 stations a large fine thread cuts too deeply; its outer tool facets
+    // can even dip under the shaft surface. The existing coarse sizes still use 48.
+    let outer = r0.abs().max(r1.abs());
+    if !outer.is_finite() {
+        return Err(DocError::Invalid("thread dimensions are too large".into()));
+    }
+    let angle = (1.0 - (p * 0.01 / outer).min(1.0)).acos();
+    let stations = (std::f64::consts::PI / angle).ceil().max(48.0);
+    if !stations.is_finite() || stations > 720.0 {
+        return Err(DocError::Invalid("the modelled thread is too fine for this diameter; use a cosmetic thread".into()));
+    }
+    Ok(kernel::sweep_helix_mesh(&plane, &section, base, *k, p, (s1 - s0) / p, stations as usize)?)
 }
 
 /// A constant fillet of `edges`; with [`FilletFit::Reduce`](crate::FilletFit::Reduce), a radius too
@@ -1047,23 +1071,26 @@ fn placement_digest(doc: &Document, f: &Feature) -> u64 {
     };
     let wired = |id: &crate::SketchId| doc.sketch(id.0).is_ok_and(|sketch| !sketch.wires.is_empty());
     let rails: &[crate::SweepRail] = match &f.kind {
-        FeatureKind::Sweep { rails, .. } | FeatureKind::SurfaceSweep { rails, .. } => rails,
+        FeatureKind::Sweep { rails, .. }
+        | FeatureKind::SurfaceSweep { rails, .. }
+        | FeatureKind::Loft { rails, .. }
+        | FeatureKind::SurfaceLoft { rails, .. } => rails,
         _ => &[],
     };
-    if let Some(path) = path
-        && (wired(&path) || rails.iter().any(|r| wired(&r.sketch)))
-    {
+    if path.as_ref().is_some_and(wired) || rails.iter().any(|r| wired(&r.sketch)) {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
-        let owner = doc.feature(path.0).map(|feature| feature.component).unwrap_or(0);
+        let owner = path.and_then(|path| doc.feature(path.0)).map(|feature| feature.component).unwrap_or(0);
         for frame in [doc.component_transform(f.component), doc.component_transform(owner)] {
             frame.iter().flatten().for_each(|value| value.to_bits().hash(&mut hash));
         }
-        if let FeatureKind::Sweep { sketch, rails, .. } | FeatureKind::SurfaceSweep { sketch, rails, .. } = &f.kind {
-            // The profile's and the rails' components place them too.
-            for sketch in std::iter::once(sketch).chain(rails.iter().map(|r| &r.sketch)) {
-                let owner = doc.feature(sketch.0).map(|feature| feature.component).unwrap_or(0);
-                doc.component_transform(owner).iter().flatten().for_each(|value| value.to_bits().hash(&mut hash));
-            }
+        // A sweep's profile and the rails' components place them too.
+        let profile = match &f.kind {
+            FeatureKind::Sweep { sketch, .. } | FeatureKind::SurfaceSweep { sketch, .. } => Some(sketch),
+            _ => None,
+        };
+        for sketch in profile.into_iter().chain(rails.iter().map(|r| &r.sketch)) {
+            let owner = doc.feature(sketch.0).map(|feature| feature.component).unwrap_or(0);
+            doc.component_transform(owner).iter().flatten().for_each(|value| value.to_bits().hash(&mut hash));
         }
         return hash.finish();
     }
@@ -1213,6 +1240,23 @@ impl Model {
     pub fn edited_sketches<'a>(&'a self, doc: &'a Document) -> impl Iterator<Item = &'a SolvedSketch> + 'a {
         self.results.iter().filter(|r| !r.skipped && r.error.is_none()).filter_map(|r| r.state.sketch(r.id)).filter(|s| {
             s.report.keeps_orientation() && doc.sketch(s.feature).is_ok_and(|stored| stored.driving_values() != s.sketch.driving_values())
+        })
+    }
+
+    /// Whether the results are `doc`'s evaluation: one per feature, each on the inputs `doc`
+    /// gives it, none stale, so [`Model::evaluate`] would keep every one of them. A document
+    /// changed without an evaluation since is not.
+    pub fn is_current(&self, doc: &Document) -> bool {
+        if self.results.len() != doc.features.len() || self.is_stale() {
+            return false;
+        }
+        let vals = evaluation_values(doc).0;
+        let steps = StepDigests::of(doc, &self.step_digests);
+        let marker = doc.marker.unwrap_or(usize::MAX);
+        let mut prev = 0;
+        doc.features.iter().zip(&self.results).enumerate().all(|(i, (f, r))| {
+            prev = chain_fingerprint(doc, &vals, f, prev, i >= marker, &steps);
+            r.id == f.id && r.fingerprint == prev
         })
     }
 
@@ -1458,15 +1502,12 @@ pub(crate) fn val(vals: &BTreeMap<String, Value>, e: &str, k: Kind) -> Result<f6
     Document::eval_in(vals, e, k)
 }
 
-/// A loft builds each section from its outline alone, so a section with a hole (a ring) is
-/// refused rather than lofted as if it were filled.
+/// Collapsing the outline and its holes onto one apex cannot make a manifold solid.
 fn refuse_loft_holes(r: &Region2) -> Result<()> {
     if r.holes.is_empty() {
         return Ok(());
     }
-    Err(DocError::Invalid(
-        "not supported yet: a loft section with a hole; loft the outline and the hole as two bodies and cut one from the other".into(),
-    ))
+    Err(DocError::Invalid("not supported yet: lofting a section with holes to a point".into()))
 }
 
 pub fn select_profiles(ss: &SolvedSketch, sel: &ProfileSel) -> Result<Vec<Region2>> {
@@ -1903,12 +1944,7 @@ pub fn through_all_distance(st: &ModelState, plane: &Plane, targets: &[String]) 
 /// Sample points inside a region (sketch coordinates).
 fn region_samples(r: &Region2) -> Vec<Vec2> {
     let mut out = vec![r.interior_point()];
-    let pts = r.outer.polyline(1e-2);
-    let (mut lo, mut hi) = (Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));
-    for p in &pts {
-        lo = Vec2::new(lo.x.min(p.x), lo.y.min(p.y));
-        hi = Vec2::new(hi.x.max(p.x), hi.y.max(p.y));
-    }
+    let solidcraft_geom::Aabb2 { min: lo, max: hi } = r.outer.polyline(1e-2).bounds();
     for i in 0..5 {
         for j in 0..5 {
             let p = Vec2::new(lo.x + (hi.x - lo.x) * (0.1 + 0.2 * i as f64), lo.y + (hi.y - lo.y) * (0.1 + 0.2 * j as f64));
@@ -3731,8 +3767,11 @@ fn feature_tools_with_constructor(
             let m = crate::rigid(Vec3::ZERO, origin_w, axis_w, -start);
             regions.iter().zip(bodies).map(|(r, body)| Ok(tool(r, kernel::transform_matrix(&body, m)?, Some(&body)))).collect()
         }
-        FeatureKind::Loft { sections, .. } if sections.iter().any(|s| s.point.is_some()) => {
+        FeatureKind::Loft { sections, rails, .. } if sections.iter().any(|s| s.point.is_some()) => {
             // A profile lofted to a sketch point (an apex).
+            if !rails.is_empty() {
+                return Err(DocError::Invalid("not supported yet: guide rails on a loft to a point".into()));
+            }
             let [a, b] = &sections[..] else { return Err(DocError::Invalid("not supported yet: a point section in a loft of more than two".into())) };
             let (prof, pt) = if a.point.is_some() { (b, a) } else { (a, b) };
             let ss = st.sketch(prof.sketch.0).ok_or_else(|| DocError::Unknown(format!("sketch {}", prof.sketch)))?;
@@ -3785,7 +3824,7 @@ fn feature_tools_with_constructor(
             let pitch = if *clockwise { -p } else { p };
             Ok(unnamed(vec![kernel::sweep_helix(&plane, &region, *base, axis, pitch, n)?]))
         }
-        FeatureKind::Loft { sections, .. } => {
+        FeatureKind::Loft { sections, rails, rail_fit, .. } => {
             let mut secs = Vec::new();
             let mut sketches = Vec::new();
             for sec in sections {
@@ -3794,14 +3833,27 @@ fn feature_tools_with_constructor(
                     .ok_or_else(|| DocError::Unknown(format!("sketch {} (it must come earlier in the timeline)", sec.sketch)))?;
                 let regions = solidcraft_sketch::merge_regions(&select_profiles(ss, &sec.profiles)?);
                 let [r] = &regions[..] else { return Err(DocError::Invalid("each loft section must be one profile".into())) };
-                refuse_loft_holes(r)?;
-                secs.push((ss.plane, r.outer.clone()));
+                secs.push((ss.plane, r.clone()));
                 sketches.push(ss);
             }
             // Its caps are the first and last sections, its sides named by the curves they run
             // between.
-            let body = kernel::loft(&secs)?;
-            let roles = crate::lineage::SectionRoles { sections: sketches.into_iter().zip(secs.iter().map(|(_, lp)| lp)).collect() };
+            let body = if rails.is_empty() {
+                kernel::loft_regions(&secs)?
+            } else {
+                // Rails shape the sections' outlines; sections with holes wait for rails that
+                // carry the holes too.
+                if secs.iter().any(|(_, r)| !r.holes.is_empty()) {
+                    return Err(DocError::Invalid("not supported yet: guide rails on a loft whose sections have holes".into()));
+                }
+                let outlines: Vec<_> = secs.iter().map(|(p, r)| (*p, r.outer.clone())).collect();
+                // The rails run from the end at the first section.
+                let start = outlines.first().and_then(|(p, lp)| lp.segs.first().map(|seg| p.to_world(seg.start()))).unwrap_or_default();
+                kernel::loft_with_rails(&outlines, &rail_polylines(doc, st, rails, f.component, start)?, kernel_rail_fit(*rail_fit))?
+            };
+            let roles = crate::lineage::SectionRoles {
+                sections: sketches.into_iter().zip(secs.iter().map(|(_, r)| std::iter::once(&r.outer).chain(&r.holes).collect())).collect(),
+            };
             Ok(vec![roles.tool(body)])
         }
         FeatureKind::Sweep { sketch, profiles, path_sketch, path, orientation, twist, scale, rails, rail_fit, .. } => {
@@ -3911,20 +3963,24 @@ pub(crate) fn sweep_control(
         Some(k) => val(vals, k, Kind::Unitless)?,
         None => 1.0,
     };
-    let rail_fit = match rail_fit {
-        crate::RailFit::Scale => kernel::RailFit::Scale,
-        crate::RailFit::Stretch => kernel::RailFit::Stretch,
-    };
-    let ctl = kernel::SweepControl { orientation, twist, scale, rails, rail_fit };
+    let ctl = kernel::SweepControl { orientation, twist, scale, rails, rail_fit: kernel_rail_fit(rail_fit) };
     ctl.check()?;
     Ok(ctl)
 }
 
-/// A sweep's guide rails as polylines in the feature's frame, each a chain of its sketch's curves
-/// (planar or 3D) from the end nearest `start`, the start of the path.
+/// How guide rails reshape a sweep's profile or a loft's sections, for the kernel.
+pub(crate) fn kernel_rail_fit(fit: crate::RailFit) -> kernel::RailFit {
+    match fit {
+        crate::RailFit::Scale => kernel::RailFit::Scale,
+        crate::RailFit::Stretch => kernel::RailFit::Stretch,
+    }
+}
+
+/// A sweep's or a loft's guide rails as polylines in the feature's frame, each a chain of its sketch's curves
+/// (planar or 3D) from the end nearest `start` (the start of the path, the loft's first section).
 pub(crate) fn rail_polylines(doc: &Document, st: &ModelState, rails: &[crate::SweepRail], consumer: u64, start: Vec3) -> Result<Vec<Vec<Vec3>>> {
     if rails.len() > 2 {
-        return Err(DocError::Invalid("a sweep takes one or two guide rails".into()));
+        return Err(DocError::Invalid("a sweep or a loft takes one or two guide rails".into()));
     }
     rails
         .iter()

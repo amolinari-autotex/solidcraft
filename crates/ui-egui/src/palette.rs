@@ -121,7 +121,7 @@ pub fn popup(app: &mut SolveApp, ctx: &egui::Context) {
             }
             egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
                 for (id, label, icon) in list.iter().take(60) {
-                    let enabled = solidcraft_engine::find_command(id).is_some_and(|c| c.info(&app.session).enabled);
+                    let enabled = solidcraft_engine::find_command(id).is_some_and(|c| app.command_info(c).enabled);
                     ui.horizontal(|ui| {
                         let (ir, _) = ui.allocate_exact_size(vec2(18.0, 18.0), egui::Sense::hover());
                         crate::icons::paint(ui.painter(), ir, icon, t.icon, t.icon_fill, t.accent);

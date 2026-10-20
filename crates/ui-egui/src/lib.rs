@@ -72,6 +72,8 @@ pub mod issue_report;
 pub mod joint_drag;
 pub mod keymap;
 mod linked_source;
+#[cfg(test)]
+mod loft_rails_dialog_tests;
 mod material_card_review;
 #[cfg(test)]
 mod measurement_ui_tests;
@@ -117,6 +119,8 @@ pub use file_picker::FilePickerFuture;
 #[cfg(test)]
 mod blend_arrow_tests;
 #[cfg(test)]
+mod blend_dialog_tests;
+#[cfg(test)]
 mod boundary_dialog_tests;
 pub(crate) mod display_lod;
 #[cfg(test)]
@@ -131,6 +135,7 @@ pub mod pdm_panel;
 mod pdm_panel_tests;
 pub(crate) mod pick_buffer;
 pub(crate) mod pick_index;
+pub(crate) mod plugins;
 pub mod prefs;
 #[cfg(test)]
 mod preselect_tests;
@@ -144,6 +149,7 @@ pub mod render_workspace;
 mod revolve_edit_tests;
 #[cfg(test)]
 mod revolve_manipulator_tests;
+pub mod save_job;
 pub mod scenario;
 pub mod select_other;
 pub mod selection;
@@ -170,6 +176,8 @@ mod sketch_guidance_ui_tests;
 pub mod sketch_modify_ui;
 #[cfg(test)]
 mod sketch_modify_ui_tests;
+#[cfg(test)]
+mod sketch_moving_click_tests;
 pub mod sketch_palette;
 mod sketch_pattern_tree;
 #[cfg(test)]
@@ -317,6 +325,8 @@ pub struct SolveApp {
     pub pre_sketch_marker: Option<Option<usize>>,
     pub services: Services,
     file_picker: Option<file_picker::Pending>,
+    /// A Save or Save As being written on a worker (see [`save_job`]).
+    saving: Option<save_job::Saving>,
     pub viewport: viewport::ViewportState,
     pub render_workspace: render_workspace::State,
     pub tool: Option<tools::Tool>,
@@ -333,6 +343,8 @@ pub struct SolveApp {
     pub menu: context_menu::MenuState,
     /// Browser tree state (reveal, groups being edited, occurrence moves).
     pub tree: browser::TreeState,
+    /// A saved design copied for insertion into another open document.
+    pub linked_design_clipboard: Option<String>,
     /// The S box (command search at the cursor): recent and pinned commands.
     pub sbox: shortcut_box::ShortcutBox,
     /// Keyboard shortcuts the user changed.
@@ -436,6 +448,16 @@ pub struct SolveApp {
 }
 
 impl SolveApp {
+    /// Interactive commands share PDM availability across ribbons, menus and the palette.
+    /// Programmatic commands still validate their explicit target in the engine and host.
+    pub(crate) fn command_info(&self, command: &solidcraft_engine::CommandSpec) -> solidcraft_engine::CommandInfo {
+        let mut info = command.info(&self.session);
+        if let Some(reason) = pdm_panel::command_unavailable(self, command.id) {
+            info.enabled = false;
+            info.disabled_reason = Some(self.tr(reason).to_string());
+        }
+        info
+    }
     pub fn new(mut session: Session, services: Services) -> Self {
         #[cfg(test)]
         let image_host = Some(solidcraft_engine::render::job::CpuHost::cooperative());
@@ -460,6 +482,7 @@ impl SolveApp {
             pre_sketch_marker: None,
             services,
             file_picker: None,
+            saving: None,
             viewport: viewport::ViewportState::default(),
             render_workspace,
             tool: None,
@@ -471,6 +494,7 @@ impl SolveApp {
             palette: palette::Palette::default(),
             menu: context_menu::MenuState::default(),
             tree: browser::TreeState::default(),
+            linked_design_clipboard: None,
             sbox: shortcut_box::ShortcutBox::default(),
             keymap: keymap::Keymap::default(),
             help: help::HelpState::default(),
@@ -679,7 +703,7 @@ impl SolveApp {
         if id == "pdm.check_in" && (self.dialog.is_some() || self.tool.is_some() || self.applying.is_some() || self.deferred.is_some()) {
             return Err("Finish or cancel interactive edits before checking in the saved design".into());
         }
-        if self.file_load.busy() || self.file_picker.is_some() {
+        if self.file_load.busy() || self.file_picker.is_some() || self.saving.is_some() {
             return Err("a file operation is in progress".into());
         }
         let t0 = now_ms();
@@ -710,7 +734,14 @@ impl SolveApp {
             // Curves drawn in construction (or centerline) mode take that line type.
             sketch_palette::apply_mode(self, id, v);
         }
-        match &r {
+        self.finish_command(id, &r);
+        r
+    }
+
+    /// What follows a command's run, whether it ran here or on a worker (a save): its echo,
+    /// the status line when it failed, what opening and saving update, and the toolbar tab.
+    pub(crate) fn finish_command(&mut self, id: &str, r: &Result<Value, String>) {
+        match r {
             Ok(v) => {
                 // Programmatic callers (the control channel, scripts) run outside a render
                 // language scope, so resolve the echo from the saved preference instead of the
@@ -762,7 +793,6 @@ impl SolveApp {
             self.ui.tab = "SOLID".into();
             self.tool = None;
         }
-        r
     }
 
     /// Start a command the way a toolbar click does: interactive tools and dialogs for commands
@@ -799,7 +829,7 @@ impl SolveApp {
         // A disabled command starts nothing, however it was reached. The toolbar greys its
         // button, but a shortcut, the command palette and the control channel all land here.
         // Its reason goes to the status line, so the refusal is never silent.
-        if let Some(info) = solidcraft_engine::find_command(id).map(|c| c.info(&self.session))
+        if let Some(info) = solidcraft_engine::find_command(id).map(|c| self.command_info(c))
             && let Some(why) = info.disabled_reason
         {
             let label = self.tr_label(info.label).to_string();
@@ -812,6 +842,9 @@ impl SolveApp {
             return;
         }
         if id.starts_with("pdm.") {
+            if pdm_panel::start_action(self, id) {
+                return;
+            }
             if matches!(id, "pdm.panel" | "pdm.connections" | "pdm.setup.create" | "pdm.connection.open" | "pdm.connection.recover") {
                 if let Err(error) = pdm_panel::enter(self) {
                     self.set_status(error, true);
@@ -1375,6 +1408,10 @@ impl SolveApp {
         render_workspace::sync_backend(self);
         render_workspace::tick(self, ctx);
         file_load::tick(self, ctx);
+        save_job::tick(self, false);
+        if self.saving.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         self.esc_handled = false;
         prefs::apply(self, ctx);
         if !self.styled || theme::is_dark() != self.ui.dark || theme::vision() != self.preferences.color_vision {

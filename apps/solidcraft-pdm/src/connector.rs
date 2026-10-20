@@ -301,7 +301,9 @@ mod tests {
         let catalog = client.managed_catalog().unwrap();
         let current = catalog.entries.iter().find(|item| item.document == entry.document).unwrap();
         assert_eq!(current.checkout, grant.entry.checkout);
-        assert_eq!(client.managed_checkout(entry.document, "workspace".into(), "desktop".into()).unwrap(), grant);
+        // Verify the retained capability through the read-only resume endpoint;
+        // a second mutating checkout is deliberately a conflict.
+        assert_eq!(client.managed_resume_checkout(entry.document, "workspace".into(), "desktop".into()).unwrap(), grant);
     }
 
     #[test]

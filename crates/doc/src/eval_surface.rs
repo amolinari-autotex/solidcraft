@@ -141,7 +141,7 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             }
             Ok(())
         }
-        FeatureKind::SurfaceBlend { from, to, continuity, bulge, align, stitch } => {
+        FeatureKind::SurfaceBlend { from, to, continuity, bulge, align, seam, stitch } => {
             let a = st.body(&from.body).ok_or_else(|| DocError::Unknown(format!("body `{}`", from.body)))?.body.clone();
             let b = st.body(&to.body).ok_or_else(|| DocError::Unknown(format!("body `{}`", to.body)))?.body.clone();
             if from.edges.is_empty() || to.edges.is_empty() {
@@ -155,6 +155,7 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
                 *continuity,
                 *bulge,
                 align.map(|[p, q]| [p.0, q.0]),
+                seam.map(|[p, q]| [p.0, q.0]),
                 BLEND_STATIONS,
                 *stitch,
             )?;
@@ -388,11 +389,14 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             push_sheet(st, f, traced);
             Ok(())
         }
-        FeatureKind::SurfaceLoft { sections, continuity, crown } => {
+        FeatureKind::SurfaceLoft { sections, continuity, crown, rails, rail_fit } => {
             // A loft with edge chains for sections, or one that has to leave its ends a particular
             // way, is built through `loft_blend` from the frames of every section; the plain one
             // (sketch chains only, both ends G0) is the loft of old.
             if *continuity != [kernel::Continuity::G0, kernel::Continuity::G0] || sections.iter().any(|s| s.body.is_some()) {
+                if !rails.is_empty() {
+                    return Err(DocError::Invalid("not supported yet: guide rails on a loft with edge sections or end continuity".into()));
+                }
                 return loft_blend(st, f, sections, *continuity, *crown, doc);
             }
             let mut secs = Vec::with_capacity(sections.len());
@@ -417,10 +421,17 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
                 secs.push((ss.plane, chain));
                 sketches.push(ss);
             }
-            let body = kernel::loft_sheet(&secs)?;
+            let body = if rails.is_empty() {
+                kernel::loft_sheet(&secs)?
+            } else {
+                // The rails run from the end at the first section.
+                let start = secs.first().and_then(|(p, c)| c.first().map(|seg| p.to_world(seg.start()))).unwrap_or_default();
+                let rails = crate::eval::rail_polylines(doc, st, rails, f.component, start)?;
+                kernel::loft_sheet_with_rails(&secs, &rails, crate::eval::kernel_rail_fit(*rail_fit))?
+            };
             // Each wall named by the section curves it runs between, as a loft's sides are.
             let loops: Vec<solidcraft_geom::Loop2> = secs.iter().map(|(_, c)| solidcraft_geom::Loop2 { segs: c.clone() }).collect();
-            let traced = crate::lineage::SectionRoles { sections: sketches.iter().zip(&loops).collect() }.tool(body);
+            let traced = crate::lineage::SectionRoles { sections: sketches.iter().zip(&loops).map(|(s, lp)| (s, vec![lp])).collect() }.tool(body);
             push_sheet(st, f, traced);
             Ok(())
         }

@@ -2,6 +2,7 @@
 //! source mesh and map it into each pose; retain the exact placed B-rep separately in ModelBody.
 use std::sync::{Arc, OnceLock};
 
+use solidcraft_geom::tess::TessPlan;
 use solidcraft_geom::{Mesh, Vec3};
 use solidcraft_kernel::{self as kernel, Body};
 
@@ -11,6 +12,10 @@ use super::ModelBody;
 pub(super) struct PlacedMesh {
     body: Body,
     mesh: Arc<OnceLock<Arc<Mesh>>>,
+    /// The definition's display plans and their meshes by display quality (its own cells):
+    /// each placement draws them moved, so a part is planned once however often it is placed.
+    plans: Arc<[OnceLock<Option<Arc<TessPlan>>>; 4]>,
+    plan_meshes: Arc<[OnceLock<Option<Arc<Mesh>>>; 4]>,
     transform: crate::Mat,
     pub(super) tolerance: f64,
 }
@@ -26,16 +31,47 @@ impl PlacedMesh {
             Some(original) => Self {
                 body: original.body.clone(),
                 mesh: original.mesh.clone(),
+                plans: original.plans.clone(),
+                plan_meshes: original.plan_meshes.clone(),
                 transform: crate::mat_mul(transform, &original.transform),
                 tolerance: original.tolerance,
             },
-            None => Self { body: source.body.clone(), mesh: source.mesh.clone(), transform: *transform, tolerance: source.display_tol() },
+            None => Self {
+                body: source.body.clone(),
+                mesh: source.mesh.clone(),
+                plans: source.plan.clone(),
+                plan_meshes: source.plan_mesh.clone(),
+                transform: *transform,
+                tolerance: source.display_tol(),
+            },
         })
     }
 
     pub(super) fn mesh(&self) -> Arc<Mesh> {
-        let source = reference_mesh(&self.body, &self.mesh, self.tolerance);
-        Arc::new(Mesh {
+        Arc::new(self.moved(&reference_mesh(&self.body, &self.mesh, self.tolerance)))
+    }
+
+    /// The definition's display plan at quality `q` (made once, in its own cell), moved here.
+    pub(super) fn plan(&self, q: crate::display_quality::DisplayQuality, name: &str) -> Option<Arc<TessPlan>> {
+        let source = definition_plan(&self.body, self.plans.get(q.index())?, q, name)?;
+        Some(Arc::new(source.transformed(&self.transform)))
+    }
+
+    /// The definition's display plan mesh at quality `q`, moved here.
+    pub(super) fn plan_mesh(&self, q: crate::display_quality::DisplayQuality, name: &str) -> Option<Arc<Mesh>> {
+        let cell = self.plan_meshes.get(q.index())?;
+        let source = cell
+            .get_or_init(|| {
+                let plan = definition_plan(&self.body, self.plans.get(q.index())?, q, name)?;
+                self.body.display_mesh_of(&plan).ok().map(Arc::new)
+            })
+            .clone()?;
+        Some(Arc::new(self.moved(&source)))
+    }
+
+    /// `source` (in the definition's place) moved by this placement.
+    fn moved(&self, source: &Mesh) -> Mesh {
+        Mesh {
             positions: source.positions.iter().map(|p| crate::apply_point(&self.transform, *p)).collect(),
             normals: source.normals.iter().map(|n| crate::apply_vector(&self.transform, *n)).collect(),
             edges: source.edges.iter().map(|edge| edge.iter().map(|p| crate::apply_point(&self.transform, *p)).collect()).collect(),
@@ -45,8 +81,25 @@ impl PlacedMesh {
             seams: source.seams.clone(),
             smooth_edges: source.smooth_edges.clone(),
             sharp_edges: source.sharp_edges.clone(),
-        })
+        }
     }
+}
+
+/// The display plan of a definition `body` at quality `q`, made once in `cell`.
+pub(super) fn definition_plan(
+    body: &Body,
+    cell: &OnceLock<Option<Arc<TessPlan>>>,
+    q: crate::display_quality::DisplayQuality,
+    name: &str,
+) -> Option<Arc<TessPlan>> {
+    cell.get_or_init(|| match body.display_plan_angular(q.chord(body.size()), q.angle()) {
+        Ok(plan) => Some(Arc::new(plan)),
+        Err(e) => {
+            log::debug!("{name}: no display plan ({e})");
+            None
+        }
+    })
+    .clone()
 }
 
 pub(super) fn reference_mesh(body: &Body, mesh: &OnceLock<Arc<Mesh>>, tolerance: f64) -> Arc<Mesh> {
@@ -95,6 +148,57 @@ mod tests {
         assert_eq!(work.tessellate_ms, 0.);
         assert_eq!(other.tri_face, local.tri_face);
         assert!(Arc::ptr_eq(&mesh, &nested.mesh()));
+    }
+
+    /// Placed parts share their definition's display plan (#3044): the definition is planned
+    /// once, every placement moves that plan, and a moved plan evaluates to the definition's
+    /// points moved, on every kind of surface (planes, revolved and spline surfaces).
+    #[test]
+    fn placed_parts_are_planned_once_and_draw_the_moved_plan() {
+        use crate::display_quality::DisplayQuality;
+        let q = DisplayQuality::parse("normal").unwrap();
+        for body in [
+            kernel::box_solid(Vec3::ZERO, Vec3::new(2., 3., 4.)).unwrap(),
+            kernel::cylinder(Vec3::new(1., 0., 0.), Vec3::Z, 2., 8.).unwrap(),
+            kernel::torus(Vec3::ZERO, 6., 1.5).unwrap(),
+            kernel::sphere(Vec3::new(0., 1., 2.), 3.).unwrap(),
+        ] {
+            let source = ModelBody::new("Part".into(), body, 1);
+            let a = crate::rigid(Vec3::new(10., 20., 30.), Vec3::ZERO, Vec3::Z, 0.7);
+            let b = crate::rigid(Vec3::new(-4., 5., 1.), Vec3::new(1., 1., 0.), Vec3::X, 1.1);
+            let placed: Vec<ModelBody> = [a, b]
+                .iter()
+                .map(|m| {
+                    let mut p = ModelBody::new("Copy".into(), kernel::transform_matrix(&source.body, *m).unwrap(), 1);
+                    p.mesh_placement = Some(Arc::new(PlacedMesh::new(&source, m).unwrap()));
+                    p
+                })
+                .collect();
+            assert!(source.plan.get(q.index()).unwrap().get().is_none());
+            let plans: Vec<_> = placed.iter().map(|p| p.display_plan_at(q).unwrap()).collect();
+            assert!(source.plan.get(q.index()).unwrap().get().is_some(), "placing plans the definition, in its own cell");
+            let own = source.display_plan_at(q).unwrap();
+            let local = own.evaluate();
+            for (m, plan) in [a, b].iter().zip(&plans) {
+                assert!(!Arc::ptr_eq(plan, &own));
+                let moved = plan.evaluate();
+                assert_eq!(moved.triangles, local.triangles);
+                for (p, q) in local.positions.iter().zip(&moved.positions) {
+                    assert!(crate::apply_point(m, *p).dist(*q) < 1e-9, "{p:?} -> {q:?}");
+                }
+                for (n, k) in local.normals.iter().zip(&moved.normals) {
+                    assert!(crate::apply_vector(m, *n).dist(*k) < 1e-9);
+                }
+            }
+            for (m, p) in [a, b].iter().zip(&placed) {
+                let mesh = p.plan_mesh_at(q).unwrap();
+                let base = source.plan_mesh_at(q).unwrap();
+                assert_eq!(mesh.triangles, base.triangles);
+                for (x, y) in base.positions.iter().zip(&mesh.positions) {
+                    assert!(crate::apply_point(m, *x).dist(*y) < 1e-9);
+                }
+            }
+        }
     }
 
     #[test]

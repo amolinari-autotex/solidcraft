@@ -111,7 +111,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(concat!("p0, p1: overall ends, width", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.point", "Point", draw_point).at("SKETCH", "CREATE").icon("point").enabled(in_sketch).params(concat!("point: [x,y] (each a number or an expression over the design's parameters: the point is then fixed where it comes to and follows them), id?", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.dimension", "Sketch Dimension", dimension).at("SKETCH", "CREATE").icon("dimension").key("D").enabled(in_sketch).params(
-        "entities: [refs], type?: auto|distance|horizontal|vertical|length|radius|diameter|angle, value?: number or expression (default: current; a bare number is in the design's units, e.g. 2 means 2 in in an inch design; give a unit such as \"50 mm\" to override); text_at?: [x, y]. Two points or a line off the axes: with auto, text_at across from them is the distance between them, above or below them horizontal, beside them vertical. Two lines: the angle between them (acute, or 180° − it when the value is nearer that) unless text_at picks a sector. A dimension the sketch already determines is refused (naming what determines it); if_redundant?: \"driven\" places it as a driven (reference) dimension instead. scale_sketch?: bool (the dimension tool sends true): when this is the sketch's first length dimension and nothing in the sketch fixes a size (no other driving length dimension, nothing fixed or projected), the whole sketch scales about its origin to the value instead of distorting. Returns measured in unit (mm or deg), and scaled: the factor when the sketch was scaled",
+        "entities: [refs], type?: auto|distance|horizontal|vertical|length|radius|diameter|angle, value?: number or expression (default: current; a bare number is in the design's units, e.g. 2 means 2 in in an inch design; give a unit such as \"50 mm\" to override); text_at?: [x, y]. Two points or a line off the axes: with auto, text_at across from them is the distance between them, above or below them horizontal, beside them vertical. Two lines: the angle between them (acute, or 180° − it when the value is nearer that) unless text_at picks a sector. A line and a circle or arc: the distance from the line to its edge (the gap, or how far the edge reaches past a line that cuts it; 0 is tangent); dimension the centre point for the distance to the centre. A dimension the sketch already determines is refused (naming what determines it); if_redundant?: \"driven\" places it as a driven (reference) dimension instead. scale_sketch?: bool (the dimension tool sends true): when this is the sketch's first length dimension and nothing in the sketch fixes a size (no other driving length dimension, nothing fixed or projected), the whole sketch scales about its origin to the value instead of distorting. Returns measured in unit (mm or deg), and scaled: the factor when the sketch was scaled",
     ),
     CommandSpec::new("sketch.constraint.horizontal_vertical", "Horizontal/Vertical", c_horizontal_vertical)
         .at("SKETCH", "CONSTRAINTS")
@@ -179,7 +179,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("entities: [curve, point or constraint ids]"),
     CommandSpec::new("sketch.move_point", "Drag Sketch Point", move_point).icon("sketch_move").enabled(in_sketch).params("point: ref, to: [x,y]"),
     CommandSpec::new("sketch.drag", "Drag Sketch Geometry", drag).icon("sketch_move").enabled(in_sketch).live(drag_live).params(
-        "entity: point or curve, from: [x,y] where it was grabbed, to: [x,y], live?: bool: a point moves toward `to` within the design constraints; when exact cursor placement is impossible, bounded feasible steps minimize cursor distance while keeping design constraints mandatory. A line (spline, conic) slides by to - from; a circle or arc grabbed on its edge takes the radius to `to`. Long moves use continuation to retain the solution branch, and a step that would sweep an arc through its start is rejected. Returns `reached`: progress along the requested move (0..1; feasible point motion projects its actual displacement onto that move), and `at`: where the grabbed spot went (`from` moved as the dragged points did), the `from` of the next move. `live: true` solves the sketch and leaves later features stale until `sketch.drag_end` or a command that reads the model; `dof` is then the one from before the drag",
+        "entity: point or curve, from: [x,y] where it was grabbed, to: [x,y], live?: bool: a point moves toward `to` within the design constraints; when exact cursor placement is impossible, bounded feasible steps minimize cursor distance while keeping design constraints mandatory. A line (spline, conic) slides by to - from; a circle or arc grabbed on its edge takes the radius to `to`. `with?`: [point or curve ids]: the rest of a selection dragged by `entity`, which all slides by to - from as one (circles keep their radii). Long moves use continuation to retain the solution branch, and a step that would sweep an arc through its start is rejected. Returns `reached`: progress along the requested move (0..1; feasible point motion projects its actual displacement onto that move), and `at`: where the grabbed spot went (`from` moved as the dragged points did), the `from` of the next move. `live: true` solves the sketch and leaves later features stale until `sketch.drag_end` or a command that reads the model; `dof` is then the one from before the drag",
     ),
     CommandSpec::new("sketch.drag_end", "End Sketch Drag", drag_end).icon("sketch_move").enabled(in_sketch).doc_only().params(
         "constraint?: {command: a sketch.constraint.* id, params}: ends a drag made of `sketch.drag` `live: true` frames: adds the constraint it let go on (not kept if it over-constrains the sketch), then evaluates the whole model once; returns the constraint's result and the sketch's solved state and degrees of freedom",
@@ -1976,6 +1976,7 @@ fn dimension(s: &mut Session, p: &Value) -> Result<Value> {
         };
         let is_line = |c: usize| matches!(sk.curves.get(c).map(|c| &c.kind), Some(CurveKind::Line { .. }));
         let is_circle = |c: usize| matches!(sk.curves.get(c).map(|c| &c.kind), Some(CurveKind::Circle { .. }));
+        let is_round = |c: usize| matches!(sk.curves.get(c).map(|c| &c.kind), Some(CurveKind::Circle { .. } | CurveKind::Arc { .. }));
         // The other reading of an angle between two lines (see below).
         let mut alt: Option<(ConstraintKind, f64)> = None;
         let (mut k, mut cur): (ConstraintKind, f64) = match (e0, e1) {
@@ -2084,6 +2085,16 @@ fn dimension(s: &mut Session, p: &Value) -> Result<Value> {
                         }
                     }
                 }
+            }
+            // A line and a circle or arc: the distance from the line to its edge (#1803).
+            ((None, Some(l)), Some((None, Some(c)))) | ((None, Some(c)), Some((None, Some(l)))) if is_line(l) && is_round(c) => {
+                let (a, b) = line_pts(sk, l).unwrap_or_default();
+                let (centre, r) = sk.center(c).zip(sk.radius(c)).ok_or_else(|| bad(cmd, "cannot dimension that curve"))?;
+                let d = (b - a).normalized().map(|u| u.cross(centre - a).abs()).ok_or_else(|| bad(cmd, "that line has no length"))?;
+                // A line that cuts the circle measures how far its edge reaches past the line.
+                let inside = d < r;
+                let gap = (d - r).abs();
+                (ConstraintKind::LineCircleDistance { l, c, value: gap, inside }, gap)
             }
             _ => return Err(bad(cmd, "cannot dimension that combination of entities")),
         };
@@ -2397,7 +2408,7 @@ fn move_point(s: &mut Session, p: &Value) -> Result<Value> {
     let id = target_sketch(s, p, cmd)?;
     let (_, rep) = edit_solved(s, id, false, |sk, _| {
         let q = point_ref(sk, p.get("point"), cmd, "point")?;
-        Ok(((), drag_entity(sk, Ent::Point(q), to, to, false).1.solve_again()))
+        Ok(((), drag_entity(sk, Ent::Point(q), &[], to, to, false).1.solve_again()))
     })?;
     Ok(json!({"sketch": rep.as_ref().map(report_json)}))
 }
@@ -2424,6 +2435,21 @@ fn drag_frame(s: &mut Session, p: &Value, live: bool) -> Result<(Value, Option<c
     let (d, rep) = edit_solved(s, id, false, |sk, doc| {
         let r = p.get("entity").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`entity` must be a sketch point or curve"))?;
         let e = ent(sk, r).ok_or_else(|| bad(cmd, format!("unknown sketch entity `{r}`")))?;
+        let with = match p.get("with") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(v) => {
+                let ids = v.as_array().ok_or_else(|| bad(cmd, "`with` must be a list of sketch point or curve ids"))?;
+                if ids.len() > sk.points.len() + sk.curves.len() {
+                    return Err(bad(cmd, "`with` lists more entities than the sketch has"));
+                }
+                ids.iter()
+                    .map(|v| {
+                        let r = v.as_str().ok_or_else(|| bad(cmd, "`with` must be a list of sketch point or curve ids"))?;
+                        ent(sk, r).ok_or_else(|| bad(cmd, format!("unknown sketch entity `{r}`")))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
         if let Some(link) = super::sketch_create::text_link(sk, r).map(str::to_owned) {
             let moving = sk.link_points(&link).into_iter().filter_map(|i| sk.point(i).map(|p| (i, p))).collect();
             super::sketch_create::move_text(sk, &link, to - from, 0.0, Vec2::ZERO, false)?;
@@ -2431,7 +2457,7 @@ fn drag_frame(s: &mut Session, p: &Value, live: bool) -> Result<(Value, Option<c
         }
         // The held solves work on the dimensions' current values (a solved step applies them).
         doc.apply_dimension_values(&doc.param_values().0, sk)?;
-        let (d, left) = drag_entity(sk, e, from, to, live);
+        let (d, left) = drag_entity(sk, e, &with, from, to, live);
         // A live frame's held solve is its only one; otherwise the sketch's own solve reports
         // its degrees of freedom.
         Ok((d, if live && last.is_some() { left } else { left.solve_again() }))
@@ -2582,6 +2608,9 @@ mod ids_tests;
 #[cfg(test)]
 #[path = "sketch_infinite_tests.rs"]
 mod infinite_tests;
+#[cfg(test)]
+#[path = "sketch_line_circle_tests.rs"]
+mod line_circle_tests;
 #[cfg(test)]
 #[path = "sketch_point_expr_tests.rs"]
 mod point_expr_tests;

@@ -803,6 +803,7 @@ fn hostile_params_never_panic() {
         "kind",
         "prefix",
         "orientation",
+        "seam",
         "twist",
         "scale",
         "continuity",
@@ -3777,4 +3778,16 @@ fn a_sketch_on_one_piece_stays_attached_when_the_side_joins() {
     assert_eq!(faces(&mut s), 6, "the side is straight now: one face");
     let sketch = run(&mut s, "timeline.inspect", json!({"feature": "Sketch2"}));
     assert!(sketch["error"].is_null() && sketch["warning"].is_null(), "{sketch}");
+}
+
+/// With a taper too, a side drawn in two collinear pieces extrudes into one face (#1788).
+#[test]
+fn a_tapered_side_drawn_in_two_collinear_pieces_is_one_face() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [10, 0], [20, 0], [20, 10], [0, 10], [0, 0]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5, "taper": "5 deg"}));
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(m["bodies"][0]["kernel"]["faces"], 6, "{m}");
 }

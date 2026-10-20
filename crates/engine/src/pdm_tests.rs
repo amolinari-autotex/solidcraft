@@ -354,7 +354,17 @@ fn restore_in_flight_blocks_edits_and_outputs_in_every_editor_for_its_workspace(
     let path = folder.join("part.solidcraft");
     session.execute("file.save", &json!({"path":path})).unwrap();
     let before = std::fs::read(&path).unwrap();
-    apply_managed(&session.pdm, managed_snapshot(path.to_str().unwrap(), "a", false), false).unwrap();
+    let mut state = managed_snapshot(path.to_str().unwrap(), "a", false);
+    state.local[0].base_version = 2;
+    state.catalog.push(CatalogEntry {
+        document: "part".into(),
+        logical_path: "part.solidcraft".into(),
+        head: Some(2),
+        checkout: None,
+        head_checked_in_unix_ms: None,
+        head_author: None,
+    });
+    apply_managed(&session.pdm, state, false).unwrap();
     let mut second_editor = Session { path: Some(path.to_string_lossy().into_owned()), pdm: session.pdm.clone(), ..Default::default() };
     second_editor.mark_saved();
     let id = session.execute("pdm.restore_version", &json!({"document":"part","version":1,"restore":true})).unwrap()["request"].as_u64().unwrap();
@@ -434,9 +444,24 @@ fn busy_managed_destinations_block_existing_hardlinks_until_completion() {
     std::fs::write(&original, b"unchanged").unwrap();
     std::fs::hard_link(&original, &alias).unwrap();
     let runtime = connected().pdm;
-    apply_managed(&runtime, managed_snapshot(original.to_str().unwrap(), "a", true), false).unwrap();
+    let mut state = managed_snapshot(original.to_str().unwrap(), "a", true);
+    state.catalog.push(CatalogEntry {
+        document: "part".into(),
+        logical_path: "working.solidcraft".into(),
+        head: Some(1),
+        checkout: Some(Checkout {
+            owner: "alice".into(),
+            workspace: "a".into(),
+            machine: "desktop".into(),
+            checked_out_unix_ms: 1,
+            base_version: Some(1),
+        }),
+        head_checked_in_unix_ms: None,
+        head_author: None,
+    });
+    apply_managed(&runtime, state, false).unwrap();
     runtime.may_save(alias.to_str().unwrap()).unwrap();
-    let id = runtime.enqueue(Task::Managed(ManagedTask::GetLatest { document: Some("part".into()), path: None })).unwrap();
+    let id = runtime.enqueue(Task::Managed(ManagedTask::CancelCheckout { document: Some("part".into()), path: None })).unwrap();
     assert!(runtime.may_save(alias.to_str().unwrap()).unwrap_err().contains("Wait for the managed operation"));
     assert_eq!(std::fs::read(&original).unwrap(), b"unchanged");
     runtime.finish(id, Err(Failure { message: "No local replacement".into(), disconnect: false })).unwrap();
@@ -727,4 +752,167 @@ fn recovery_epoch_exhaustion_and_poison_fail_closed_for_saved_editors() {
     assert!(poisoned.is_err());
     assert!(runtime.requires_reopen(0, Some(path.to_str().unwrap())));
     assert!(runtime.begin_pdm_reload().is_err());
+}
+
+fn policy_status() -> Status {
+    Status {
+        available: true,
+        port: Some(48231),
+        connection: Some(ActiveConnection {
+            id: "a".repeat(64),
+            label: "Toy".into(),
+            origin: "https://localhost".into(),
+            server_id: "server".into(),
+            account: "alice".into(),
+            role: "Contributor".into(),
+        }),
+        managed: ManagedState {
+            catalog: vec![CatalogEntry {
+                document: "part".into(),
+                logical_path: "part.solidcraft".into(),
+                head: Some(2),
+                checkout: None,
+                head_checked_in_unix_ms: None,
+                head_author: None,
+            }],
+            ..managed_snapshot("/workspace/part.solidcraft", "a", false)
+        },
+        ..Status::default()
+    }
+}
+
+#[test]
+fn action_policy_requires_verified_checkout_here_and_distinguishes_other_reservations() {
+    let mut status = policy_status();
+    status.managed.local[0].base_version = 2;
+    let path = Some("/workspace/part.solidcraft");
+    let action = |status: &Status, command| status.action_unavailable(command, Some("part"), path, false, false, Some(1));
+    assert_eq!(status.document_state(Some("part"), path, false), "ui.pdm_state_archived");
+    assert_eq!(action(&status, "pdm.archive"), Some("ui.pdm_reason_checkout_required"));
+    assert_eq!(action(&status, "pdm.checkout"), None);
+    assert_eq!(action(&status, "pdm.cancel_checkout"), Some("ui.pdm_reason_checkout_required"));
+    assert_eq!(action(&status, "pdm.get_latest"), Some("ui.pdm_reason_up_to_date"));
+    assert_eq!(action(&status, "pdm.restore_version"), None);
+    status.managed.catalog[0].checkout =
+        Some(Checkout { owner: "alice".into(), workspace: "a".into(), machine: "desktop".into(), checked_out_unix_ms: 1, base_version: Some(2) });
+    assert_eq!(action(&status, "pdm.archive"), Some("ui.pdm_reason_checked_out_elsewhere"));
+    status.managed.local[0].checked_out = true;
+    assert_eq!(action(&status, "pdm.archive"), None);
+    assert_eq!(action(&status, "pdm.cancel_checkout"), None);
+    assert_eq!(action(&status, "pdm.checkout"), Some("ui.pdm_reason_checked_out_here"));
+    assert_eq!(status.document_state(Some("part"), path, true), "ui.pdm_state_modified");
+    status.managed.catalog[0].checkout.as_mut().unwrap().workspace = "other-device".into();
+    assert_eq!(action(&status, "pdm.archive"), Some("ui.pdm_reason_checked_out_elsewhere"));
+    status.managed.catalog[0].checkout.as_mut().unwrap().owner = "bob".into();
+    assert_eq!(action(&status, "pdm.cancel_checkout"), Some("ui.pdm_reason_checked_out_other"));
+    assert_eq!(status.document_state(Some("part"), path, false), "ui.pdm_state_checked_out_other");
+}
+
+#[test]
+fn action_policy_covers_busy_offline_dirty_stale_initial_archive_and_selection_mismatch() {
+    let mut status = policy_status();
+    assert_eq!(status.action_unavailable("pdm.archive", None, Some("/workspace/new.solidcraft"), false, false, None), None);
+    assert_eq!(
+        status.action_unavailable("pdm.archive", Some("part"), Some("/workspace/new.solidcraft"), false, false, None),
+        Some("ui.pdm_reason_open_selected")
+    );
+    assert_eq!(status.action_unavailable("pdm.checkout", None, None, false, false, None), Some("ui.pdm_reason_select_document"));
+    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), None, true, false, None), Some("ui.pdm_reason_modified"));
+    assert_eq!(status.action_unavailable("pdm.restore_version", Some("part"), None, false, false, Some(1)), Some("ui.pdm_reason_stale_base"));
+    assert_eq!(status.document_state(Some("part"), None, false), "ui.pdm_state_outdated");
+    status.connection.as_mut().unwrap().role = "Viewer".into();
+    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), None, false, false, None), Some("ui.pdm_reason_viewer"));
+    status.busy = Some(3);
+    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), None, false, false, None), Some("ui.pdm_reason_busy"));
+    assert_eq!(status.document_state(Some("part"), None, false), "ui.pdm_state_busy");
+    status.busy = None;
+    status.port = None;
+    assert_eq!(status.action_unavailable("pdm.checkout", Some("part"), None, false, false, None), Some("ui.pdm_reason_disconnected"));
+}
+
+#[test]
+fn action_policy_checks_working_folder_and_native_dependency_update_flags() {
+    let mut status = policy_status();
+    status.managed.root = Some("/workspace".into());
+    status.managed.local[0].base_version = 2;
+    assert_eq!(
+        status.action_unavailable("pdm.archive", None, Some("/outside/new.solidcraft"), false, false, None),
+        Some("ui.pdm_reason_working_folder")
+    );
+    assert_eq!(
+        status.action_unavailable("pdm.archive", None, Some("/workspace-other/new.solidcraft"), false, false, None),
+        Some("ui.pdm_reason_working_folder")
+    );
+    assert_eq!(status.action_unavailable("pdm.archive", None, Some("/workspace/new.solidcraft"), false, false, None), None);
+    status.managed.dependency_updates.push("part".into());
+    assert_eq!(status.action_unavailable("pdm.get_latest", Some("part"), None, false, false, None), None);
+    assert_eq!(status.document_state(Some("part"), None, false), "ui.pdm_state_outdated");
+}
+
+#[test]
+fn managed_action_queue_rejects_duplicates_and_archive_without_checkout() {
+    let session = connected();
+    let snapshot = policy_status().managed;
+    apply_managed(&session.pdm, snapshot, false).unwrap();
+    let task = Task::Managed(ManagedTask::Checkout { document: Some("part".into()), path: None });
+    let id = session.pdm.enqueue(task.clone()).unwrap();
+    assert!(session.pdm.enqueue(task.clone()).is_err());
+    session.pdm.finish(id, Err(Failure { message: "offline".into(), disconnect: false })).unwrap();
+    assert!(session.pdm.status().unwrap().managed.catalog[0].checkout.is_none());
+    assert_eq!(session.pdm.enqueue(task.clone()).unwrap_err(), "ui.pdm_reason_refresh_required");
+    let inventory = session.pdm.enqueue(Task::Managed(ManagedTask::ListConnections)).unwrap();
+    session.pdm.finish(inventory, Ok(Outcome::Connections(vec![]))).unwrap();
+    assert_eq!(session.pdm.enqueue(task.clone()).unwrap_err(), "ui.pdm_reason_refresh_required", "saved metadata is not fresh server authority");
+    let refresh = session.pdm.enqueue(Task::Refresh).unwrap();
+    session.pdm.finish(refresh, Ok(Outcome::ManagedRefreshed { port: 48231, state: policy_status().managed })).unwrap();
+    let id = session.pdm.enqueue(task).unwrap();
+    session.pdm.finish(id, Ok(Outcome::Managed { port: 48231, state: policy_status().managed })).unwrap();
+    let archive = Task::Managed(ManagedTask::Archive {
+        path: "/workspace/part.solidcraft".into(),
+        logical_path: None,
+        saved: session.doc.clone(),
+        visibility: Box::new(session.visibility.clone()),
+    });
+    assert_eq!(session.pdm.enqueue(archive).unwrap_err(), "ui.pdm_reason_checkout_required");
+    assert!(session.pdm.take_job().unwrap().is_none());
+}
+
+#[test]
+fn receipt_only_reconciliation_can_queue_after_reconnect_but_never_ordinary_archive() {
+    let mut session = connected();
+    let path = "/workspace/part.solidcraft";
+    let mut state = policy_status().managed;
+    state.local[0].checked_out = false;
+    apply_managed(&session.pdm, state, false).unwrap();
+    session.path = Some(path.into());
+    session.mark_saved();
+    assert!(session.execute("pdm.archive", &json!({})).is_err());
+    assert!(session.pdm.take_job().unwrap().is_none());
+    let id = session.execute("pdm.archive", &json!({"reconcile":true})).unwrap()["request"].as_u64().unwrap();
+    assert!(matches!(session.pdm.take_job().unwrap().unwrap().task, Task::Managed(ManagedTask::ReconcileArchive { .. })));
+    session.pdm.finish(id, Err(Failure { message: "No matching receipt".into(), disconnect: false })).unwrap();
+    assert!(session.execute("pdm.archive", &json!({})).is_err());
+    let id = session.execute("pdm.archive", &json!({"reconcile":true})).unwrap()["request"].as_u64().unwrap();
+    session.pdm.finish(id, Err(Failure { message: "Still no matching receipt".into(), disconnect: false })).unwrap();
+    assert!(session.execute("pdm.archive", &json!({"document":"other","reconcile":true})).is_err());
+    assert!(session.execute("pdm.archive", &json!({"reconcile":"yes"})).is_err());
+}
+
+#[test]
+fn native_incomplete_checkout_proof_allows_release_only_and_never_publication() {
+    let mut status = policy_status();
+    status.managed.local.clear();
+    status.managed.catalog[0].checkout =
+        Some(Checkout { owner: "alice".into(), workspace: "a".into(), machine: "desktop".into(), checked_out_unix_ms: 1, base_version: Some(2) });
+    assert_eq!(status.action_unavailable("pdm.cancel_checkout", Some("part"), None, false, false, None), Some("ui.pdm_reason_checked_out_elsewhere"));
+    status.managed.recoverable_checkouts.push("part".into());
+    assert_eq!(status.document_state(Some("part"), None, false), "ui.pdm_state_checkout_incomplete");
+    assert_eq!(status.action_unavailable("pdm.cancel_checkout", Some("part"), None, false, false, None), None);
+    assert!(status.action_unavailable("pdm.archive", Some("part"), Some("/workspace/part.solidcraft"), false, false, None).is_some());
+    assert!(status.action_unavailable("pdm.checkout", Some("part"), None, false, false, None).is_some());
+    status.managed.catalog[0].checkout.as_mut().unwrap().owner = "bob".into();
+    assert_eq!(status.action_unavailable("pdm.cancel_checkout", Some("part"), None, false, false, None), Some("ui.pdm_reason_checked_out_other"));
+    status.managed.catalog[0].checkout.as_mut().unwrap().owner = "alice".into();
+    status.managed.catalog[0].checkout.as_mut().unwrap().workspace = "other-device".into();
+    assert_eq!(status.action_unavailable("pdm.cancel_checkout", Some("part"), None, false, false, None), Some("ui.pdm_reason_checked_out_elsewhere"));
 }

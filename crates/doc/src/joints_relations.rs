@@ -82,7 +82,7 @@ mod tests {
     use solidcraft_geom::Vec3;
 
     fn joint(kind: JointKind) -> Joint {
-        let at = |occurrence| JointOrigin { occurrence, snap: Snap::Point { point: Vec3::ZERO, z: None } };
+        let at = |occurrence| JointOrigin { occurrence, snap: Snap::Point { point: Vec3::ZERO, z: None, x: None } };
         Joint {
             id: 1,
             name: "R".into(),

@@ -50,6 +50,64 @@ and previously supplied trial binaries are not migrated or modified.
   modify designs or write managed destinations. Completion clears temporary
   RAM-edit permissions before reloading the restored normal tab.
 
+## Interaction state and explorer redesign (draft)
+
+This interaction increment is not accepted until its integrated tests and native
+visual review complete. Earlier historical-restore trials are preserved as
+immutable reproductions and do not establish acceptance of the redesigned UI.
+
+The native worker combines authenticated server metadata, workspace identity,
+manifest base/hash and a verified reservation capability. The UI reads that
+snapshot; optimistic button changes never grant checkout or publication rights.
+A shared action policy drives the explorer, active-file ribbon and menus. The
+engine, native adapter and server validate again before side effects, including
+when a caller bypasses a disabled button.
+
+| State | Extract / Check Out | Publish / Check In | Undo Checkout | Get Latest |
+| --- | --- | --- | --- | --- |
+| Disconnected, unavailable, or request pending | Disabled | Disabled | Disabled | Disabled |
+| No file selected | Disabled | Only explicit first publication of a saved unmanaged active design | Disabled | Disabled |
+| Unmanaged saved native design inside the working folder | Disabled | Explicit first publication | Disabled | Disabled |
+| Archived, clean and current | Enabled for a writable role | Disabled; checkout required | Disabled | Disabled when the required graph is current |
+| Authenticated checkout here, matching workspace and base | Disabled; already extracted | Enabled after saving memory edits | Enabled with explicit discard confirmation | Disabled |
+| Verified checkout here whose download failed before manifest installation | Disabled | Disabled | Release only, with explicit no-local-file-replacement confirmation | Disabled |
+| Checkout in another workspace/device, or owned by someone else | Disabled with owner/workspace explanation | Disabled | Disabled | Disabled |
+| Locally modified without valid checkout, or stale base | Disabled with reconciliation guidance | Disabled | Only an authentic owned checkout can be released | Disabled until local changes are preserved |
+| Clean local copy behind the server | Enabled with fresh authority and installation checks | Disabled | Disabled | Enabled with complete dependency preflight |
+
+Historical opening requires a real selected version and read access. Restore
+requires a writable role, a clean current working copy, no conflicting checkout
+and a selected older version, plus explicit confirmation. Lost-acknowledgement
+publication receipts are reconciled before requesting any new reservation;
+reconciliation never authorizes a new publication using stale rights.
+The explicit `pdm.archive {reconcile:true}` retry verifies an existing receipt
+only: it cannot create a document, acquire a checkout or publish new content.
+An uncertain previous result requires a fresh status check before another
+mutating action. Background Save/Save As workers preserve the exact shared PDM
+runtime, historical flag and editor recovery epoch; creating a scratch save
+snapshot cannot detach a managed destination or renew a stale editor.
+An incomplete checkout is recoverable only when an authenticated resume verifies
+the exact cached native grant against the current account, workspace and device.
+The public status exposes document identities, never reservation secrets. This
+proof permits release alone and cannot authorize publication. A genuinely missing
+clean working file can be installed again at its original path; permission errors,
+directories, links and reparse points never count as missing files.
+
+The explorer separates folders, files and lower detail tabs. It uses the existing
+semantic theme tokens and original icon library, resizable panes and columns,
+search, sorting, breadcrumbs and text alongside status badges. Real embedded
+version thumbnails load asynchronously through the same single-flight worker;
+a bounded cache keys them by immutable document/version/hash. Missing previews
+remain explicit. A captured operation target keeps success/error feedback tied
+to the file acted on, even if selection changes before the response. Background
+refreshes and previews do not replace the last user-operation result.
+
+Italian labels use Estrai, Archivia and Annulla estrazione; initial publication
+has its own label. Local Save remains distinct from publishing to the archive.
+Native before/after evidence uses only original toy parts and assemblies in a
+new isolated profile. Previously delivered applications, profiles and archives
+are never used as test targets or silently upgraded.
+
 ## Incremental slices and validation
 
 The authorized delivery includes three deployment modes, using the same service

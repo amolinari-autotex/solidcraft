@@ -1,5 +1,5 @@
 use serde::Serialize;
-use solidcraft_geom::{Mesh, Vec3};
+use solidcraft_geom::{Aabb3, Mesh, Vec3};
 use truck_meshalgo::prelude::*;
 use truck_modeling as mt;
 
@@ -79,6 +79,25 @@ pub(crate) struct SharedDisplay {
 impl SharedDisplay {
     pub(crate) fn new(original: Body) -> Self {
         SharedDisplay { original: Body { display_of: None, meshes: None, ..original }, mesh: std::sync::OnceLock::new() }
+    }
+}
+
+/// The display one body shares with its placed copies (see [`Body::display_share`]), so a
+/// saved design can store the part once and give its copies the same display again.
+#[derive(Clone, Debug)]
+pub struct DisplayShare(std::sync::Arc<SharedDisplay>);
+
+impl DisplayShare {
+    pub fn new(original: Body) -> Self {
+        DisplayShare(std::sync::Arc::new(SharedDisplay::new(original)))
+    }
+    /// The body whose display the copies show.
+    pub fn original(&self) -> &Body {
+        &self.0.original
+    }
+    /// Identity: copies that show the same display have the same id.
+    pub fn id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0) as usize
     }
 }
 
@@ -523,14 +542,8 @@ fn orientation_tolerance(span: f64) -> f64 {
 
 /// Bounding-box diagonal of a solid's vertices (1 when it has no finite extent).
 fn span_of(solid: &Solid) -> f64 {
-    let mut lo = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-    let mut hi = -lo;
-    for v in solid.vertex_iter() {
-        let p = from_p3(v.point());
-        lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
-        hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
-    }
-    if lo.x.is_finite() { (hi - lo).len() } else { 1.0 }
+    let bounds: Aabb3 = solid.vertex_iter().map(|v| from_p3(v.point())).collect();
+    if bounds.is_empty() { 1.0 } else { bounds.diagonal() }
 }
 
 /// Equal shared values: the same allocation (a clone of the body), else equal contents.
@@ -974,6 +987,23 @@ impl Body {
             self.display_of = Some(std::sync::Arc::new((shared, t)));
         }
         self
+    }
+
+    /// The display this body shows placed by a matrix (by columns), when it is a placed copy of
+    /// another body.
+    pub fn display_share(&self) -> Option<(DisplayShare, [[f64; 4]; 4])> {
+        self.display_of.as_deref().map(|(shared, t)| (DisplayShare(shared.clone()), *t))
+    }
+
+    /// The same body showing `share`'s display placed by `t` (see [`Body::display_share`]).
+    pub fn with_display_share(self, share: &DisplayShare, t: [[f64; 4]; 4]) -> Body {
+        self.with_display_of(share.0.clone(), t)
+    }
+
+    /// Identity of the solid: clones of a body (and bodies a feature passed through unchanged)
+    /// share it.
+    pub fn solid_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.solid) as usize
     }
 
     pub fn with_split_lines(mut self, s: Option<std::sync::Arc<Vec<Vec<Vec3>>>>) -> Body {

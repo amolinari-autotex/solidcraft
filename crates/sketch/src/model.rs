@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Seg2, Vec2, Vec3};
+use solidcraft_geom::{Aabb2, Seg2, Vec2, Vec3};
 
 use crate::union_find::{find, union};
 
@@ -303,6 +303,17 @@ pub enum ConstraintKind {
         l: usize,
         value: f64,
     },
+    /// Distance from line `l` to the edge of circle or arc `c`, along the line's normal: the
+    /// gap `|distance from the centre to the line| − radius` while the line misses the circle,
+    /// or, `inside`, how far the edge reaches past the line, `radius − |distance|`, while the
+    /// line cuts it. Zero is tangency either way. An arc is measured to its whole circle.
+    LineCircleDistance {
+        l: usize,
+        c: usize,
+        value: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        inside: bool,
+    },
     Length {
         l: usize,
         value: f64,
@@ -380,6 +391,7 @@ impl ConstraintKind {
             | DistanceX { value, .. }
             | DistanceY { value, .. }
             | PointLineDistance { value, .. }
+            | LineCircleDistance { value, .. }
             | Length { value, .. }
             | LineAngle { value, .. }
             | ArcSweep { value, .. }
@@ -400,6 +412,7 @@ impl ConstraintKind {
             | DistanceX { value, .. }
             | DistanceY { value, .. }
             | PointLineDistance { value, .. }
+            | LineCircleDistance { value, .. }
             | Length { value, .. }
             | LineAngle { value, .. }
             | ArcSweep { value, .. }
@@ -433,7 +446,9 @@ impl ConstraintKind {
             Midpoint { .. } => "MidPoint",
             Symmetric { .. } => "Symmetry",
             Fix { .. } => "Fix",
-            Distance { .. } | DistanceX { .. } | DistanceY { .. } | PointLineDistance { .. } | Length { .. } => "LinearDimension",
+            Distance { .. } | DistanceX { .. } | DistanceY { .. } | PointLineDistance { .. } | LineCircleDistance { .. } | Length { .. } => {
+                "LinearDimension"
+            }
             Radius { .. } => "RadialDimension",
             Diameter { .. } => "DiameterDimension",
             Angle { .. } | LineAngle { .. } | ArcSweep { .. } => "AngularDimension",
@@ -466,6 +481,7 @@ impl ConstraintKind {
             }
             Angle { a, b, .. } | SlotOverallLength { a, b, .. } => (vec![], vec![a, b]),
             Midpoint { p, l } | PointLineDistance { p, l, .. } => (vec![p], vec![l]),
+            LineCircleDistance { l, c, .. } => (vec![], vec![l, c]),
             Symmetric { p, q, l } => (vec![p, q], vec![l]),
             Fix { p } => (vec![p], vec![]),
             Smooth { a, b } => (vec![], vec![a, b]),
@@ -528,6 +544,10 @@ impl ConstraintKind {
             Midpoint { p, l } | PointLineDistance { p, l, .. } => {
                 fp(p);
                 fc(l);
+            }
+            LineCircleDistance { l, c, .. } => {
+                fc(l);
+                fc(c);
             }
             Symmetric { p, q, l } => {
                 fp(p);
@@ -968,6 +988,10 @@ impl Sketch {
                 if value <= radius(a) + radius(b) + 1e-9 {
                     return Err(SketchError::Invalid("overall slot length must exceed its width".into()));
                 }
+            }
+            LineCircleDistance { l, c, .. } => {
+                need_line(l)?;
+                need_round(c)?;
             }
             Tangent { a, b } => {
                 let free = |i: usize| self.curves.get(i).is_some_and(|c| c.kind.is_freeform());
@@ -1570,18 +1594,7 @@ impl Sketch {
 
     /// Axis-aligned bounds of all geometry (for views).
     pub fn bounds(&self) -> Option<(Vec2, Vec2)> {
-        let mut lo = Vec2::new(f64::INFINITY, f64::INFINITY);
-        let mut hi = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
-        let mut any = false;
-        for i in 0..self.curves.len() {
-            for s in self.segs(i) {
-                for p in s.polyline(0.5) {
-                    lo = Vec2::new(lo.x.min(p.x), lo.y.min(p.y));
-                    hi = Vec2::new(hi.x.max(p.x), hi.y.max(p.y));
-                    any = true;
-                }
-            }
-        }
-        any.then_some((lo, hi))
+        let b: Aabb2 = (0..self.curves.len()).flat_map(|i| self.segs(i)).flat_map(|s| s.polyline(0.5)).collect();
+        (!b.is_empty()).then_some((b.min, b.max))
     }
 }

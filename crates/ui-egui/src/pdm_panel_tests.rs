@@ -405,6 +405,14 @@ fn restore_version_confirmation_captures_selection_and_cancel_queues_nothing() {
             Ok(Outcome::Managed {
                 port: 48231,
                 state: ManagedState {
+                    catalog: vec![solidcraft_engine::pdm::CatalogEntry {
+                        document: "part".into(),
+                        logical_path: "part.solidcraft".into(),
+                        head: Some(2),
+                        checkout: None,
+                        head_checked_in_unix_ms: None,
+                        head_author: None,
+                    }],
                     local: vec![LocalEntry {
                         document: "part".into(),
                         path: "part.solidcraft".into(),
@@ -421,9 +429,11 @@ fn restore_version_confirmation_captures_selection_and_cancel_queues_nothing() {
         )
         .unwrap();
     h.app.pdm.selected = Some(version().reference);
-    h.frames(2);
+    h.frames(8);
     h.step(&json!({"click":{"handle":"pdm:restore_version"}})).unwrap();
     assert_eq!(h.app.pdm.restore_confirmation, Some(version().reference));
+    assert!(h.widget("part.solidcraft · v1").is_some(), "confirmation identifies the readable captured file and version");
+    assert!(h.widget("part - v1").is_none(), "opaque identity belongs only in the hover details");
     assert!(h.app.pdm.runtime.status().unwrap().busy.is_none());
     h.step(&json!({"widget":"Cancel"})).unwrap();
     assert!(h.app.pdm.restore_confirmation.is_none());
@@ -633,6 +643,14 @@ fn restore_completion_clears_temporary_ram_permission_and_reuses_its_editor() {
     h.app.session.path = Some("part.solidcraft".into());
     h.app.session.mark_saved();
     let state = |base_version| ManagedState {
+        catalog: vec![solidcraft_engine::pdm::CatalogEntry {
+            document: "part".into(),
+            logical_path: "part.solidcraft".into(),
+            head: Some(base_version),
+            checkout: None,
+            head_checked_in_unix_ms: None,
+            head_author: None,
+        }],
         local: vec![LocalEntry {
             document: "part".into(),
             path: "part.solidcraft".into(),
@@ -821,4 +839,442 @@ fn pdm_recovery_epoch_cached_adoption_never_renews_its_receipt() {
     epoch_recover(&mut h, &path, true);
     crate::documents::adopt(&mut h.app, cached);
     assert!(h.app.session.check_pdm_reopen().is_err());
+}
+
+fn explorer_state(checked_out: bool) -> ManagedState {
+    use solidcraft_engine::pdm::{CatalogEntry, Checkout, LocalEntry};
+    let catalog = ["part", "other"]
+        .into_iter()
+        .map(|document| CatalogEntry {
+            document: document.into(),
+            logical_path: format!("Projects/{document}.solidcraft"),
+            head: Some(2),
+            checkout: (checked_out && document == "part").then(|| Checkout {
+                owner: "tester".into(),
+                workspace: "workspace-a".into(),
+                machine: "test-device".into(),
+                checked_out_unix_ms: 0,
+                base_version: Some(2),
+            }),
+            head_checked_in_unix_ms: Some(0),
+            head_author: Some("tester".into()),
+        })
+        .collect();
+    let local = ["part", "other"]
+        .into_iter()
+        .map(|document| LocalEntry {
+            document: document.into(),
+            path: format!("Working/{document}.solidcraft"),
+            relative_path: format!("Projects/{document}.solidcraft"),
+            base_version: 2,
+            sha256: "00".repeat(32),
+            checked_out: checked_out && document == "part",
+            modified: false,
+            present: true,
+        })
+        .collect();
+    ManagedState {
+        server_id: Some("test-server".into()),
+        workspace: Some("workspace-a".into()),
+        root: Some("Working".into()),
+        catalog,
+        local,
+        ..Default::default()
+    }
+}
+
+type ExplorerRequests = Arc<Mutex<Vec<Task>>>;
+type ExplorerCompletions = Arc<Mutex<Vec<mpsc::Sender<Completion>>>>;
+
+fn explorer(checked_out: bool) -> (Harness, ExplorerRequests, ExplorerCompletions) {
+    let mut h = Harness::new();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let retained = held.clone();
+    h.app.services.pdm = Some(Arc::new(move |job| {
+        let (send, receive) = mpsc::channel();
+        if matches!(&job.task, Task::Managed(ManagedTask::History { .. } | ManagedTask::Preview { .. })) {
+            send.send(Completion { result: Ok(Outcome::Listed(Vec::new())), open: None }).unwrap();
+        } else {
+            observed.lock().unwrap().push(job.task);
+            retained.lock().unwrap().push(send);
+        }
+        receive
+    }));
+    h.app.pdm.runtime.set_available(true).unwrap();
+    let id = h.app.pdm.runtime.enqueue(Task::Connect { port: 48231 }).unwrap();
+    h.app
+        .pdm
+        .runtime
+        .finish(
+            id,
+            Ok(Outcome::ManagedConnected {
+                port: 48231,
+                state: explorer_state(checked_out),
+                connections: Vec::new(),
+                connection: ActiveConnection {
+                    id: "a".repeat(64),
+                    label: "Test archive".into(),
+                    origin: "https://localhost:48231".into(),
+                    server_id: "test-server".into(),
+                    account: "tester".into(),
+                    role: "Editor".into(),
+                },
+            }),
+        )
+        .unwrap();
+    h.app.session.path = Some("Working/part.solidcraft".into());
+    h.app.session.mark_saved();
+    crate::pdm_panel::enter(&mut h.app).unwrap();
+    h.app.pdm.document = "part".into();
+    h.app.pdm.folder = "Projects".into();
+    h.frames(3);
+    (h, requests, held)
+}
+
+fn complete_explorer(h: &mut Harness, held: &ExplorerCompletions, result: Result<Outcome, Failure>) {
+    held.lock().unwrap().remove(0).send(Completion { result, open: None }).unwrap();
+    h.frames(4);
+}
+
+#[test]
+fn explorer_checkout_is_single_flight_and_archive_requires_confirmed_checkout() {
+    let (mut h, requests, held) = explorer(false);
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.archive"), Some("ui.pdm_reason_checkout_required"));
+    h.step(&json!({"click":{"handle":"pdm:archive"}})).unwrap();
+    h.frames(2);
+    assert!(requests.lock().unwrap().is_empty());
+    h.step(&json!({"click":{"handle":"pdm:checkout"}})).unwrap();
+    h.step(&json!({"click":{"handle":"pdm:checkout"}})).unwrap();
+    h.frames(2);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(matches!(&requests.lock().unwrap()[0],Task::Managed(ManagedTask::Checkout{document:Some(document),..})if document=="part"));
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.archive"), Some("ui.pdm_reason_busy"));
+    complete_explorer(&mut h, &held, Ok(Outcome::ManagedRefreshed { port: 48231, state: explorer_state(true) }));
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.checkout"), Some("ui.pdm_reason_checked_out_here"));
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.archive"), None);
+    assert!(h.widget("Check Out completed for Projects/part.solidcraft.").is_some());
+    h.step(&json!({"click":{"handle":"pdm:checkout"}})).unwrap();
+    h.frames(2);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    h.step(&json!({"click":{"handle":"pdm:archive"}})).unwrap();
+    h.frames(2);
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert!(matches!(&requests.lock().unwrap()[1],Task::Managed(ManagedTask::Archive{path,..})if path=="Working/part.solidcraft"));
+    complete_explorer(&mut h, &held, Ok(Outcome::ManagedRefreshed { port: 48231, state: explorer_state(false) }));
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.archive"), Some("ui.pdm_reason_checkout_required"));
+    assert!(h.widget("Check In completed for Projects/part.solidcraft.").is_some());
+}
+
+#[test]
+fn explorer_completion_keeps_selection_folder_and_target_feedback_through_refresh() {
+    let (mut h, requests, held) = explorer(false);
+    h.step(&json!({"click":{"handle":"pdm:checkout"}})).unwrap();
+    h.frames(2);
+    h.app.pdm.document = "other".into();
+    complete_explorer(&mut h, &held, Ok(Outcome::ManagedRefreshed { port: 48231, state: explorer_state(true) }));
+    assert_eq!(h.app.pdm.document, "other");
+    assert_eq!(h.app.pdm.folder, "Projects");
+    assert!(h.widget("Check Out completed for Projects/part.solidcraft.").is_some());
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.archive"), Some("ui.pdm_reason_open_selected"));
+    h.app.run("pdm.refresh", json!({})).unwrap();
+    h.frames(2);
+    complete_explorer(&mut h, &held, Ok(Outcome::ManagedRefreshed { port: 48231, state: explorer_state(true) }));
+    assert!(h.widget("Check Out completed for Projects/part.solidcraft.").is_some());
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn explorer_offline_failure_stays_visible_and_blocks_actions_without_fake_success() {
+    let (mut h, requests, held) = explorer(false);
+    h.step(&json!({"click":{"handle":"pdm:checkout"}})).unwrap();
+    h.frames(2);
+    complete_explorer(&mut h, &held, Err(Failure { message: "Archive is offline; reconnect and retry".into(), disconnect: true }));
+    assert!(h.app.pdm.runtime.status().unwrap().port.is_none());
+    assert!(h.widget("Check Out failed for Projects/part.solidcraft: Archive is offline; reconnect and retry").is_some());
+    h.step(&json!({"click":{"handle":"pdm:checkout"}})).unwrap();
+    h.step(&json!({"click":{"handle":"pdm:archive"}})).unwrap();
+    h.frames(3);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(h.widget("Check Out failed for Projects/part.solidcraft: Archive is offline; reconnect and retry").is_some());
+}
+
+#[test]
+fn explorer_undo_checkout_confirmation_keeps_captured_document_after_selection_switch() {
+    let (mut h, requests, held) = explorer(true);
+    h.step(&json!({"click":{"handle":"pdm:cancel_checkout"}})).unwrap();
+    h.frames(2);
+    assert!(h.app.pdm.cancel_confirmation);
+    assert!(requests.lock().unwrap().is_empty());
+    h.app.pdm.document = "other".into();
+    h.step(&json!({"click":{"handle":"pdm:cancel_checkout_confirm"}})).unwrap();
+    h.frames(2);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(matches!(&requests.lock().unwrap()[0],Task::Managed(ManagedTask::CancelCheckout{document:Some(document),..})if document=="part"));
+    complete_explorer(&mut h, &held, Ok(Outcome::ManagedRefreshed { port: 48231, state: explorer_state(false) }));
+    assert_eq!(h.app.pdm.document, "other");
+}
+
+#[test]
+fn explorer_no_selection_cannot_operate_active_managed_file_but_initial_archive_is_explicit() {
+    let (mut h, requests, _held) = explorer(true);
+    h.app.pdm.document.clear();
+    h.frames(2);
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.checkout"), Some("ui.pdm_reason_select_document"));
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.archive"), Some("ui.pdm_reason_select_document"));
+    h.step(&json!({"click":{"handle":"pdm:archive"}})).unwrap();
+    h.frames(2);
+    assert!(requests.lock().unwrap().is_empty());
+    h.app.session.path = Some("Working/new-design.solidcraft".into());
+    h.app.session.mark_saved();
+    h.frames(2);
+    assert!(h.widget("Initial Check In").is_some());
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.archive"), None);
+    h.step(&json!({"click":{"handle":"pdm:archive"}})).unwrap();
+    h.frames(2);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(matches!(&requests.lock().unwrap()[0],Task::Managed(ManagedTask::Archive{path,..})if path=="Working/new-design.solidcraft"));
+}
+
+#[test]
+fn explorer_folder_navigation_and_sorting_do_not_discard_selected_document() {
+    let (mut h, requests, _held) = explorer(false);
+    h.step(&json!({"click":{"handle":"pdm:sort:0"}})).unwrap();
+    h.step(&json!({"click":{"handle":"pdm:folder:root"}})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.pdm.document, "part");
+    assert!(h.app.pdm.folder.is_empty());
+    h.step(&json!({"click":{"handle":"pdm:folder:Projects"}})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.pdm.folder, "Projects");
+    assert_eq!(h.app.pdm.document, "part");
+    // A click on the text itself selects the row, rather than entering egui's
+    // generic label text-selection interaction.
+    h.step(&json!({"widget":"other.solidcraft"})).unwrap();
+    h.frames(3);
+    assert_eq!(h.app.pdm.document, "other");
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn explorer_menu_command_info_matches_ribbon_policy_and_waits_for_native_file_operations() {
+    let (mut h, _requests, _held) = explorer(false);
+    let archive = solidcraft_engine::find_command("pdm.archive").unwrap();
+    let checkout = solidcraft_engine::find_command("pdm.checkout").unwrap();
+    for command in [archive, checkout] {
+        let reason = crate::pdm_panel::command_unavailable(&h.app, command.id);
+        let info = h.app.command_info(command);
+        assert_eq!(info.enabled, reason.is_none());
+        assert_eq!(info.disabled_reason, reason.map(|reason| h.app.tr(reason).to_string()));
+    }
+    h.app.services.pick_open = Some(Box::new(|_| Box::pin(std::future::pending())));
+    h.app.pick_open(|_, _| {});
+    assert!(h.app.file_picker_busy());
+    for command in [archive, checkout] {
+        let info = h.app.command_info(command);
+        assert!(!info.enabled);
+        assert_eq!(crate::pdm_panel::command_unavailable(&h.app, command.id), Some("ui.pdm_reason_busy"));
+        assert_eq!(info.disabled_reason.as_deref(), Some(h.app.tr("ui.pdm_reason_busy")));
+    }
+}
+
+#[test]
+fn explorer_failed_archive_offers_receipt_verification_without_repeating_publication() {
+    let (mut h, requests, held) = explorer(true);
+    h.step(&json!({"click":{"handle":"pdm:archive"}})).unwrap();
+    h.frames(2);
+    complete_explorer(&mut h, &held, Err(Failure { message: "Publication reply was lost; verify the result".into(), disconnect: false }));
+    assert!(h.widget("Verify Check-In Result").is_some());
+    h.step(&json!({"click":{"handle":"pdm:reconcile_archive"}})).unwrap();
+    h.frames(2);
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert!(matches!(&requests.lock().unwrap()[0],Task::Managed(ManagedTask::Archive{path,..})if path=="Working/part.solidcraft"));
+    assert!(matches!(&requests.lock().unwrap()[1],Task::Managed(ManagedTask::ReconcileArchive{path,..})if path=="Working/part.solidcraft"));
+    complete_explorer(&mut h, &held, Ok(Outcome::ManagedRefreshed { port: 48231, state: explorer_state(false) }));
+    assert!(h.widget("Check In completed for Projects/part.solidcraft.").is_some());
+    assert!(h.widget("Verify Check-In Result").is_none());
+}
+
+#[test]
+fn explorer_table_rows_keep_allocated_height_below_header_in_wide_and_narrow_windows() {
+    let (mut h, _requests, _held) = explorer(false);
+    for width in [1600, 860] {
+        h.call("ui.resize", json!({"width":width,"height":1000}));
+        h.frames(3);
+        let header = crate::scenario::handle_at("pdm:sort:0").unwrap();
+        let other = crate::scenario::handle_at("pdm:file:other").unwrap();
+        let part = crate::scenario::handle_at("pdm:file:part").unwrap();
+        assert!(other.y - header.y >= 31.0, "first row overlaps header: {header:?} {other:?}");
+        assert!(part.y - other.y >= 31.0, "allocated row height lost: {other:?} {part:?}");
+        assert!(part.y < 1000.0, "rows remain inside the explorer");
+    }
+}
+
+#[test]
+fn explorer_palette_start_routes_checkout_to_selected_row_instead_of_another_active_editor() {
+    let (mut h, requests, _held) = explorer(false);
+    h.app.pdm.document = "other".into();
+    assert_eq!(h.app.session.path.as_deref(), Some("Working/part.solidcraft"));
+    h.app.start("pdm.checkout");
+    h.frames(2);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(matches!(&requests.lock().unwrap()[0],Task::Managed(ManagedTask::Checkout{document:Some(document),..})if document=="other"));
+    assert_eq!(h.app.session.path.as_deref(), Some("Working/part.solidcraft"));
+}
+
+#[test]
+fn explorer_where_used_never_shows_completed_metadata_for_a_different_selection() {
+    let (mut h, _requests, _held) = explorer(false);
+    h.app.pdm.detail_tab = 2;
+    let mut initial = explorer_state(false);
+    initial.where_used = vec![Reference { document: "parent_a".into(), version: 1 }];
+    // Metadata jobs return Managed, whereas periodic ManagedRefreshed deliberately
+    // preserves the previous history/where-used snapshot in Runtime::finish.
+    h.app.services.pdm = Some(Arc::new(move |job| {
+        assert!(matches!(job.task,Task::Managed(ManagedTask::History {ref document}) if document=="part"));
+        let (send, receive) = mpsc::channel();
+        send.send(Completion { result: Ok(Outcome::Managed { port: 48231, state: initial.clone() }), open: None }).unwrap();
+        receive
+    }));
+    h.app.run("pdm.history", json!({"document":"part"})).unwrap();
+    h.frames(4);
+    assert!(h.widget("parent_a · v1").is_some());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let retained = held.clone();
+    h.app.services.pdm = Some(Arc::new(move |job| {
+        let (send, receive) = mpsc::channel();
+        observed.lock().unwrap().push(job.task);
+        retained.lock().unwrap().push(send);
+        receive
+    }));
+    h.app.run("pdm.history", json!({"document":"part"})).unwrap();
+    h.frames(2);
+    h.step(&json!({"click":{"handle":"pdm:file:other"}})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.pdm.document, "other");
+    assert!(h.widget("parent_a · v1").is_none());
+    let mut stale = explorer_state(false);
+    stale.where_used = vec![Reference { document: "parent_a".into(), version: 1 }];
+    complete_explorer(&mut h, &held, Ok(Outcome::Managed { port: 48231, state: stale }));
+    assert_eq!(h.app.pdm.document, "other");
+    assert!(h.widget("parent_a · v1").is_none());
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert!(matches!(&requests.lock().unwrap()[1],Task::Managed(ManagedTask::History{document})if document=="other"));
+    let mut current = explorer_state(false);
+    current.where_used = vec![Reference { document: "parent_b".into(), version: 2 }];
+    complete_explorer(&mut h, &held, Ok(Outcome::Managed { port: 48231, state: current }));
+    assert!(h.widget("parent_b · v2").is_some());
+    assert!(h.widget("parent_a · v1").is_none());
+}
+
+#[test]
+fn explorer_incomplete_checkout_release_requires_verified_native_proof_and_never_enables_archive() {
+    let (mut h, requests, held) = explorer(false);
+    let mut incomplete = explorer_state(true);
+    incomplete.local.retain(|entry| entry.document != "part");
+    incomplete.recoverable_checkouts = vec!["part".into()];
+    let id = h.app.pdm.runtime.enqueue(Task::Refresh).unwrap();
+    h.app.pdm.runtime.finish(id, Ok(Outcome::ManagedRefreshed { port: 48231, state: incomplete.clone() })).unwrap();
+    h.frames(3);
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.cancel_checkout"), None);
+    assert!(crate::pdm_panel::command_unavailable(&h.app, "pdm.archive").is_some());
+    assert_eq!(h.app.pdm.runtime.status().unwrap().document_state(Some("part"), None, false), "ui.pdm_state_checkout_incomplete");
+    h.step(&json!({"click":{"handle":"pdm:cancel_checkout"}})).unwrap();
+    h.frames(2);
+    assert!(h.widget("Release this verified incomplete checkout? No local file will be replaced.").is_some());
+    assert!(h.widget(h.app.tr("ui.pdm_discard_confirm")).is_none());
+    h.step(&json!({"click":{"handle":"pdm:cancel_checkout_confirm"}})).unwrap();
+    h.frames(2);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(matches!(&requests.lock().unwrap()[0],Task::Managed(ManagedTask::CancelCheckout{document:Some(document),..})if document=="part"));
+    incomplete.recoverable_checkouts.clear();
+    complete_explorer(&mut h, &held, Ok(Outcome::ManagedRefreshed { port: 48231, state: incomplete }));
+    assert_eq!(crate::pdm_panel::command_unavailable(&h.app, "pdm.cancel_checkout"), Some("ui.pdm_reason_checked_out_elsewhere"));
+    assert!(crate::pdm_panel::command_unavailable(&h.app, "pdm.archive").is_some());
+    h.step(&json!({"click":{"handle":"pdm:cancel_checkout"}})).unwrap();
+    h.frames(2);
+    assert!(!h.app.pdm.cancel_confirmation);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn explorer_compact_details_keep_actions_above_footer_and_scroll_to_later_history_rows() {
+    use solidcraft_engine::pdm::{ManagedVersion, Preview};
+    let (mut h, _requests, held) = explorer(false);
+    let long_path = "Working/Very long archive folder/Another nested folder/Initial.solidcraft";
+    h.app.session.path = Some(long_path.into());
+    h.app.session.mark_saved();
+    h.app.pdm.document.clear();
+    h.app.run("pdm.archive", json!({})).unwrap();
+    h.frames(2);
+    let mut state = explorer_state(false);
+    state.catalog.iter_mut().find(|entry| entry.document == "part").unwrap().head = Some(3);
+    state.local.iter_mut().find(|entry| entry.document == "part").unwrap().base_version = 3;
+    state.history = (1..=3)
+        .map(|number| ManagedVersion {
+            version: Version {
+                reference: Reference { document: "part".into(), version: number },
+                parent: (number > 1).then_some(number - 1),
+                sha256: "00".repeat(32),
+                dependencies: Vec::new(),
+            },
+            author: "Test author".into(),
+            checked_in_unix_ms: 0,
+            comment: format!("Test version {number}"),
+            request_id: format!("history-{number}"),
+        })
+        .collect();
+    let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(240, 150, image::Rgba([60, 90, 120, 255])));
+    let mut png = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    state.preview = Some(Preview { reference: Reference { document: "part".into(), version: 1 }, sha256: "00".repeat(32), png: png.into_inner() });
+    h.app.pdm.document = "part".into();
+    h.app.pdm.selected = Some(Reference { document: "part".into(), version: 1 });
+    complete_explorer(&mut h, &held, Ok(Outcome::Managed { port: 48231, state }));
+    h.app.preferences.language = "it".into();
+    h.frames(8);
+    for (index, width) in [860, 960].into_iter().enumerate() {
+        h.call("ui.resize", json!({"width":width,"height":512}));
+        h.frames(4);
+        let pane = crate::scenario::rect_of("pdm_details_pane").unwrap();
+        let footer = crate::scenario::rect_of("pdm_footer").unwrap();
+        let actions = crate::scenario::rect_of("pdm_detail_actions").unwrap();
+        assert!(pane.bottom() <= footer.top(), "details crossed footer: {pane:?} {footer:?}");
+        for command in ["pdm.open_archived", "pdm.restore_version"] {
+            let button = crate::scenario::rect_of(&format!("pdm_action_button:{command}")).unwrap();
+            // egui rounds widget edges to physical pixels; only containment in
+            // the reserved action row gets this subpixel allowance. The footer
+            // boundary below remains strict.
+            assert!(actions.expand(0.5).contains_rect(button), "action escaped reserved row at {width}: {button:?} {actions:?}");
+            assert!(button.bottom() <= footer.top(), "action crossed persistent footer: {button:?} {footer:?}");
+        }
+        let notice = crate::scenario::rect_of("pdm_notice").unwrap();
+        assert!(footer.contains_rect(notice), "notice escaped footer: {notice:?} {footer:?}");
+        assert!(notice.height() < 24.0, "success notice wrapped at {width}: {notice:?}");
+        let scroll = crate::scenario::rect_of("pdm_details_scroll").unwrap();
+        assert!(scroll.height() >= 64.0, "history must initially show a readable full thumbnail row: {scroll:?}");
+        if index > 0 {
+            h.call("ui.scroll", json!({"x":scroll.center().x,"y":scroll.center().y,"delta":300}));
+            h.frames(12);
+        }
+        let scroll = crate::scenario::rect_of("pdm_details_scroll").unwrap();
+        let first_label = crate::scenario::rect_of("pdm_history_version:part:1").unwrap();
+        let first_thumbnail = crate::scenario::rect_of("pdm_history_thumbnail:part:1").unwrap();
+        assert!(scroll.expand(0.5).contains_rect(first_label), "initial version text clipped at {width}: {first_label:?} {scroll:?}");
+        assert!(scroll.expand(0.5).contains_rect(first_thumbnail), "initial real thumbnail clipped at {width}: {first_thumbnail:?} {scroll:?}");
+        h.call("ui.scroll", json!({"x":scroll.center().x,"y":scroll.center().y,"delta":-300}));
+        h.frames(12);
+        let last = crate::scenario::handle_at("pdm:version:part:3").unwrap();
+        let scroll = crate::scenario::rect_of("pdm_details_scroll").unwrap();
+        assert!(scroll.contains(last), "later history row unreachable by wheel at {width}: {last:?} {scroll:?}");
+        h.step(&json!({"click":{"handle":"pdm:version:part:3"}})).unwrap();
+        h.frames(3);
+        assert_eq!(h.app.pdm.selected, Some(Reference { document: "part".into(), version: 3 }));
+    }
+    let locale = crate::i18n::Locale::for_language("it");
+    let notice = locale.format("ui.pdm_operation_succeeded", &[("action", locale.text("ui.pdm_archive")), ("file", "Initial.solidcraft")]);
+    assert!(h.widget(&notice).is_some());
 }

@@ -3,7 +3,7 @@
 //! directly from the body's faces (the band's walls continue the walls below, which a boolean
 //! union can't join: their faces would coincide).
 
-use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec3};
+use solidcraft_geom::{Loop2, Plane, Region2, Ring, Seg2, Vec3};
 use truck_modeling::{self as mt, builder};
 
 use crate::body::{Body, Solid, from_p3, p3, v3};
@@ -141,7 +141,7 @@ fn pieces(wire: &mt::Wire, size: f64) -> Result<Vec<Piece>> {
 /// vertices, whose polygon has zero area for both the inner and outer loops.
 fn turn(wire: &mt::Wire, n: Vec3) -> f64 {
     use mt::{BoundedCurve, ParametricCurve};
-    let pts: Vec<Vec3> = wire
+    let ring: Ring<Vec3> = wire
         .edge_iter()
         .flat_map(|e| {
             let c = e.oriented_curve();
@@ -149,7 +149,7 @@ fn turn(wire: &mt::Wire, n: Vec3) -> f64 {
             [from_p3(e.front().point()), from_p3(c.subs((a + b) * 0.5))]
         })
         .collect();
-    pts.iter().zip(pts.iter().cycle().skip(1)).map(|(a, b)| a.cross(*b).dot(n)).sum()
+    ring.area_vector().dot(n)
 }
 
 fn rim_loops(wires: &[mt::Wire], n: Vec3) -> Result<(&mt::Wire, &mt::Wire)> {

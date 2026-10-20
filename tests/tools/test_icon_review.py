@@ -1,6 +1,7 @@
 """Long-term discovery and acceptance behavior of the repository-owned review app."""
 import contextlib
 import json
+import os
 import re
 from pathlib import Path
 import shutil
@@ -247,7 +248,14 @@ class IconReviewTest(unittest.TestCase):
             self.assertNotIn('box', changed['final'])
             self.assertIn('changed since acceptance', get('/'))
             self.assertEqual(old_hash, json.loads((design / 'review.json').read_text(encoding='utf-8'))['final']['box'])
-            (design / 'svg/model/box.svg').write_text(SVG.replace('r="20"', 'r="17"'), encoding='utf-8')
+            artwork = design / 'svg/model/box.svg'
+            before = artwork.stat()
+            artwork.write_text(SVG.replace('r="20"', 'r="17"'), encoding='utf-8')
+            # Equal-length edits can share a filesystem timestamp on fast CI hosts.
+            # Reproduce that deterministically: acceptance must track the content.
+            os.utime(artwork, ns=(before.st_atime_ns, before.st_mtime_ns))
+            self.assertEqual(artwork.stat().st_size, before.st_size)
+            self.assertEqual(artwork.stat().st_mtime_ns, before.st_mtime_ns)
             with self.assertRaises(urllib.error.HTTPError) as error:
                 post(changed, final=['box'])
             self.assertEqual(error.exception.code, 400)

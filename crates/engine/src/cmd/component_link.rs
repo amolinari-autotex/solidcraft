@@ -23,7 +23,8 @@ mod relink_tests;
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("component.insert_design", "Insert Design", insert_design).at("SOLID", "ASSEMBLE").icon("component").params(
         "path: a .solidcraft design → a new component linked to it, holding its solid bodies as placed in that design; \
-         name? (default: the design's name); parent?: component id or name (default: the active one); translate?: [x,y,z]",
+         name? (default: the design's name); parent?: component id or name (default: the active one); translate?: [x,y,z]; \
+         reuse?: bool (default false): insert another occurrence of an existing link to the same file",
     ),
     CommandSpec::new("component.update_links", "Update Links", update_links).icon("update").params(
         "component?: id or name (default: every linked component) — reads the linked designs again and replaces their bodies where they changed",
@@ -147,13 +148,23 @@ fn insert_design(s: &mut Session, p: &Value) -> Result<Value> {
         Some(v) => vec3(v).filter(|t| t.is_finite() && t.len() < 1e9).ok_or_else(|| bad(cmd, "`translate` must be [x, y, z] in mm"))?,
     };
     let file = absolute(Path::new(given));
+    if s.path.as_deref().is_some_and(|own| absolute(Path::new(own)) == file) {
+        return Err(bad(cmd, "a design can't be linked into itself"));
+    }
+    if p.get("reuse").and_then(Value::as_bool).unwrap_or(false) {
+        let existing = s.doc.links.iter().find(|(_, link)| absolute(&resolve(s.path.as_deref(), &link.path)) == file).map(|(id, _)| *id);
+        if let Some(component) = existing {
+            let parent = p.get("parent").cloned().unwrap_or_else(|| json!(s.active_component));
+            return super::component::copy_occurrence(s, &json!({"component": component, "parent": parent, "translate": translate}));
+        }
+    }
     let (design_name, sf) = linked_bodies(&file, s.path.as_deref())?;
     let name = str_(p, "name").filter(|n| !n.trim().is_empty()).map(str::to_string).unwrap_or(design_name);
     let mut create = json!({"name": name, "activate": false});
     if let Some(parent) = p.get("parent") {
         create["parent"] = parent.clone();
     }
-    let made = s.execute("component.create", &create)?;
+    let made = super::component::new_component(s, &create)?;
     let comp = made["component"].as_u64().ok_or_else(|| bad(cmd, "the component was not created"))?;
     let occ = made["occurrence"].as_u64();
     let id = s.doc_mut().add_feature(sf.kind, Some(&name))?;

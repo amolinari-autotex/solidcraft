@@ -64,6 +64,13 @@ pub struct ManagedState {
     pub workspace: Option<String>,
     pub catalog: Vec<CatalogEntry>,
     pub local: Vec<LocalEntry>,
+    /// Native-verified installed assemblies with a newer managed component.
+    #[serde(default)]
+    pub dependency_updates: Vec<String>,
+    /// Native-verified grants with no installed manifest entry. Release only;
+    /// never authorizes publication or filesystem writes.
+    #[serde(default)]
+    pub recoverable_checkouts: Vec<String>,
     pub history: Vec<ManagedVersion>,
     pub where_used: Vec<Reference>,
     pub preview: Option<Preview>,
@@ -111,20 +118,64 @@ pub struct ActiveConnection {
 #[derive(Clone)]
 pub enum ManagedTask {
     ListConnections,
-    CreateLocal { label: String, administrator: String },
-    OpenConnection { connection_id: String },
-    RecoverConnection { connection_id: String },
-    Recover { port: u16, root: String },
-    Preview { reference: Reference },
-    OpenArchived { reference: Reference },
-    Restore { reference: Reference },
-    Connect { port: u16, root: Option<String> },
-    Archive { path: String, logical_path: Option<String>, saved: Arc<solidcraft_doc::Document>, visibility: Box<crate::Visibility> },
-    Checkout { document: Option<String>, path: Option<String> },
-    CancelCheckout { document: Option<String>, path: Option<String> },
-    GetLatest { document: Option<String>, path: Option<String> },
-    Open { document: String },
-    History { document: String },
+    CreateLocal {
+        label: String,
+        administrator: String,
+    },
+    OpenConnection {
+        connection_id: String,
+    },
+    RecoverConnection {
+        connection_id: String,
+    },
+    Recover {
+        port: u16,
+        root: String,
+    },
+    Preview {
+        reference: Reference,
+    },
+    OpenArchived {
+        reference: Reference,
+    },
+    Restore {
+        reference: Reference,
+    },
+    Connect {
+        port: u16,
+        root: Option<String>,
+    },
+    Archive {
+        path: String,
+        logical_path: Option<String>,
+        saved: Arc<solidcraft_doc::Document>,
+        visibility: Box<crate::Visibility>,
+    },
+    /// Reconcile only an existing publication receipt; cannot acquire or publish.
+    ReconcileArchive {
+        path: String,
+        logical_path: Option<String>,
+        saved: Arc<solidcraft_doc::Document>,
+        visibility: Box<crate::Visibility>,
+    },
+    Checkout {
+        document: Option<String>,
+        path: Option<String>,
+    },
+    CancelCheckout {
+        document: Option<String>,
+        path: Option<String>,
+    },
+    GetLatest {
+        document: Option<String>,
+        path: Option<String>,
+    },
+    Open {
+        document: String,
+    },
+    History {
+        document: String,
+    },
 }
 
 #[derive(Clone)]
@@ -207,6 +258,196 @@ pub struct Status {
     pub error: Option<String>,
     #[serde(flatten)]
     pub managed: ManagedState,
+}
+
+impl Status {
+    fn action_entries(&self, document: Option<&str>, path: Option<&str>) -> (Option<&CatalogEntry>, Option<&LocalEntry>) {
+        let local = self.managed.local.iter().find(|entry| {
+            document
+                .map_or_else(|| path.is_some_and(|path| cached_path_key(path) == cached_path_key(&entry.path)), |document| entry.document == document)
+        });
+        let document = document.or_else(|| local.map(|entry| entry.document.as_str()));
+        (self.managed.catalog.iter().find(|entry| Some(entry.document.as_str()) == document), local)
+    }
+    fn owns_here(&self, remote: &CatalogEntry, local: Option<&LocalEntry>) -> bool {
+        local.is_some_and(|local| local.checked_out)
+            && remote.checkout.as_ref().is_some_and(|checkout| {
+                Some(checkout.workspace.as_str()) == self.managed.workspace.as_deref()
+                    && self.connection.as_ref().is_none_or(|connection| connection.account == checkout.owner)
+            })
+    }
+    fn recoverable_here(&self, remote: &CatalogEntry, local: Option<&LocalEntry>) -> bool {
+        local.is_none()
+            && self.managed.recoverable_checkouts.contains(&remote.document)
+            && remote.checkout.as_ref().is_some_and(|checkout| {
+                Some(checkout.workspace.as_str()) == self.managed.workspace.as_deref()
+                    && self.connection.as_ref().is_none_or(|connection| connection.account == checkout.owner)
+            })
+    }
+    fn lock_reason(&self, remote: &CatalogEntry, local: Option<&LocalEntry>) -> &'static str {
+        if self.owns_here(remote, local) {
+            "ui.pdm_reason_checked_out_here"
+        } else if remote
+            .checkout
+            .as_ref()
+            .is_some_and(|checkout| self.connection.as_ref().is_some_and(|connection| checkout.owner != connection.account))
+        {
+            "ui.pdm_reason_checked_out_other"
+        } else {
+            "ui.pdm_reason_checked_out_elsewhere"
+        }
+    }
+    /// Shared presentation and command policy. Native execution revalidates fresh server authority.
+    pub fn action_unavailable(
+        &self,
+        command: &str,
+        document: Option<&str>,
+        path: Option<&str>,
+        dirty: bool,
+        historical: bool,
+        version: Option<u64>,
+    ) -> Option<&'static str> {
+        if self.busy.is_some() {
+            return Some("ui.pdm_reason_busy");
+        }
+        if matches!(
+            command,
+            "pdm.connections" | "pdm.setup.create" | "pdm.connection.open" | "pdm.connect" | "pdm.connection.recover" | "pdm.recover_workspace"
+        ) {
+            return None;
+        }
+        if !self.available || self.port.is_none() {
+            return Some("ui.pdm_reason_disconnected");
+        }
+        if matches!(command, "pdm.refresh" | "pdm.disconnect" | "pdm.status" | "pdm.panel") {
+            return None;
+        }
+        let (remote, local) = self.action_entries(document, path);
+        let writes = matches!(command, "pdm.archive" | "pdm.checkout" | "pdm.cancel_checkout" | "pdm.restore_version" | "pdm.check_in");
+        if writes && self.connection.as_ref().is_some_and(|connection| connection.role.eq_ignore_ascii_case("viewer")) {
+            return Some("ui.pdm_reason_viewer");
+        }
+        if writes && self.error.is_some() {
+            return Some("ui.pdm_reason_refresh_required");
+        }
+        if historical && matches!(command, "pdm.archive" | "pdm.check_in") {
+            return Some("ui.pdm_reason_historical");
+        }
+        if command == "pdm.archive" {
+            if path.is_none() || dirty {
+                return Some("ui.pdm_reason_save_first");
+            }
+            if let (Some(root), Some(path)) = (self.managed.root.as_deref(), path) {
+                let root = format!("{}/", cached_path_key(root).trim_end_matches('/'));
+                if !cached_path_key(path).starts_with(&root) {
+                    return Some("ui.pdm_reason_working_folder");
+                }
+            }
+            if document.is_some() && local.is_none_or(|local| path.is_none_or(|path| cached_path_key(path) != cached_path_key(&local.path))) {
+                return Some("ui.pdm_reason_open_selected");
+            }
+            if let Some(remote) = remote {
+                if !self.owns_here(remote, local) {
+                    return Some(if remote.checkout.is_some() { self.lock_reason(remote, local) } else { "ui.pdm_reason_checkout_required" });
+                }
+                if local.is_none_or(|local| {
+                    Some(local.base_version) != remote.head
+                        || remote.checkout.as_ref().is_none_or(|checkout| checkout.base_version != Some(local.base_version))
+                }) {
+                    return Some("ui.pdm_reason_stale_base");
+                }
+            } else if local.is_some() {
+                return Some("ui.pdm_reason_unavailable");
+            }
+            return None;
+        }
+        if document.is_none() && local.is_none() {
+            return Some(if path.is_some() { "ui.pdm_reason_unmanaged" } else { "ui.pdm_reason_select_document" });
+        }
+        let Some(remote) = remote else {
+            return Some("ui.pdm_reason_unmanaged");
+        };
+        if matches!(command, "pdm.open_archived" | "pdm.retrieve" | "pdm.preview" | "pdm.restore_version")
+            && version.is_none_or(|version| version == 0 || remote.head.is_none_or(|head| version > head))
+        {
+            return Some("ui.pdm_reason_select_version");
+        }
+        match command {
+            "pdm.checkout" => {
+                if remote.checkout.is_some() {
+                    return Some(self.lock_reason(remote, local));
+                }
+                if dirty || local.is_some_and(|local| local.modified) {
+                    return Some("ui.pdm_reason_modified");
+                }
+            }
+            "pdm.cancel_checkout" => {
+                if !self.owns_here(remote, local) && !self.recoverable_here(remote, local) {
+                    return Some(if remote.checkout.is_some() { self.lock_reason(remote, local) } else { "ui.pdm_reason_checkout_required" });
+                }
+                if dirty {
+                    return Some("ui.pdm_reason_save_first");
+                }
+            }
+            "pdm.get_latest" | "pdm.restore_version" => {
+                if remote.checkout.is_some() {
+                    return Some(self.lock_reason(remote, local));
+                }
+                if dirty || local.is_some_and(|local| local.modified) {
+                    return Some("ui.pdm_reason_modified");
+                }
+                if command == "pdm.get_latest"
+                    && local.is_some_and(|local| local.present && Some(local.base_version) == remote.head)
+                    && !self.managed.dependency_updates.contains(&remote.document)
+                {
+                    return Some("ui.pdm_reason_up_to_date");
+                }
+                if command == "pdm.restore_version" {
+                    if local.is_none_or(|local| !local.present || Some(local.base_version) != remote.head) {
+                        return Some("ui.pdm_reason_stale_base");
+                    }
+                    if version == remote.head {
+                        return Some("ui.pdm_reason_current_version");
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+    pub fn document_state(&self, document: Option<&str>, path: Option<&str>, dirty: bool) -> &'static str {
+        if self.busy.is_some() {
+            return "ui.pdm_state_busy";
+        }
+        if !self.available || self.port.is_none() {
+            return "ui.pdm_state_disconnected";
+        }
+        if self.error.is_some() {
+            return "ui.pdm_state_error";
+        }
+        let (remote, local) = self.action_entries(document, path);
+        let Some(remote) = remote else {
+            return if document.is_none() && path.is_none() { "ui.pdm_state_no_selection" } else { "ui.pdm_state_unmanaged" };
+        };
+        if remote.checkout.is_some() {
+            if self.recoverable_here(remote, local) {
+                return "ui.pdm_state_checkout_incomplete";
+            }
+            return match self.lock_reason(remote, local) {
+                "ui.pdm_reason_checked_out_here" if dirty || local.is_some_and(|local| local.modified) => "ui.pdm_state_modified",
+                "ui.pdm_reason_checked_out_here" => "ui.pdm_state_checked_out_here",
+                "ui.pdm_reason_checked_out_other" => "ui.pdm_state_checked_out_other",
+                _ => "ui.pdm_state_checked_out_elsewhere",
+            };
+        }
+        if dirty || local.is_some_and(|local| local.modified) {
+            return "ui.pdm_state_modified";
+        }
+        if local.is_some_and(|local| Some(local.base_version) != remote.head) || self.managed.dependency_updates.contains(&remote.document) {
+            return "ui.pdm_state_outdated";
+        }
+        "ui.pdm_state_archived"
+    }
 }
 
 #[derive(Default)]
@@ -424,6 +665,52 @@ impl Runtime {
         {
             return Err("Connect to a local PDM service first".into());
         }
+        let action = match &task {
+            Task::Managed(ManagedTask::Archive { path, .. } | ManagedTask::ReconcileArchive { path, .. }) => {
+                Some(("pdm.archive", None, Some(path.as_str()), None))
+            }
+            Task::Managed(ManagedTask::Checkout { document, path }) => Some(("pdm.checkout", document.as_deref(), path.as_deref(), None)),
+            Task::Managed(ManagedTask::CancelCheckout { document, path }) => {
+                Some(("pdm.cancel_checkout", document.as_deref(), path.as_deref(), None))
+            }
+            Task::Managed(ManagedTask::GetLatest { document, path }) => Some(("pdm.get_latest", document.as_deref(), path.as_deref(), None)),
+            Task::Managed(ManagedTask::Restore { reference }) => {
+                Some(("pdm.restore_version", Some(reference.document.as_str()), None, Some(reference.version)))
+            }
+            _ => None,
+        };
+        let mut policy_status = state.status.clone();
+        if matches!(&task, Task::Managed(ManagedTask::ReconcileArchive { .. })) {
+            policy_status.error = None;
+        }
+        if let Some((command, document, path, version)) = action
+            && let Some(reason) = policy_status.action_unavailable(command, document, path, false, false, version)
+        {
+            // A lost restore acknowledgement is reconciled against the native
+            // durable receipt before any new checkout/publication. Cached lock or
+            // base metadata must not prevent that authenticated retry.
+            let receipt_only = matches!(&task, Task::Managed(ManagedTask::ReconcileArchive { .. }))
+                && matches!(
+                    reason,
+                    "ui.pdm_reason_checkout_required"
+                        | "ui.pdm_reason_stale_base"
+                        | "ui.pdm_reason_checked_out_here"
+                        | "ui.pdm_reason_checked_out_elsewhere"
+                        | "ui.pdm_reason_checked_out_other"
+                );
+            if !receipt_only
+                && (command != "pdm.restore_version"
+                    || !matches!(
+                        reason,
+                        "ui.pdm_reason_stale_base"
+                            | "ui.pdm_reason_checked_out_here"
+                            | "ui.pdm_reason_checked_out_elsewhere"
+                            | "ui.pdm_reason_checked_out_other"
+                    ))
+            {
+                return Err(reason.into());
+            }
+        }
         if matches!(&task, Task::Managed(ManagedTask::Recover { .. } | ManagedTask::RecoverConnection { .. })) {
             state.recovery_epoch = match state.recovery_epoch.checked_add(1) {
                 Some(epoch) => epoch,
@@ -436,7 +723,7 @@ impl Runtime {
         state.next = state.next.checked_add(1).ok_or("Local PDM request limit reached")?;
         let id = state.next;
         state.blocked_paths = state.status.managed.local.iter().map(|entry| entry.path.clone()).collect();
-        if let Task::Managed(ManagedTask::Archive { path, .. }) | Task::CheckIn { path, .. } = &task {
+        if let Task::Managed(ManagedTask::Archive { path, .. } | ManagedTask::ReconcileArchive { path, .. }) | Task::CheckIn { path, .. } = &task {
             state.blocked_paths.push(path.clone());
         }
         // A connection ID keeps native paths out of commands. Until native
@@ -449,6 +736,7 @@ impl Runtime {
                 Task::CheckIn { .. }
                     | Task::Managed(
                         ManagedTask::Archive { .. }
+                            | ManagedTask::ReconcileArchive { .. }
                             | ManagedTask::Checkout { .. }
                             | ManagedTask::CancelCheckout { .. }
                             | ManagedTask::GetLatest { .. }
@@ -460,7 +748,6 @@ impl Runtime {
             )
         });
         state.status.busy = Some(id);
-        state.status.error = None;
         Ok(id)
     }
     pub fn take_job(&self) -> Result<Option<Job>, String> {
@@ -488,6 +775,16 @@ impl Runtime {
             state.status.connection = None;
             state.status.error = Some(error.clone());
             return Err(error);
+        }
+        if matches!(
+            &result,
+            Ok(Outcome::Managed { .. }
+                | Outcome::ManagedRefreshed { .. }
+                | Outcome::ManagedConnected { .. }
+                | Outcome::Connected { .. }
+                | Outcome::Disconnected)
+        ) {
+            state.status.error = None;
         }
         match result {
             Err(failure) => {

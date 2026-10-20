@@ -1,5 +1,5 @@
 //! Dialogs for the surface tools and face splitting (#19): Surface Extrude, Revolve, Sweep and
-//! Loft, Offset and Ruled Surface, Boundary Surface, Patch, Stitch, Thicken, Extend, Trim, Untrim
+//! Loft, Offset and Ruled Surface, Blend and Boundary Surface, Patch, Stitch, Thicken, Extend, Trim, Untrim
 //! and Split Face. Each has a live preview and Edit Feature.
 
 use serde_json::{Map, Value, json};
@@ -27,7 +27,18 @@ pub enum Surf {
         axis: Option<Value>,
     },
     Sweep(crate::dialogs_sweep::SweepOpts),
-    Loft,
+    /// `rail_fit`: how the guide rails reshape the sections (an index into the sweep dialog's
+    /// rail fits).
+    Loft {
+        rail_fit: usize,
+    },
+    /// `continuity`: an index into [`BLEND_CONTINUITY`] for each end, [from, to]; `bulge`: how
+    /// full each end leaves (0 is the plain bridge); `stitch`: sew the blend onto both bodies.
+    Blend {
+        continuity: [usize; 2],
+        bulge: [f64; 2],
+        stitch: bool,
+    },
     /// `continuity`: an index into [`PATCH_CONTINUITY`] (for a loop of sketch curves, how much of
     /// the sketch's plane each side repeats; for picked edges, how the surface meets the faces
     /// beside them); `join`: sew the surface into the body of its edges.
@@ -86,7 +97,8 @@ impl Surf {
             Surf::Extrude { .. } => "SURFACE EXTRUDE",
             Surf::Revolve { .. } => "SURFACE REVOLVE",
             Surf::Sweep(_) => "SURFACE SWEEP",
-            Surf::Loft => "SURFACE LOFT",
+            Surf::Loft { .. } => "SURFACE LOFT",
+            Surf::Blend { .. } => "BLEND SURFACE",
             Surf::Boundary { .. } => "BOUNDARY SURFACE",
             Surf::Patch { .. } => "PATCH",
             Surf::Unstitch => "UNSTITCH",
@@ -118,6 +130,11 @@ impl Surf {
 /// How a patch on edges meets the faces beside its loop (labels, and the `continuity` parameter).
 const PATCH_CONTINUITY: [(&str, &str); 3] = [("Position (G0)", "g0"), ("Tangent (G1)", "g1"), ("Curvature (G2)", "g2")];
 
+/// How much of the surface at its edges each end of a blend repeats (labels, and the
+/// `continuity` words).
+const BLEND_CONTINUITY: [(&str, &str); 4] =
+    [("Position (G0)", "g0"), ("Tangent (G1)", "g1"), ("Curvature (G2)", "g2"), ("Curvature change (G3)", "g3")];
+
 /// What a boundary surface becomes: a body of its own, or part of the body of its edges.
 const BOUNDARY_OPS: [&str; 2] = ["New Body", "Join"];
 
@@ -144,7 +161,11 @@ fn inputs(k: &Surf) -> Vec<SelInput> {
                 rail2,
             ]
         }
-        Surf::Loft => vec![SelInput::new("Sections (one sketch each)", PROFILES | CURVES, true)],
+        Surf::Loft { .. } => {
+            let [rail, rail2] = crate::dialogs_sweep::rail_inputs();
+            vec![SelInput::new("Sections (one sketch each)", PROFILES | CURVES, true), rail, rail2]
+        }
+        Surf::Blend { .. } => vec![SelInput::new("From edges", EDGES, true), SelInput::new("To edges", EDGES, true)],
         Surf::Boundary { .. } => vec![SelInput::new("Curves", CURVES | EDGES, true), SelInput::new("Cross curves", CURVES | EDGES, true)],
         Surf::Patch { .. } => vec![SelInput::new("Boundary", PROFILES | EDGES, true), SelInput::new("Pass through", VERTICES | FACES, true)],
         Surf::Unstitch => vec![SelInput::new("Body, or faces to take out", BODIES | FACES, true)],
@@ -174,7 +195,8 @@ pub fn start(_app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         "surface.extrude" => Surf::Extrude { distance: "10 mm".into(), direction: 0 },
         "surface.revolve" => Surf::Revolve { angle: "360 deg".into(), symmetric: false, axis: None },
         "surface.sweep" => Surf::Sweep(crate::dialogs_sweep::SweepOpts::default()),
-        "surface.loft" => Surf::Loft,
+        "surface.loft" => Surf::Loft { rail_fit: 0 },
+        "surface.blend" => Surf::Blend { continuity: [1, 1], bulge: [0.0, 0.0], stitch: false },
         "surface.boundary" => Surf::Boundary { continuity: 1, join: false },
         "surface.patch" => Surf::Patch { continuity: 0 },
         "surface.unstitch" => Surf::Unstitch,
@@ -285,6 +307,26 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
             combo(ui, "pa_cont", &PATCH_CONTINUITY.map(|(label, _)| label), continuity);
             ui.end_row();
         }
+        Surf::Blend { continuity, bulge, stitch } => {
+            // One row per end, so the dialog keeps its docked width.
+            let [from, to] = continuity;
+            let [from_bulge, to_bulge] = bulge;
+            row_label(ui, "Start continuity");
+            combo(ui, "bl_cont0", &BLEND_CONTINUITY.map(|(label, _)| label), from);
+            ui.end_row();
+            row_label(ui, "Start bulge");
+            ui.add(egui::DragValue::new(from_bulge).range(-0.9..=3.0).speed(0.01).max_decimals(2));
+            ui.end_row();
+            row_label(ui, "End continuity");
+            combo(ui, "bl_cont1", &BLEND_CONTINUITY.map(|(label, _)| label), to);
+            ui.end_row();
+            row_label(ui, "End bulge");
+            ui.add(egui::DragValue::new(to_bulge).range(-0.9..=3.0).speed(0.01).max_decimals(2));
+            ui.end_row();
+            row_label(ui, "Stitch to both bodies");
+            ui.checkbox(stitch, "");
+            ui.end_row();
+        }
         Surf::Boundary { continuity, join } => {
             row_label(ui, "Continuity");
             combo(ui, "bo_cont", &PATCH_CONTINUITY.map(|(label, _)| label), continuity);
@@ -304,7 +346,8 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
             ui.end_row();
         }
         Surf::Sweep(opts) => enter |= crate::dialogs_sweep::rows(ui, opts, "ss"),
-        Surf::SplitFace | Surf::Unstitch | Surf::ReverseNormal | Surf::Loft => {}
+        Surf::Loft { rail_fit } => crate::dialogs_sweep::rail_fit_row(ui, "sl", rail_fit),
+        Surf::SplitFace | Surf::Unstitch | Surf::ReverseNormal => {}
     }
     enter
 }
@@ -333,6 +376,17 @@ fn body_and_faces(picks: &[Sel]) -> Result<(String, Vec<Value>), String> {
     }
     let faces = picks.iter().filter_map(|x| if let Sel::Face { point, .. } = x { Some(pt(*point)) } else { None }).collect();
     Ok((body, faces))
+}
+
+/// The body of picked edges (all of one body) and a point on each edge.
+fn body_and_edges(picks: &[Sel]) -> Result<(String, Vec<Value>), String> {
+    let body_of = |x: &Sel| if let Sel::Edge { body, .. } = x { Some(body.clone()) } else { None };
+    let body = picks.iter().find_map(body_of).ok_or("pick edges of a body")?;
+    if picks.iter().any(|x| body_of(x).as_ref() != Some(&body)) {
+        return Err("pick edges of one body".into());
+    }
+    let edges = picks.iter().filter_map(|x| if let Sel::Edge { point, .. } = x { Some(pt(*point)) } else { None }).collect();
+    Ok((body, edges))
 }
 
 /// The sketch, profiles and curves of a surface builder's picks (all in one sketch).
@@ -510,7 +564,7 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             crate::dialogs_sweep::params(app, opts, items(inputs, 2).first(), [items(inputs, 3), items(inputs, 4)], &mut p)?;
             ("surface.sweep", p)
         }
-        Surf::Loft => {
+        Surf::Loft { rail_fit } => {
             need(0, "the sections, one sketch each")?;
             // One section per sketch, in the order the sketches were first picked.
             let st = app.session.world_state();
@@ -536,7 +590,28 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
                     sheet_picks(app, &picks)
                 })
                 .collect::<Result<_, String>>()?;
-            ("surface.loft", json!({ "sections": sections }))
+            let mut p = json!({ "sections": sections });
+            crate::dialogs_sweep::rail_params(app, *rail_fit, [items(inputs, 1), items(inputs, 2)], &mut p)?;
+            ("surface.loft", p)
+        }
+        Surf::Blend { continuity, bulge, stitch } => {
+            need(0, "the edges the blend leaves")?;
+            need(1, "the edges the blend arrives at")?;
+            let side = |i: usize| -> Result<Value, String> {
+                let (body, edges) = body_and_edges(items(inputs, i))?;
+                Ok(json!({"body": body, "edges": edges}))
+            };
+            let word = |i: usize| BLEND_CONTINUITY.get(i).map_or("g1", |(_, w)| *w);
+            let mut p = json!({
+                "from": side(0)?,
+                "to": side(1)?,
+                "continuity": [word(continuity[0]), word(continuity[1])],
+                "bulge": bulge,
+            });
+            if *stitch {
+                p["stitch"] = json!(true);
+            }
+            ("surface.blend", p)
         }
         Surf::Boundary { continuity, join } => {
             need(0, "the curves (sketch curves or edges)")?;
@@ -622,13 +697,7 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
         }
         Surf::Ruled { distance, mode, angle, flip, round } => {
             need(0, "the edges to rule from")?;
-            let edge_body = |x: &Sel| if let Sel::Edge { body, .. } = x { Some(body.clone()) } else { None };
-            let body = items(inputs, 0).iter().find_map(edge_body).ok_or("pick edges of a body")?;
-            if items(inputs, 0).iter().any(|x| edge_body(x).as_ref() != Some(&body)) {
-                return Err("pick edges of one body".into());
-            }
-            let edges: Vec<Value> =
-                items(inputs, 0).iter().filter_map(|x| if let Sel::Edge { point, .. } = x { Some(pt(*point)) } else { None }).collect();
+            let (body, edges) = body_and_edges(items(inputs, 0))?;
             let mode = RULED_MODES.get(*mode).map_or("normal", |(_, m)| *m);
             let mut p = json!({"body": body, "edges": edges, "distance": distance, "mode": mode});
             if mode == "angle" {
@@ -836,6 +905,22 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
                 ],
             )
         }
+        FeatureKind::SurfaceBlend { from, to, continuity, bulge, align, seam, stitch } => {
+            let index = |c: &solidcraft_engine::doc::kernel::Continuity| BLEND_CONTINUITY.iter().position(|(_, w)| *w == c.as_str()).unwrap_or(1);
+            let k = Surf::Blend { continuity: continuity.each_ref().map(index), bulge: *bulge, stitch: *stitch };
+            // What the dialog does not show is kept as it was: the leave directions and the seams.
+            let mut extra = Map::new();
+            for (key, points) in [("align", align), ("seam", seam)] {
+                if let Some([p, q]) = points {
+                    extra.insert(key.into(), json!([pt(p.0), pt(q.0)]));
+                }
+            }
+            let mut ins = inputs(&k);
+            for (inp, side) in ins.iter_mut().zip([from, to]) {
+                inp.items = side.edges.iter().filter_map(edge).collect();
+            }
+            return Some((Kind::Surface(k), ins, extra));
+        }
         FeatureKind::SurfaceBoundary { curves, orders, crown, samples, .. } => {
             let first = orders.first().copied().unwrap_or(solidcraft_engine::doc::kernel::Continuity::G1);
             let index = PATCH_CONTINUITY.iter().position(|(_, w)| *w == first.as_str());
@@ -876,8 +961,10 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
             let index = PATCH_CONTINUITY.iter().position(|(_, w)| *w == g.as_str()).unwrap_or(0);
             (Surf::Boundary { continuity: index, join: *operation == solidcraft_engine::doc::Operation::Join }, vec![sels(u), sels(v)])
         }
-        FeatureKind::SurfaceLoft { sections, .. } => {
-            (Surf::Loft, vec![sections.iter().flat_map(|sec| sheet_sels(app, sec.sketch.0, sec.profiles.as_ref(), &sec.curves)).collect()])
+        FeatureKind::SurfaceLoft { sections, rails, rail_fit, .. } => {
+            let [rail, rail2] = crate::dialogs_sweep::rail_sels(rails);
+            let picked = sections.iter().flat_map(|sec| sheet_sels(app, sec.sketch.0, sec.profiles.as_ref(), &sec.curves)).collect();
+            (Surf::Loft { rail_fit: crate::dialogs_sweep::rail_fit_index(*rail_fit) }, vec![picked, rail, rail2])
         }
         FeatureKind::SurfaceExtrude { sketch, profiles, curves, extent } => {
             let sels = sheet_sels(app, sketch.0, profiles.as_ref(), curves);

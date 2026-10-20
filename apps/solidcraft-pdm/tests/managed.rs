@@ -36,6 +36,14 @@ fn checkout(store: &mut Store, owner: &Principal, document: &str, workspace: &st
         other => panic!("{other:?}"),
     }
 }
+fn resume(store: &mut Store, owner: &Principal, document: &str, workspace: &str) -> CheckoutGrant {
+    match store
+        .execute_as(Request::ManagedResumeCheckout { document: document.into(), workspace: workspace.into(), machine: "machine-a".into() }, owner)
+    {
+        Response::ManagedCheckout { grant } => grant,
+        other => panic!("{other:?}"),
+    }
+}
 fn input(grant: &CheckoutGrant, request: &str) -> ManagedCheckIn {
     ManagedCheckIn {
         document: grant.entry.document.clone(),
@@ -67,7 +75,14 @@ fn checkout_is_exclusive_persistent_and_catalog_does_not_disclose_grant() {
     let entry = create(&mut store, &owner, "parts/widget.solidcraft");
     assert_ne!(entry.document, entry.logical_path);
     let grant = checkout(&mut store, &owner, &entry.document, "workspace-a");
-    assert_eq!(grant, checkout(&mut store, &owner, &entry.document, "workspace-a"));
+    error(
+        store.execute_as(
+            Request::ManagedCheckout { document: entry.document.clone(), workspace: "workspace-a".into(), machine: "machine-a".into() },
+            &owner,
+        ),
+        "conflict",
+    );
+    assert_eq!(grant, resume(&mut store, &owner, &entry.document, "workspace-a"));
     for (principal, workspace) in [(user("bob"), "workspace-a"), (owner.clone(), "workspace-b")] {
         error(
             store.execute_as(
@@ -85,7 +100,14 @@ fn checkout_is_exclusive_persistent_and_catalog_does_not_disclose_grant() {
     };
     drop(store);
     let mut store = Store::open(&temp.0).unwrap();
-    assert_eq!(grant, checkout(&mut store, &owner, &entry.document, "workspace-a"));
+    error(
+        store.execute_as(
+            Request::ManagedCheckout { document: entry.document.clone(), workspace: "workspace-a".into(), machine: "machine-a".into() },
+            &owner,
+        ),
+        "conflict",
+    );
+    assert_eq!(grant, resume(&mut store, &owner, &entry.document, "workspace-a"));
     match store.execute_as(Request::ManagedCatalog, &owner) {
         Response::ManagedCatalog { catalog } => assert_eq!(server_id, catalog.server_id),
         _ => panic!(),
@@ -152,7 +174,7 @@ fn lost_ack_retry_is_identical_after_restart_and_does_not_unlock_new_checkout() 
     let mut without_secret = request.clone();
     without_secret.checkout_token.clear();
     assert_eq!(version, committed(store.execute_as(Request::ManagedCheckIn { input: without_secret }, &alice)));
-    assert_eq!(bob_grant, checkout(&mut store, &user("bob"), &entry.document, "bob-ws"));
+    assert_eq!(bob_grant, resume(&mut store, &user("bob"), &entry.document, "bob-ws"));
     let mut changed = request;
     changed.content.push(1);
     error(store.execute_as(Request::ManagedCheckIn { input: changed }, &alice), "conflict");
@@ -259,7 +281,7 @@ fn metadata_failure_preserves_checkout_and_retry_publishes_once() {
     fs::write(temp.0.join("managed/generations/pending"), b"block staging").unwrap();
     let request = input(&grant, "retry-a");
     error(store.execute_as(Request::ManagedCheckIn { input: request.clone() }, &alice), "storage_error");
-    assert_eq!(grant, checkout(&mut store, &alice, &entry.document, "ws"));
+    assert_eq!(grant, resume(&mut store, &alice, &entry.document, "ws"));
     fs::remove_file(temp.0.join("managed/generations/pending")).unwrap();
     let version = committed(store.execute_as(Request::ManagedCheckIn { input: request.clone() }, &alice));
     assert_eq!(version, committed(store.execute_as(Request::ManagedCheckIn { input: request }, &alice)));

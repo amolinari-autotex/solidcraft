@@ -47,6 +47,9 @@ enum SkipWithin {
 
 /// Most pairs [`PairCache`] keeps; it starts over when full.
 const MAX_CACHED: usize = 2 * MAX_PAIRS;
+/// The kernel's tries at intersecting a pin with its hole on one cylinder (each about a second
+/// on real parts; a plain pin on its axis needs one or two).
+const PIN_ATTEMPTS: usize = 4;
 
 /// Pairs measured before, by the two bodies' geometry where they stood
 /// ([`solidcraft_doc::ModelBody::geometry_key`]) and the settings that shape the result
@@ -341,40 +344,73 @@ fn measure_pair(
         // A pair whose shared part can't be worked out is reported, not passed as clear.
         let region = shared_region(a, b);
         let (ca, cb) = (clipped(ka, region), clipped(kb, region));
-        let (shared, report) = solidcraft_kernel::capture_boolean_diagnostics(|| {
-            solidcraft_kernel::boolean(ca.as_ref().unwrap_or(&ba.body), cb.as_ref().unwrap_or(&bb.body), solidcraft_kernel::BoolOp::Intersect)
-        });
-        match shared {
-            Err(e) => {
-                out.unchecked = Some(e.to_string());
-                return out;
+        // A pin of one in a hole of the other of its own size. On its very axis the boolean takes
+        // the two walls as one and answers plain ones at once, but with blends next to them it
+        // tries for minutes and gives up; a hair off the axis it cannot intersect them at all
+        // (and may pass the pin as clear). So a pin on its axis gets a few tries of the boolean
+        // first, and what the walls share is otherwise worked out apart, with a few tries of the
+        // boolean left for when that declines. The body left whole is cut down to where the
+        // other's piece is first, so that both meet only the faces there.
+        let candidate = solidcraft_kernel::coaxial_candidate(ca.as_ref().unwrap_or(ka), cb.as_ref().unwrap_or(kb));
+        let pin = candidate.is_some();
+        let (ca, cb) = match (ca, cb) {
+            (Some(x), None) if pin => {
+                let y = narrowed(kb, &x);
+                (Some(x), y)
             }
-            Ok(shared) => {
-                if let Some(reason) = report.unverified() {
-                    out.unchecked = Some(reason);
+            (None, Some(y)) if pin => (narrowed(ka, &y), Some(y)),
+            other => other,
+        };
+        // A body left whole is the copy that keeps its meshes: meeting several others at one
+        // size, it is meshed once for the booleans of all of them.
+        let (pa, pb) = (ca.as_ref().unwrap_or(ka), cb.as_ref().unwrap_or(kb));
+        let intersect = || {
+            solidcraft_kernel::capture_boolean_diagnostics(|| {
+                let run = || solidcraft_kernel::boolean(pa, pb, solidcraft_kernel::BoolOp::Intersect);
+                if pin { solidcraft_kernel::with_attempt_budget(PIN_ATTEMPTS, run) } else { run() }
+            })
+        };
+        let first = (candidate != Some(false)).then(intersect);
+        let answered = first.as_ref().is_some_and(|(r, report)| r.is_ok() && report.unverified().is_none());
+        let coaxial = if pin && !answered { solidcraft_kernel::coaxial_overlap(pa, pb) } else { None };
+        if let Some(o) = coaxial {
+            if o.volume > 0.0 {
+                out.overlap = Some((o.volume, o.area, o.bbox, o.centroid));
+            }
+        } else {
+            let (shared, report) = first.unwrap_or_else(intersect);
+            let failed =
+                |why: String| if pin { format!("a pin on one cylinder with its hole, whose walls could not be intersected ({why})") } else { why };
+            let shared = match shared {
+                Err(e) => {
+                    out.unchecked = Some(failed(e.to_string()));
                     return out;
                 }
-                if let Some(o) = shared {
-                    match measure_near_origin(&o, region.center()) {
-                        Ok(m) if !plausible(m.volume, m.centroid, m.bbox) => {
-                            out.unchecked = Some(format!(
-                                "the shared part came out malformed ({:.4} mm³ with its centre outside its own box), so it is not measured",
-                                m.volume
-                            ));
+                Ok(shared) => shared,
+            };
+            if let Some(reason) = report.unverified() {
+                out.unchecked = Some(failed(reason));
+                return out;
+            }
+            if let Some(o) = shared {
+                match measure_near_origin(&o, region.center()) {
+                    Ok(m) if !plausible(m.volume, m.centroid, m.bbox) => {
+                        out.unchecked = Some(format!(
+                            "the shared part came out malformed ({:.4} mm³ with its centre outside its own box), so it is not measured",
+                            m.volume
+                        ));
+                        return out;
+                    }
+                    Ok(m) => {
+                        if let Some(reason) = union_disagrees(pa, pb, m.volume, region.center()) {
+                            out.unchecked = Some(reason);
                             return out;
                         }
-                        Ok(m) => {
-                            let (wa, wb) = (ca.as_ref().unwrap_or(&ba.body), cb.as_ref().unwrap_or(&bb.body));
-                            if let Some(reason) = union_disagrees(wa, wb, m.volume, region.center()) {
-                                out.unchecked = Some(reason);
-                                return out;
-                            }
-                            out.overlap = Some((m.volume, m.area, m.bbox, m.centroid));
-                        }
-                        Err(e) => {
-                            out.unchecked = Some(e.to_string());
-                            return out;
-                        }
+                        out.overlap = Some((m.volume, m.area, m.bbox, m.centroid));
+                    }
+                    Err(e) => {
+                        out.unchecked = Some(e.to_string());
+                        return out;
                     }
                 }
             }
@@ -425,6 +461,35 @@ fn shared_region(a: &DistanceShape, b: &DistanceShape) -> Aabb3 {
 /// body is small and its faces there are the same faces. `None`: use the whole body.
 fn clipped(body: &solidcraft_kernel::Body, region: Aabb3) -> Option<solidcraft_kernel::Body> {
     if region.is_empty() || body.size() <= 4.0 * region.diagonal() {
+        return None;
+    }
+    let cut = solidcraft_kernel::box_solid(region.min, region.max).ok()?;
+    let (r, report) = solidcraft_kernel::capture_boolean_diagnostics(|| solidcraft_kernel::boolean(body, &cut, solidcraft_kernel::BoolOp::Intersect));
+    match r {
+        Ok(Some(c)) if report.unverified().is_none() => Some(c),
+        _ => None,
+    }
+}
+
+/// `body` cut down to where it may meet `piece` (their boxes' common part, grown as
+/// [`shared_region`] grows it), when that leaves part of it out. `None`: use the whole body.
+fn narrowed(body: &solidcraft_kernel::Body, piece: &solidcraft_kernel::Body) -> Option<solidcraft_kernel::Body> {
+    let bounds = |b: &solidcraft_kernel::Body| b.tessellate_with((b.size() * 1e-3).max(1e-4), false).ok().map(|m| m.bounds());
+    let (x, y) = (bounds(body)?, bounds(piece)?);
+    let (min, max) = (x.min.max(y.min), x.max.min(y.max));
+    if x.is_empty() || y.is_empty() || !(min.x <= max.x && min.y <= max.y && min.z <= max.z) {
+        return None;
+    }
+    let grow = 1.0 + 0.05 * min.dist(max);
+    let g = solidcraft_geom::Vec3::new(grow, grow, grow);
+    let region = Aabb3 { min: min - g, max: max + g };
+    if region.min.x <= x.min.x
+        && region.min.y <= x.min.y
+        && region.min.z <= x.min.z
+        && x.max.x <= region.max.x
+        && x.max.y <= region.max.y
+        && x.max.z <= region.max.z
+    {
         return None;
     }
     let cut = solidcraft_kernel::box_solid(region.min, region.max).ok()?;

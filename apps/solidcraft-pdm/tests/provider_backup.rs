@@ -90,6 +90,12 @@ fn checkout(store: &mut Store, document: &str) -> CheckoutGrant {
         other => panic!("{other:?}"),
     }
 }
+fn resume(store: &mut Store, document: &str) -> CheckoutGrant {
+    match store.execute(Request::ManagedResumeCheckout { document: document.into(), workspace: "workspace".into(), machine: "desktop".into() }) {
+        Response::ManagedCheckout { grant } => grant,
+        other => panic!("{other:?}"),
+    }
+}
 fn input(grant: &CheckoutGrant, request: &str, bytes: &[u8]) -> ManagedCheckIn {
     ManagedCheckIn {
         document: grant.entry.document.clone(),
@@ -143,11 +149,11 @@ fn external_snapshot_materializes_all_bytes_and_restores_identity_locks_and_rece
     restore_backup(&backup, &restored).unwrap();
     let mut reopened = Store::open(&restored).unwrap();
     assert_eq!(serde_json::to_value(reopened.execute(Request::ManagedCatalog)).unwrap(), before);
-    assert_eq!(checkout(&mut reopened, &document), grant);
+    assert_eq!(resume(&mut reopened, &document), grant);
     let mut retry = request;
     retry.checkout_token.clear();
     assert_eq!(checked_in(reopened.execute(Request::ManagedCheckIn { input: retry })), version);
-    assert_eq!(checkout(&mut reopened, &document), grant); // Receipt replay never unlocks the later reservation.
+    assert_eq!(resume(&mut reopened, &document), grant); // Receipt replay never unlocks the later reservation.
     assert_eq!(reopened.download(&VersionRef { document: document.clone(), version: 1 }).unwrap().1, b"first public toy");
     match reopened.execute(Request::ManagedHistory { document }) {
         Response::ManagedHistory { versions } => assert_eq!(versions, vec![version]),
@@ -208,14 +214,14 @@ fn publication_failure_preserves_checkout_and_backup_captures_complete_orphan() 
     provider.memory.lock().unwrap().fail_after_upload = true;
     let request = input(&grant, "lost-upload-response", b"orphan from failed publication");
     assert!(matches!(store.execute(Request::ManagedCheckIn { input: request.clone() }), Response::Error { .. }));
-    assert_eq!(checkout(&mut store, &document), grant);
+    assert_eq!(resume(&mut store, &document), grant);
     let backup = temp.0.join("backup");
     store.backup(&backup).unwrap();
     assert_eq!(fs::read(backup.join("data/managed/blobs").join(hash(&request.content))).unwrap(), request.content);
     let restored = temp.0.join("restored");
     restore_backup(&backup, &restored).unwrap();
     let mut restored = Store::open(&restored).unwrap();
-    assert_eq!(checkout(&mut restored, &document), grant);
+    assert_eq!(resume(&mut restored, &document), grant);
     let version = checked_in(restored.execute(Request::ManagedCheckIn { input: request }));
     assert_eq!(version.version.reference.version, 1);
 }

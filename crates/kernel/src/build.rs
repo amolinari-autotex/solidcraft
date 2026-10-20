@@ -1,13 +1,14 @@
 //! Building bodies: extrude and revolve planar regions, primitives.
 
 use mt::builder;
-use solidcraft_geom::{Grid, Loop2, Plane, Region2, Seg2, Vec2, Vec3};
+use solidcraft_geom::{Grid, Loop2, Plane, Region2, Ring, Seg2, Vec2, Vec3};
 use truck_modeling as mt;
 
 use crate::body::{Body, Solid, from_p3, p3, v3};
 use crate::history::FaceProv;
 use crate::numbered::{self, NumberedLoop, NumberedRegion};
 use crate::record::{self, Side};
+use crate::sweep_path::RailFit;
 use crate::{KernelError, Result, guard};
 
 const MAX_SEGS: usize = 20_000;
@@ -1328,7 +1329,9 @@ pub fn extrude_tapered_between(plane: &Plane, region: &Region2, from: f64, to: f
     region_ok(region)?;
     let (t, sign) = (taper.tan(), dir_sign.signum());
     let (bottom_plane, top_plane) = (plane.offset(from * sign), plane.offset(to * sign));
-    let loops0 = oriented(region)?;
+    // A side drawn in collinear pieces slopes as one face over all of them, as a straight
+    // extrude's does (#1788).
+    let loops0 = oriented(region)?.map_loops(|l| l.merged_lines(continues_straight));
     let split: Vec<(Loop2, Vec<usize>)> = loops0.loops().map(|l| offset_splits(&l.lp, from.abs().max(to.abs()) * t)).collect();
     let ends = |h: f64| split.iter().map(|(lp, _)| offset_loop(lp, h * t)).collect::<Result<Vec<_>>>();
     let (bottoms, tops) = (ends(from)?, ends(to)?);
@@ -1581,8 +1584,7 @@ fn revolve_on_axis(plane: &Plane, numbered: &NumberedLoop, axis_origin: Vec2, d:
                         }
                     };
                     // The loop's turning (Newell) against the surface normal halfway round.
-                    let mut nw = Vec3::ZERO;
-                    let poly: Vec<Vec3> = wire
+                    let poly: Ring<Vec3> = wire
                         .edge_iter()
                         .flat_map(|ed| {
                             let c = ed.oriented_curve();
@@ -1590,11 +1592,7 @@ fn revolve_on_axis(plane: &Plane, numbered: &NumberedLoop, axis_origin: Vec2, d:
                             (0..8).map(move |j| from_p3(c.subs(t0 + (t1 - t0) * j as f64 / 8.0))).collect::<Vec<_>>()
                         })
                         .collect();
-                    for (j, p) in poly.iter().enumerate() {
-                        if let Some(q) = poly.get((j + 1) % poly.len()) {
-                            nw += p.cross(*q);
-                        }
-                    }
+                    let nw = poly.area_vector();
                     let probe = turn(&half, plane.to_world(sg.mid()));
                     let sn = surface.search_nearest_parameter(p3(probe), None, 100).map(|(u, v)| surface.normal(u, v));
                     if sn.is_some_and(|m| nw.dot(Vec3::new(m.x, m.y, m.z)) < 0.0) {
@@ -1795,22 +1793,153 @@ pub(crate) fn close_sweep(sides: Vec<Side>) -> Result<Body> {
 /// Ruled loft through two or more planar sections (outer loops only). The sections and the
 /// same sections in reverse order give the same body.
 pub fn loft(sections: &[(Plane, Loop2)]) -> Result<Body> {
+    loft_with_rails(sections, &[], RailFit::Scale)
+}
+
+/// [`loft`] following one or two guide rails (polylines from the first section to the last,
+/// through every section's curve; see [`crate::loft_rails`]), `fit` saying how they reshape the
+/// sections between. Without rails, the plain loft.
+pub fn loft_with_rails(sections: &[(Plane, Loop2)], rails: &[Vec<Vec3>], fit: RailFit) -> Result<Body> {
     let (wires, edge_sources, reversed) = loft_wires(sections)?;
+    let (Some(first), Some(last)) = (wires.first(), wires.last()) else { return Err(KernelError::Failed("loft: sections".into())) };
+    let mut planes: Vec<Plane> = sections.iter().map(|(p, _)| *p).collect();
+    if reversed {
+        planes.reverse();
+    }
+    let all = guard("loft", || crate::loft_rails::railed_wires(&planes, &wires, true, rails, fit))?;
     // The wires run from the first section given, or (turned round) the last.
-    // Three sections or more: one smooth surface through them all for each segment.
-    if wires.len() >= 3
-        && let Ok(b) = guard("loft", || {
-            let faces = smooth_loft_faces(&wires, &edge_sources, true)?;
-            let (Some(w0), Some(w1)) = (wires.first(), wires.last()) else { return Err(KernelError::Failed("smooth loft: sections".into())) };
-            cap_and_close(faces, std::slice::from_ref(w0), std::slice::from_ref(w1), reversed)
-        })
-    {
-        return Ok(b);
+    // Three wires or more: one smooth surface through them all for each segment. A plain loft
+    // falls back to ruled faces where that fails; a railed one has to follow its rails.
+    if all.len() >= 3 {
+        let smooth = guard("loft", || {
+            let faces = smooth_loft_faces(&all, &edge_sources, true)?;
+            cap_and_close(faces, std::slice::from_ref(first), std::slice::from_ref(last), reversed)
+        });
+        if smooth.is_ok() || !rails.is_empty() {
+            return smooth;
+        }
     }
     guard("loft", || {
         let sides = ruled_loft_faces(&wires, &edge_sources)?;
-        let (Some(first), Some(last)) = (wires.first(), wires.last()) else { return Err(KernelError::Failed("loft".into())) };
         cap_and_close(sides, std::slice::from_ref(first), std::slice::from_ref(last), reversed)
+    })
+}
+
+/// A loft through regions with matching hole counts. Hole walls are built alongside the
+/// outline and share the end caps, so the result is one shell with open passages.
+/// Holes are paired by their positions relative to the outline, independently of sketch
+/// curve order. A hole cannot appear or disappear partway through a loft.
+pub fn loft_regions(sections: &[(Plane, Region2)]) -> Result<Body> {
+    if !(2..=50).contains(&sections.len()) {
+        return Err(KernelError::Invalid("a loft needs 2…50 sections".into()));
+    }
+    let holes = sections.first().map_or(0, |(_, r)| r.holes.len());
+    if sections.iter().any(|(_, r)| r.holes.len() != holes) {
+        return Err(KernelError::Invalid("every loft section must have the same number of holes".into()));
+    }
+    // Bound the quadratic matching work as well as the geometry built per section.
+    if holes > 128 || sections.iter().any(|(_, r)| numbered::profile_loops(std::slice::from_ref(r)).map(|l| l.segs.len()).sum::<usize>() > MAX_SEGS) {
+        return Err(KernelError::Invalid("too many loops or segments in a loft section".into()));
+    }
+    for (_, r) in sections {
+        region_ok(r)?;
+    }
+    if holes == 0 {
+        return loft(&sections.iter().map(|(p, r)| (*p, r.outer.clone())).collect::<Vec<_>>());
+    }
+    let regions: Vec<Region2> = sections.iter().map(|(_, r)| r.clone()).collect();
+    let mut numbered = numbered::number_regions(&regions);
+    let outlines: Vec<_> = sections.iter().map(|(p, _)| *p).zip(numbered.iter().map(|r| r.outer.clone())).collect();
+    let reversed = loft_reversed(&sections.iter().map(|(p, r)| (*p, r.outer.clone())).collect::<Vec<_>>())?;
+    // Match in canonical section order, so reversing the input cannot change the pairing.
+    if reversed {
+        numbered.reverse();
+    }
+    let planes: Vec<_> = if reversed { sections.iter().rev().map(|(p, _)| *p).collect() } else { sections.iter().map(|(p, _)| *p).collect() };
+    let mut previous: Vec<Vec3> = Vec::new();
+    for (p, r) in planes.iter().zip(&mut numbered) {
+        let centre = r.outer.lp.centroid();
+        let scale = r.outer.lp.signed_area().abs().sqrt().max(1e-9);
+        let position = |l: &NumberedLoop| {
+            let d = l.lp.centroid() - centre;
+            (p.x * d.x + p.y * d.y) * (1.0 / scale)
+        };
+        if !previous.is_empty() {
+            let positions: Vec<_> = r.holes.iter().map(position).collect();
+            let mut used = vec![false; positions.len()];
+            let mut order = Vec::new();
+            for point in &previous {
+                let (k, distance) = positions
+                    .iter()
+                    .enumerate()
+                    .map(|(k, p)| (k, p.dist(*point)))
+                    .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .ok_or_else(|| KernelError::Invalid("missing loft hole".into()))?;
+                let occupied = used.get_mut(k).ok_or_else(|| KernelError::Invalid("missing loft hole".into()))?;
+                if *occupied
+                    || !distance.is_finite()
+                    || positions.iter().enumerate().any(|(j, p)| j != k && (p.dist(*point) - distance).abs() <= 1e-9)
+                {
+                    return Err(KernelError::Invalid("loft hole correspondence is ambiguous; each hole needs a unique nearest match".into()));
+                }
+                *occupied = true;
+                order.push(k);
+            }
+            let mut remaining: Vec<_> = std::mem::take(&mut r.holes).into_iter().map(Some).collect();
+            for k in order {
+                r.holes.push(remaining.get_mut(k).and_then(Option::take).ok_or_else(|| KernelError::Invalid("missing loft hole".into()))?);
+            }
+        }
+        previous = r.holes.iter().map(position).collect();
+    }
+    // Matching resamples each loop family to its largest section. Different holes can
+    // be the large one in different sketches: bound the combined result, not just each
+    // input section, before allocating the wires.
+    let mut counts = vec![0usize; holes + 1];
+    for r in &numbered {
+        for (count, lp) in counts.iter_mut().zip(r.loops()) {
+            *count = (*count).max(lp.lp.segs.len());
+        }
+    }
+    if counts.iter().sum::<usize>() > MAX_SEGS {
+        return Err(KernelError::Invalid("matching loft sections would create too many segments".into()));
+    }
+    guard("loft with holes", || {
+        let mut loops = vec![loft_numbered_wires(&outlines, reversed)?];
+        for i in 0..holes {
+            let secs = planes
+                .iter()
+                .zip(&numbered)
+                .map(|(p, r)| r.holes.get(i).cloned().map(|h| (*p, h)).ok_or_else(|| KernelError::Invalid("missing loft hole".into())))
+                .collect::<Result<Vec<_>>>()?;
+            // The holes have already been ordered with the outline.
+            loops.push(loft_numbered_wires(&secs, false)?);
+        }
+        let close = |smooth: bool| {
+            let mut sides = Vec::new();
+            let mut first = Vec::new();
+            let mut last = Vec::new();
+            for (i, (wires, sources)) in loops.iter().enumerate() {
+                let faces = if smooth { smooth_loft_faces(wires, sources, true)? } else { ruled_loft_faces(wires, sources)? };
+                let (Some(a), Some(b)) = (wires.first(), wires.last()) else { return Err(KernelError::Invalid("no loft sections".into())) };
+                if i == 0 {
+                    sides.extend(faces);
+                    first.push(a.clone());
+                    last.push(b.clone());
+                } else {
+                    sides.extend(faces.into_iter().map(|(f, source)| (f.inverse(), source)));
+                    first.push(a.inverse());
+                    last.push(b.inverse());
+                }
+            }
+            cap_and_close(sides, &first, &last, reversed)
+        };
+        if sections.len() >= 3
+            && let Ok(body) = guard("smooth loft with holes", || close(true))
+        {
+            return Ok(body);
+        }
+        close(false)
     })
 }
 
@@ -1818,6 +1947,13 @@ pub fn loft(sections: &[(Plane, Loop2)]) -> Result<Body> {
 /// segment count and turned to start alike; with the profile segments under each wire edge, and
 /// whether the sections were turned round into the canonical order.
 pub(crate) fn loft_wires(sections: &[(Plane, Loop2)]) -> Result<(Vec<mt::Wire>, Vec<Vec<Vec<usize>>>, bool)> {
+    let reversed = loft_reversed(sections)?;
+    let ordered = sections.iter().map(|(p, _)| *p).zip(numbered::number_loops(sections.iter().map(|(_, l)| l))).collect::<Vec<_>>();
+    let (wires, sources) = guard("loft sections", || loft_numbered_wires(&ordered, reversed))?;
+    Ok((wires, sources, reversed))
+}
+
+fn loft_reversed(sections: &[(Plane, Loop2)]) -> Result<bool> {
     if sections.len() < 2 || sections.len() > 50 {
         return Err(KernelError::Invalid("a loft needs 2…50 sections".into()));
     }
@@ -1834,10 +1970,16 @@ pub(crate) fn loft_wires(sections: &[(Plane, Loop2)]) -> Result<(Vec<mt::Wire>, 
     let (Some(first), Some(last)) = (sections.first(), sections.last()) else { return Err(KernelError::Invalid("no sections".into())) };
     let step = centre(last) - centre(first);
     let big = [step.x, step.y, step.z].into_iter().max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
-    let reversed = big < 0.0;
+    Ok(big < 0.0)
+}
+
+fn loft_numbered_wires(sections: &[(Plane, NumberedLoop)], reversed: bool) -> Result<(Vec<mt::Wire>, Vec<Vec<Vec<usize>>>)> {
+    let n = sections.iter().map(|(_, l)| l.lp.segs.len()).max().unwrap_or(0);
+    if n == 0 || n > MAX_SEGS {
+        return Err(KernelError::Invalid("empty section".into()));
+    }
     // The sections' segments are numbered in the order given.
-    let mut ordered: Vec<(Plane, NumberedLoop)> =
-        sections.iter().map(|(p, _)| *p).zip(numbered::number_loops(sections.iter().map(|(_, l)| l))).collect();
+    let mut ordered = sections.to_vec();
     if reversed {
         ordered.reverse();
     }
@@ -1845,6 +1987,7 @@ pub(crate) fn loft_wires(sections: &[(Plane, Loop2)]) -> Result<(Vec<mt::Wire>, 
     // turns the solid outward), then match segment counts and starting points to the section
     // with the most segments.
     let n0 = ordered.first().map(|(p, _)| p.normal()).unwrap_or(Vec3::Z);
+    let parallel = ordered.iter().all(|(p, _)| p.normal().dot(n0).abs() > 1.0 - 1e-9);
     let oriented: Vec<(Plane, NumberedLoop)> = ordered
         .iter()
         .map(|(p, l)| {
@@ -1863,6 +2006,12 @@ pub(crate) fn loft_wires(sections: &[(Plane, Loop2)]) -> Result<(Vec<mt::Wire>, 
         // Break angles: the lead section's vertex directions seen in this plane.
         let angles: Vec<f64> = lead_dirs.iter().map(|d| Vec2::new(d.dot(p.x), d.dot(p.y)).angle()).collect();
         let mut r = l.resample(n, &angles);
+        // Circle resampling creates increasing local angles. An antiparallel sketch
+        // plane must run clockwise locally to keep the same winding in world space.
+        // Curving a run through a right angle does not reverse a section's winding.
+        if parallel && p.normal().dot(n0) < 0.0 {
+            r = r.oriented(true);
+        }
         // Start where every vertex lines up best with the lead's vertex of the same number (the
         // largest sum of dot products of their directions from the centroids). The one vertex
         // closest in direction to the lead's first vertex twisted non-convex sections (#881): a
@@ -1878,7 +2027,7 @@ pub(crate) fn loft_wires(sections: &[(Plane, Loop2)]) -> Result<(Vec<mt::Wire>, 
         wires.push(uniform_wire(p, &r.lp)?);
         edge_sources.push(r.from);
     }
-    Ok((wires, edge_sources, reversed))
+    Ok((wires, edge_sources))
 }
 
 /// Ruled faces between each two neighbouring section wires; each comes from the section edges
@@ -1899,7 +2048,7 @@ pub(crate) fn ruled_loft_faces(wires: &[mt::Wire], edge_sources: &[Vec<Vec<usize
 /// Points across the sections (one per section, in order) as a smooth B-spline through them at the
 /// parameters `u` (rising from 0 to 1, one per section): cubic through four or more, quadratic
 /// through three.
-fn across(pts: &[Vec3], u: &[f64]) -> Option<mt::BSplineCurve<mt::Point3>> {
+pub(crate) fn across(pts: &[Vec3], u: &[f64]) -> Option<mt::BSplineCurve<mt::Point3>> {
     match pts {
         [a, b, c] => {
             // The quadratic Bezier through `b` at t = u[1].
@@ -1919,7 +2068,7 @@ fn across(pts: &[Vec3], u: &[f64]) -> Option<mt::BSplineCurve<mt::Point3>> {
 /// them. At a uniform parameter a section close to its neighbour makes the surface overshoot
 /// between the others (by several times the section's size when the spacing differs tenfold).
 /// Evenly spaced sections give the uniform parameters.
-fn section_parameters(edges: &[Vec<mt::Edge>]) -> Vec<f64> {
+pub(crate) fn section_parameters(edges: &[Vec<mt::Edge>]) -> Vec<f64> {
     let m = edges.len();
     let uniform = || (0..m).map(|i| i as f64 / (m.max(2) - 1) as f64).collect::<Vec<f64>>();
     let corners: Vec<Vec<Vec3>> = edges.iter().map(|es| es.iter().map(|e| from_p3(e.front().point())).collect()).collect();

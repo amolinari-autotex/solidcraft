@@ -120,10 +120,13 @@ impl Path {
 /// and the drag ends there. Returns how far it got and what it leaves for the edit's solve
 /// ([`Left::Solved`]: the held solve of the last step it kept left the sketch solved).
 ///
+/// `with`: the rest of a selection dragged by one of its entities; all of it slides by the
+/// cursor's move as one (see [`plan_group`]).
+///
 /// `live`: one frame of an interactive drag, whose held solves and cursor correction share
 /// one frame's work budget ([`Budget::frame`]); otherwise each has a solve's own.
-pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, from: Vec2, to: Vec2, live: bool) -> (Dragged, Left) {
-    let Some((path, hold, n, short)) = prepare(sk, e, from, to) else {
+pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, with: &[Ent], from: Vec2, to: Vec2, live: bool) -> (Dragged, Left) {
+    let Some((path, hold, n, short)) = prepare(sk, e, with, from, to) else {
         return (Dragged { reached: 0.0, moving: Vec::new() }, Left::Unsolved);
     };
     #[cfg(test)]
@@ -383,16 +386,16 @@ impl Geometry {
 /// `drag_entity` runs, for tests.
 #[cfg(test)]
 pub(super) fn drag_steps(sk: &Sketch, e: Ent, from: Vec2, to: Vec2) -> usize {
-    prepare(sk, e, from, to).map_or(0, |(_, _, n, _)| n)
+    prepare(sk, e, &[], from, to).map_or(0, |(_, _, n, _)| n)
 }
 
 /// A drag's path, what its solves hold and its number of steps (and of short steps, see
 /// `SHORT_STEP_FRACTION`), or `None` if it cannot move.
-fn prepare(sk: &Sketch, e: Ent, from: Vec2, to: Vec2) -> Option<(Path, Hold, usize, usize)> {
+fn prepare(sk: &Sketch, e: Ent, with: &[Ent], from: Vec2, to: Vec2) -> Option<(Path, Hold, usize, usize)> {
     if !(from.is_finite() && to.is_finite()) {
         return None;
     }
-    let (path, hold) = plan(sk, e, from, to)?;
+    let (path, hold) = if with.is_empty() { plan(sk, e, from, to)? } else { plan_group(sk, e, with, to - from)? };
     let n = step_count(sk, &hold, path.length(), STEP_FRACTION);
     let short = step_count(sk, &hold, path.length(), SHORT_STEP_FRACTION);
     Some((path, hold, n, short))
@@ -501,6 +504,36 @@ fn plan(sk: &Sketch, e: Ent, from: Vec2, to: Vec2) -> Option<(Path, Hold)> {
         }
     };
     Some((path, hold))
+}
+
+/// A selection dragged by one of its entities (`e`, the rest `with`): every free point of all of
+/// them slides by `d` and the solves hold them all (circles and ellipses keep their radii), so
+/// the selection moves as one instead of its free ends trailing behind the grabbed entity.
+fn plan_group(sk: &Sketch, e: Ent, with: &[Ent], d: Vec2) -> Option<(Path, Hold)> {
+    let mut hold = Hold::default();
+    for e in std::iter::once(&e).chain(with) {
+        match *e {
+            Ent::Point(q) => hold.points.push(q),
+            Ent::Curve(c) => {
+                let Some(kind) = sk.curves.get(c).map(|x| &x.kind) else { continue };
+                hold.points.extend(kind.point_ids());
+                if matches!(kind, CurveKind::Circle { .. } | CurveKind::Ellipse { .. }) {
+                    hold.radii.push(c);
+                }
+            }
+        }
+    }
+    hold.points.sort_unstable();
+    hold.points.dedup();
+    hold.radii.sort_unstable();
+    hold.radii.dedup();
+    let locked = sk.locked_points();
+    let pts: Vec<(usize, Vec2)> =
+        hold.points.iter().filter(|q| !locked.get(**q).copied().unwrap_or(true)).filter_map(|&q| Some((q, sk.point(q)?))).collect();
+    if pts.is_empty() {
+        return None;
+    }
+    Some((Path::Slide { pts, d }, hold))
 }
 
 /// Steps for a move of `length`: enough that none is longer than `fraction` of the smallest

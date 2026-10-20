@@ -208,8 +208,9 @@ pub fn nav_preset(id: &str) -> &'static NavPreset {
     NAV_PRESETS.iter().find(|p| p.id == id).unwrap_or(&NAV_PRESETS[0])
 }
 /// The dialog's pages, in order.
-pub const PAGES: [&str; 8] = ["General", "Navigation", "Keyboard Shortcuts", "Design", "Graphics", "Sketch", "Selection", "AI"];
+pub const PAGES: [&str; 9] = ["General", "Navigation", "Keyboard Shortcuts", "Design", "Graphics", "Sketch", "Selection", "AI", "Plugins"];
 pub const PAGE_AI: usize = 7;
+pub const PAGE_PLUGINS: usize = 8;
 pub const PAGE_SHORTCUTS: usize = 2;
 pub const PAGE_DESIGN: usize = 3;
 pub const PAGE_GRAPHICS: usize = 4;
@@ -406,6 +407,8 @@ pub struct Prefs {
     /// When true: Shift+click adds without removing; Primary toggles.
     /// When false (default): Shift and Primary both toggle.
     pub selection_shift_add_only: bool,
+    /// Plugin ids turned off (Preferences › Plugins). An installed plugin whose id is absent is on.
+    pub disabled_plugins: std::collections::BTreeSet<String>,
 }
 
 /// What a middle-button double-click in the view does.
@@ -506,6 +509,7 @@ impl Default for Prefs {
             suppress_sketch_snap: ModifierCombo::CTRL_ALT,
             manipulator_free_alt: true,
             selection_shift_add_only: false,
+            disabled_plugins: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -740,6 +744,7 @@ fn defaults(app: &mut SolveApp, page: usize) {
             app.autosave_minutes = 5.0;
             set_autosave(app);
         }
+        PAGE_PLUGINS => p.disabled_plugins.clear(),
         PAGE_AI => {
             // The agents the user added and their "always allow" answers stay.
             p.ai_features = d.ai_features;
@@ -1219,6 +1224,10 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
     }
     if app.prefs_window.section == PAGE_AI {
         crate::agent_chat::settings::page(app, ui);
+        return;
+    }
+    if app.prefs_window.section == PAGE_PLUGINS {
+        crate::plugins::page(app, ui);
         return;
     }
     egui::Grid::new(("sc_prefs_grid", app.prefs_window.section)).num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| match app.prefs_window.section {
@@ -1842,12 +1851,23 @@ pub fn migrate(mut p: Prefs) -> Prefs {
     p
 }
 
+/// Drop plugin ids this page would not show, and keep at most [`crate::plugins::MAX_DISABLED`],
+/// so a hand-edited preferences file cannot carry a huge or nonsense list. `set` still refuses
+/// those instead of dropping them.
+fn limit_disabled_plugins(mut p: Prefs) -> Prefs {
+    p.disabled_plugins.retain(|id| crate::plugins::valid_id(id));
+    if p.disabled_plugins.len() > crate::plugins::MAX_DISABLED {
+        p.disabled_plugins = p.disabled_plugins.into_iter().take(crate::plugins::MAX_DISABLED).collect();
+    }
+    p
+}
+
 /// Saved preferences, keeping every one that still reads. A value this version doesn't
 /// understand (a setting a newer or older release saved differently, a hand edit) falls back to
 /// its default on its own instead of discarding all of them.
 pub fn lenient(saved: &serde_json::Value) -> Prefs {
     if let Ok(p) = serde_json::from_value::<Prefs>(saved.clone()) {
-        return migrate(p);
+        return limit_disabled_plugins(migrate(p));
     }
     let Ok(mut cur) = serde_json::to_value(Prefs::default()) else { return Prefs::default() };
     if let (Some(o), Some(src)) = (cur.as_object_mut(), saved.as_object()) {
@@ -1861,7 +1881,7 @@ pub fn lenient(saved: &serde_json::Value) -> Prefs {
             }
         }
     }
-    serde_json::from_value(cur).map(migrate).unwrap_or_default()
+    serde_json::from_value(cur).map(migrate).map(limit_disabled_plugins).unwrap_or_default()
 }
 
 /// Set preferences from JSON (control channel); returns them all.
@@ -1903,6 +1923,9 @@ pub fn set(app: &mut SolveApp, p: &serde_json::Value) -> Result<serde_json::Valu
     }
     if new.ui_font != app.preferences.ui_font && !new.ui_font.trim().is_empty() && crate::fonts::ui_font(&new.ui_font).is_none() {
         return Err(format!("`ui_font`: `{}` is not an installed font family or a readable font file", new.ui_font.trim()));
+    }
+    if new.disabled_plugins.len() > crate::plugins::MAX_DISABLED || new.disabled_plugins.iter().any(|id| !crate::plugins::valid_id(id)) {
+        return Err(format!("`disabled_plugins` must be at most {} ids of lowercase letters, digits and hyphens", crate::plugins::MAX_DISABLED));
     }
     if !(0.5..=2.5).contains(&new.ui_scale) || !(0.25..=4.0).contains(&new.look_at_speed) {
         return Err("`ui_scale` must be 0.5…2.5 and `look_at_speed` 0.25…4".into());
@@ -2478,7 +2501,7 @@ mod tests {
         let mut out = ctx.run_ui(Default::default(), |ui| show(&mut app, ui.ctx()));
         out.textures_delta.clear();
         assert!(app.prefs_window.open && app.prefs_window.section == PAGE_SHORTCUTS && !app.keymap.open);
-        assert!(control(&mut app, &json!({"open": "Plugins"})).is_err());
+        assert!(control(&mut app, &json!({"open": "NoSuch"})).is_err());
         assert!(set(&mut app, &json!({"up_axis": "x"})).is_err());
         assert!(set(&mut app, &json!({"theme": "sepia"})).is_err());
         assert!(set(&mut app, &json!({"language": "xx"})).is_err());

@@ -87,10 +87,10 @@ def read_paths(src):
 
 def select(meta, paths):
     """Return (full, sorted package names)."""
-    root = meta["workspace_root"].rstrip("/") + "/"
+    root = meta["workspace_root"].replace("\\", "/").rstrip("/") + "/"
     pkgs = {}
     for p in meta["packages"]:
-        manifest = p["manifest_path"]
+        manifest = p["manifest_path"].replace("\\", "/")
         assert manifest.startswith(root), manifest
         pkgs[p["name"]] = manifest[len(root):].rsplit("/", 1)[0] + "/"
     by_dir = {d: n for n, d in pkgs.items()}
@@ -101,7 +101,7 @@ def select(meta, paths):
             path = d.get("path")
             if not path:
                 continue
-            rel = path.rstrip("/") + "/"
+            rel = path.replace("\\", "/").rstrip("/") + "/"
             target = by_dir.get(rel[len(root):]) if rel.startswith(root) else None
             if target:
                 dependents[target].add(p["name"])

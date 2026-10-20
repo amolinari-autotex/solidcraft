@@ -2243,7 +2243,7 @@ fn curve_blend_sized(solid: &Solid, ids: &[mt::EdgeID], size: f64, size_law: Siz
 
 #[path = "curvecorner.rs"]
 mod corner;
-pub(crate) use corner::corner_blend_style;
+pub(crate) use corner::{corner_blend_style, param_on};
 // The planar corner builder the G2 corner work left in place of `corner_blend_style`'s sphere.
 #[allow(unused_imports)]
 pub(crate) use corner::corner_blend;

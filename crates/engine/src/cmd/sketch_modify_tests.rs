@@ -1587,6 +1587,35 @@ fn offset_driver_format18_offsets_keep_fixed_distances_on_upgrade() {
 }
 
 #[test]
+fn several_texts_edit_in_one_rebuild() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Labels"}));
+    let a = run(&mut s, "sketch.text", json!({"text": "I", "at": [0, 0], "height": 10}))["link"].as_str().unwrap().to_string();
+    let b = run(&mut s, "sketch.text", json!({"text": "I", "at": [30, 0], "height": 10}))["link"].as_str().unwrap().to_string();
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Labels", "distance": 2}));
+    let volume = |s: &mut Session| run(s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+    let v0 = volume(&mut s);
+    run(&mut s, "sketch.edit", json!({"sketch": "Labels"}));
+    let (before, steps) = (s.evaluations, s.undo.len());
+    let r = run(&mut s, "sketch.edit_text", json!({"edits": [{"link": a, "text": "II"}, {"link": b, "text": "II"}]}));
+    assert_eq!(s.evaluations, before + 1, "one rebuild for both texts");
+    assert_eq!(s.undo.len(), steps + 1, "one undo step for both texts");
+    assert_eq!(r["edits"][1]["link"], json!(b), "{r}");
+    // All or nothing: a bad second edit leaves the first text as it was.
+    assert!(s.execute("sketch.edit_text", &json!({"edits": [{"link": a, "text": "III"}, {"link": "nope", "text": "I"}]})).is_err());
+    assert!(s.execute("sketch.edit_text", &json!({"edits": []})).is_err());
+    // A live frame takes the same list.
+    let r = run(&mut s, "sketch.edit_text", json!({"edits": [{"link": a, "height": 12}, {"link": b, "height": 12}], "live": true}));
+    assert_eq!(r["edits"][0]["link"], json!(a), "{r}");
+    run(&mut s, "sketch.edit_text", json!({"edits": [{"link": a, "height": 10}, {"link": b, "height": 10}], "live": true}));
+    run(&mut s, "sketch.drag_end", json!({}));
+    run(&mut s, "sketch.finish", json!({}));
+    let v1 = volume(&mut s);
+    assert!((v1 / v0 - 2.0).abs() < 0.05, "two bars per label now: {v0} -> {v1}");
+}
+
+#[test]
 fn trim_keeps_the_rest_of_a_dimensioned_line_where_it_was() {
     // A 40 x 40 square, its right side dimensioned with the Dimension tool (a line length).
     let mut s = new_sketch();

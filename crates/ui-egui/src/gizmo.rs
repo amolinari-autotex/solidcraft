@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 
 use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, vec2};
-use solidcraft_engine::geom::Vec3;
+use solidcraft_engine::geom::{Ring, Vec3};
 
 use crate::theme::Tokens;
 use crate::viewport::{Proj, projected_polygon};
@@ -121,13 +121,12 @@ fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     (a + ab * t).distance(p)
 }
 
-fn in_quad(p: Pos2, q: &[Pos2]) -> bool {
+fn in_quad(p: Pos2, q: &Ring<Pos2>) -> bool {
     if q.len() < 3 {
         return false;
     }
     let mut sign = 0.0f32;
-    for i in 0..q.len() {
-        let (a, b) = (q[i], q[(i + 1) % q.len()]);
+    for (&a, &b) in q.edges() {
         let c = (b - a).x * (p - a).y - (b - a).y * (p - a).x;
         if c.abs() < 1e-6 {
             continue;
@@ -166,7 +165,7 @@ fn along(proj: &Proj, pos: Pos2, o: Vec3, d: Vec3) -> Option<f64> {
 /// The triad's shapes: (handle, screen polygon or polyline, is it a filled area).
 struct Shapes {
     arrows: Vec<(usize, Pos2, Pos2)>,
-    planes: Vec<(usize, Vec<Pos2>)>,
+    planes: Vec<(usize, Ring<Pos2>)>,
     rings: Vec<(usize, Vec<Pos2>)>,
     ball: Pos2,
 }
@@ -183,7 +182,7 @@ fn shapes(proj: &Proj, t: &Triad, l: f64) -> Option<Shapes> {
         }
         for i in 0..3 {
             let (e1, e2) = ring_basis(i);
-            let q: Vec<Pos2> = [(0.25, 0.25), (0.45, 0.25), (0.45, 0.45), (0.25, 0.45)]
+            let q: Ring<Pos2> = [(0.25, 0.25), (0.45, 0.25), (0.45, 0.45), (0.25, 0.45)]
                 .iter()
                 .filter_map(|(a, b)| proj.to_screen(c + e1 * (a * l) + e2 * (b * l)))
                 .collect();

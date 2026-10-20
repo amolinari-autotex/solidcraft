@@ -61,8 +61,11 @@ fn interrupted_blob_staging_preserves_checkout_and_retry_receipt() {
     let request = input(&grant);
     assert!(matches!(store.execute(Request::ManagedCheckIn { input: request.clone() }), Response::Error { .. }));
     assert_eq!(fs::read(&pending).unwrap(), b"interrupted transfer");
-    match store.execute(Request::ManagedCheckout { document: grant.entry.document.clone(), workspace: "workspace".into(), machine: "desktop".into() })
-    {
+    match store.execute(Request::ManagedResumeCheckout {
+        document: grant.entry.document.clone(),
+        workspace: "workspace".into(),
+        machine: "desktop".into(),
+    }) {
         Response::ManagedCheckout { grant: current } => assert_eq!(current, grant),
         other => panic!("{other:?}"),
     }

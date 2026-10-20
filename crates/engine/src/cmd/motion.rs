@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use solidcraft_doc::Mat;
 use solidcraft_doc::joints::{self, JointKind};
 use solidcraft_doc::motion::{ContactSet, ExplodedView, MotionStudy, StudyKey};
-use solidcraft_geom::Vec3;
+use solidcraft_geom::{Aabb3, Vec3};
 use solidcraft_kernel::Body;
 
 use super::CommandSpec;
@@ -905,16 +905,14 @@ fn centres(s: &Session) -> Vec<(u64, Vec3)> {
     let bodies = placed(s);
     let mut out = Vec::new();
     for o in s.doc.occurrences.iter().filter(|o| o.parent == 0) {
-        let (mut lo, mut hi) = (Vec3::new(f64::MAX, f64::MAX, f64::MAX), Vec3::new(f64::MIN, f64::MIN, f64::MIN));
+        let mut bounds = Aabb3::EMPTY;
         for (_, b) in bodies.iter().filter(|(path, _)| path.first() == Some(&o.id)) {
             if let Ok(m) = b.tessellate((b.size() * 1e-2).max(1e-2)) {
-                let bb = m.bounds();
-                lo = Vec3::new(lo.x.min(bb.min.x), lo.y.min(bb.min.y), lo.z.min(bb.min.z));
-                hi = Vec3::new(hi.x.max(bb.max.x), hi.y.max(bb.max.y), hi.z.max(bb.max.z));
+                bounds = bounds.union(&m.bounds());
             }
         }
-        if lo.x <= hi.x {
-            out.push((o.id, (lo + hi) * 0.5));
+        if !bounds.is_empty() {
+            out.push((o.id, bounds.center()));
         }
     }
     out

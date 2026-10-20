@@ -3,6 +3,7 @@
 
 Uses a small synthetic workspace, then the real one (`cargo metadata --no-deps`).
 """
+import copy
 import os
 import sys
 import unittest
@@ -32,6 +33,18 @@ SYNTH = {
 }
 
 
+def windows_metadata(root):
+    meta = copy.deepcopy(SYNTH)
+    meta["workspace_root"] = root
+    prefix = root.rstrip("\\/")
+    for p in meta["packages"]:
+        p["manifest_path"] = prefix + "\\" + p["manifest_path"][len(R) + 1:]
+        for d in p["dependencies"]:
+            if "path" in d:
+                d["path"] = prefix.replace("\\", "/") + "/" + d["path"][len(R) + 1:].replace("/", "\\")
+    return meta
+
+
 class Synthetic(unittest.TestCase):
     def test_leaf_selects_only_itself(self):
         self.assertEqual(affected.select(SYNTH, ["apps/top/src/main.rs"]), (False, ["top"]))
@@ -57,6 +70,26 @@ class Synthetic(unittest.TestCase):
         for p in [".github/workflows/docker.yml", ".github/ISSUE_TEMPLATE/bug.yml", "scripts/claim/claim.js",
                   "scripts/triage/triage.test.js", "vendor/README.md", "SECURITY.md"]:
             self.assertEqual(affected.select(SYNTH, [p]), (False, []), p)
+
+    def test_windows_metadata_selects_packages_and_preserves_triggers(self):
+        for root in [r"C:\work space\solidcraft", r"\\server\shared work\solidcraft"]:
+            for trailing in ["", "\\", "/"]:
+                with self.subTest(root=root, trailing=trailing):
+                    meta = windows_metadata(root + trailing)
+                    self.assertEqual(affected.select(meta, ["apps/top/src/main.rs"]), (False, ["top"]))
+                    self.assertEqual(affected.select(meta, ["crates/base/src/lib.rs"]), (False, ["base", "mid", "top"]))
+                    self.assertEqual(affected.select(meta, ["docs/book/a.md", "README.md"]), (False, []))
+                    for path in ["Cargo.lock", ".github/workflows/ci.yml", "unknown.txt"]:
+                        self.assertEqual(affected.select(meta, [path]), (True, []), path)
+
+    def test_windows_metadata_rejects_a_manifest_in_a_sibling_workspace(self):
+        for root in [r"C:\work space\solidcraft", r"\\server\shared work\solidcraft"]:
+            with self.subTest(root=root):
+                meta = windows_metadata(root + "\\")
+                sibling = root.replace("\\", "/") + "-sibling/crates/base/Cargo.toml"
+                meta["packages"][0]["manifest_path"] = sibling
+                with self.assertRaises(AssertionError):
+                    affected.select(meta, ["crates/base/src/lib.rs"])
 
 
 class RealWorkspace(unittest.TestCase):

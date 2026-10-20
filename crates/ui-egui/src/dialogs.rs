@@ -158,9 +158,11 @@ pub enum Kind {
         count: String,
         angle: String,
     },
-    /// Loft through profiles of different sketches, in pick order.
+    /// Loft through profiles of different sketches, in pick order; `rail_fit` how its guide
+    /// rails reshape the sections (an index into the sweep dialog's rail fits).
     Loft {
         operation: usize,
+        rail_fit: usize,
     },
     /// Sweep a profile along a path of sketch curves.
     Sweep {
@@ -644,7 +646,10 @@ impl Dialog {
                 Kind::PatternCirc { count: "6".into(), angle: "360 deg".into() },
                 vec![SelInput::new("Objects", BODIES, true), SelInput::new("Axis", AXES, false)],
             ),
-            "solid.loft" => Dialog::new(Kind::Loft { operation: usize::from(has_bodies) }, vec![SelInput::new("Profiles", PROFILES, true)]),
+            "solid.loft" => Dialog::new(Kind::Loft { operation: usize::from(has_bodies), rail_fit: 0 }, {
+                let [rail, rail2] = crate::dialogs_sweep::rail_inputs();
+                vec![SelInput::new("Profiles", PROFILES, true), rail, rail2]
+            }),
             "solid.sweep" => Dialog::new(Kind::Sweep { operation: usize::from(has_bodies), opts: crate::dialogs_sweep::SweepOpts::default() }, {
                 let [rail, rail2] = crate::dialogs_sweep::rail_inputs();
                 vec![
@@ -857,6 +862,8 @@ impl Dialog {
             Kind::SketchModify(k) => return k.previews(),
             Kind::Plastic(k) => return k.previews(),
             Kind::Part(_) | Kind::PartSize(_) => return true,
+            // Web previews run synchronously; a modelled thread can take seconds.
+            Kind::Thread { .. } => return !cfg!(target_arch = "wasm32") && self.extra.get("modeled").and_then(Value::as_bool).unwrap_or(false),
             _ => {}
         }
         matches!(
@@ -2991,7 +2998,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             feature_pattern_alignment_row(ui, &mut d.extra, 0);
                         }
                     }
-                    Kind::Loft { operation } => {
+                    Kind::Loft { operation, rail_fit } => {
+                        crate::dialogs_sweep::rail_fit_row(ui, "lf", rail_fit);
                         row_label(ui, "Operation");
                         combo(ui, "lf_op", &OP_LABELS, operation);
                         ui.end_row();
@@ -4084,7 +4092,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             pattern_objects(s, sels(d, 0), &mut p);
             ("solid.pattern.circular", p)
         }
-        Kind::Loft { operation } => {
+        Kind::Loft { operation, rail_fit } => {
             need(0, "profiles of two or more sketches")?;
             // One section per sketch, in the order the sketches were first picked.
             let mut sections: Vec<(u64, Vec<usize>)> = Vec::new();
@@ -4100,7 +4108,9 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 return Err("pick profiles in two or more sketches".into());
             }
             let sections: Vec<Value> = sections.into_iter().map(|(sk, v)| json!({"sketch": sk, "profiles": v})).collect();
-            ("solid.loft", json!({"sections": sections, "operation": OPS.get(*operation).copied().unwrap_or("new")}))
+            let mut p = json!({"sections": sections, "operation": OPS.get(*operation).copied().unwrap_or("new")});
+            crate::dialogs_sweep::rail_params(app, *rail_fit, [sels(d, 1), sels(d, 2)], &mut p)?;
+            ("solid.loft", p)
         }
         Kind::Sweep { operation, opts } => {
             need(0, "a profile")?;
@@ -5342,9 +5352,12 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             }
             d
         }
-        FeatureKind::Loft { sections, operation, targets } => {
+        FeatureKind::Loft { sections, operation, targets, rails, rail_fit } => {
             let mut d = start("solid.loft")?;
-            d.kind = Kind::Loft { operation: op_index(operation) };
+            d.kind = Kind::Loft { operation: op_index(operation), rail_fit: crate::dialogs_sweep::rail_fit_index(*rail_fit) };
+            for (inp, items) in d.inputs.iter_mut().skip(1).zip(crate::dialogs_sweep::rail_sels(rails)) {
+                inp.items = items;
+            }
             if let Some(inp) = d.inputs.first_mut() {
                 inp.items = sections
                     .iter()

@@ -301,8 +301,8 @@ impl SweepOrientation {
     }
 }
 
-/// A sweep's guide rail: a chain of curves of a sketch, followed from the end nearest the path's
-/// start.
+/// A sweep's or a loft's guide rail: a chain of curves of a sketch, followed from the end nearest
+/// the path's start (the loft's first section).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 pub struct SweepRail {
     pub sketch: SketchId,
@@ -742,6 +742,12 @@ pub enum FeatureKind {
         operation: Operation,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         targets: Vec<BodyName>,
+        /// Guide rails (one or two) the loft follows between its sections.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rails: Vec<SweepRail>,
+        /// How the rails reshape the sections between.
+        #[serde(default, skip_serializing_if = "RailFit::is_scale")]
+        rail_fit: RailFit,
     },
     /// Sweep profiles along a chain of sketch curves.
     Sweep {
@@ -1374,6 +1380,12 @@ pub enum FeatureKind {
         continuity: [Continuity; 2],
         #[serde(default, skip_serializing_if = "loft_crown_is_plain")]
         crown: [f64; 2],
+        /// Guide rails (one or two) the loft follows between its sections.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rails: Vec<SweepRail>,
+        /// How the rails reshape the sections between.
+        #[serde(default, skip_serializing_if = "RailFit::is_scale")]
+        rail_fit: RailFit,
     },
     /// The faces at `faces` copied out at a signed `distance` along their normals as a new
     /// surface body (0 copies them); `chain` takes each pick's whole smooth chain of faces;
@@ -1443,6 +1455,11 @@ pub enum FeatureKind {
         /// Points the blend leaves towards, when the faces at the picks do not say: [from, to].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         align: Option<[Position; 2]>,
+        /// Where each chain's stations start, when two closed chains should not pair the way
+        /// that keeps the blend from twisting: a point on each chain, [from, to]. An open chain
+        /// starts at the end nearer its point.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seam: Option<[Position; 2]>,
         /// Sew the blend onto its two bodies where the boundaries meet.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         stitch: bool,
@@ -2916,9 +2933,10 @@ impl Document {
     /// Insert a feature as given, keeping its id, name, parameter names and stored edge and
     /// face names, at the marker (or the end), with the model parameters its sketch dimensions
     /// use: a feature replayed from a script (`timeline.add`) is the feature the design had.
-    /// An id of 0 or an empty name gets a new one. Refused, changing nothing, when the id, the
-    /// name or a parameter name is already used, or the feature belongs to a component this
-    /// design does not have.
+    /// An id of 0 or an empty name gets a new one. The name is kept even when another feature
+    /// has it, as a sketch and the feature built from it often share one (#1990). Refused,
+    /// changing nothing, when the id or a parameter name is already used, or the feature
+    /// belongs to a component this design does not have.
     pub fn insert_feature(&mut self, mut f: Feature, params: Vec<Param>) -> Result<u64> {
         if self.features.len() >= MAX_FEATURES {
             return Err(DocError::Invalid("too many features".into()));
@@ -2933,8 +2951,6 @@ impl Document {
         f.name = f.name.trim().to_string();
         if f.name.is_empty() {
             f.name = self.unique_name(f.kind.base_name());
-        } else if self.features.iter().any(|x| x.name == f.name) {
-            return Err(DocError::Invalid(format!("a feature named `{}` already exists", f.name)));
         }
         if f.component != 0 && !self.components.iter().any(|c| c.id == f.component) {
             return Err(DocError::Invalid(format!("feature `{}` belongs to an unknown component", f.name)));
