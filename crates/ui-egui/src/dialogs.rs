@@ -1662,10 +1662,12 @@ impl Dialog {
             let picked = self.inputs.get(self.active).and_then(|i| i.items.first());
             crate::primitive_placement::picked(s, cmd, at, &mut self.extra, picked);
         }
+        crate::dialogs_assembly::resolve_alignment_order(s, self, None);
     }
 
     /// Box selection result: replace (or add to) the active input.
     pub fn take_box(&mut self, s: &Session, sels: Vec<Sel>, add: bool) {
+        let sels: Vec<_> = sels.into_iter().filter(|sel| crate::dialogs_assembly::alignment_accepts(s, self, sel)).collect();
         if let Kind::PathPlane { sketch, .. } = &mut self.kind {
             *sketch = None;
             self.extra.remove("path");
@@ -2012,7 +2014,7 @@ mod face_snap_tests {
 
     #[test]
     fn a_point_more_than_a_micrometre_off_a_sliver_is_off_the_face() {
-        // A triangle with half-micrometre legs. Points 2 µm below its lower side and 1.6 µm past
+        // A triangle with half-micrometre legs. Points 2 Âµm below its lower side and 1.6 Âµm past
         // its long side get past `preview::point_triangle_dist`'s inside test (an absolute
         // tolerance); the snap goes by the true distance and turns them down. Points on a side,
         // or half a micrometre beyond one, are on the face.
@@ -2055,7 +2057,7 @@ mod face_snap_tests {
     }
 }
 
-/// Does a feature build from this sketch's profiles (extrude, revolve, sweep, loft, emboss…)?
+/// Does a feature build from this sketch's profiles (extrude, revolve, sweep, loft, embossâ€¦)?
 fn profiles_used(s: &Session, sketch: u64) -> bool {
     s.doc.features.iter().any(|f| f.kind.profile_sels().iter().any(|(id, _)| *id == sketch))
 }
@@ -2492,15 +2494,15 @@ pub(crate) fn selection_label(s: &Session, names: crate::prefs::OriginPlaneNames
         Sel::SketchPoint { id } => crate::sketch_modify_ui::point_id(s, item).unwrap_or(id).to_string(),
         Sel::Plane { name } => names.label(name).to_string(),
         Sel::Axis { name } | Sel::ConstructionPoint { name } | Sel::Body { name } => name.clone(),
-        Sel::Face { body, index, .. } if axis => format!("{body} · face {index} axis"),
-        Sel::Face { body, index, .. } => format!("{body} · face {index}"),
-        Sel::Edge { body, .. } if axis => format!("{body} · circle axis"),
+        Sel::Face { body, index, .. } if axis => format!("{body} Â· face {index} axis"),
+        Sel::Face { body, index, .. } => format!("{body} Â· face {index}"),
+        Sel::Edge { body, .. } if axis => format!("{body} Â· circle axis"),
         Sel::Edge { body, index, .. } if d.edge_is_centre(inp) && edge_circle(s, body, *index).is_some() => {
-            format!("{body} · circle centre")
+            format!("{body} Â· circle centre")
         }
-        Sel::Edge { body, index, .. } => format!("{body} · edge {index}"),
+        Sel::Edge { body, index, .. } => format!("{body} Â· edge {index}"),
         // A point of the model: a vertex, or the centre a round edge stands for.
-        Sel::Vertex { body, .. } if !body.is_empty() => format!("{body} · point"),
+        Sel::Vertex { body, .. } if !body.is_empty() => format!("{body} Â· point"),
         Sel::Feature { id } => s.doc.feature(*id).map(|f| f.name.clone()).unwrap_or_else(|| format!("Feature {id}")),
         Sel::Occurrence { path } => s.occurrence_placement(path).map(|p| p.name).unwrap_or_else(|_| "Component".into()),
         Sel::Vertex { body, point } if body.is_empty() => {
@@ -2508,7 +2510,7 @@ pub(crate) fn selection_label(s: &Session, names: crate::prefs::OriginPlaneNames
             let p = s.active_sketch.and_then(|id| state.sketch(id)).map(|sk| sk.plane.to_local(*point)).unwrap_or_default();
             format!("({:.2}, {:.2}) mm", p.x, p.y)
         }
-        Sel::Vertex { body, .. } => format!("{body} · vertex"),
+        Sel::Vertex { body, .. } => format!("{body} Â· vertex"),
         _ => format!("{item:?}"),
     }
 }
@@ -2555,7 +2557,7 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
         form_row(ui, inp.label, |ui| {
             ui.horizontal(|ui| {
                 let active = i == d.active;
-                // A chip: "↖ Select" (outlined) while empty, "N selected" (filled) once picked.
+                // A chip: "â†– Select" (outlined) while empty, "N selected" (filled) once picked.
                 let custom_axis = i == 1 && inp.items.is_empty() && stored_revolve_axis(&d.kind).is_some();
                 let filled = !inp.items.is_empty() || custom_axis || stored_reference.is_some();
                 let text = if filled {
@@ -2590,9 +2592,10 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
                 } else {
                     RichText::new(crate::i18n::tr("dialog.select")).color(t.text)
                 };
-                let selected_text = text.text().strip_prefix("↖ ").unwrap_or_else(|| text.text());
+                let selected_text = text.text().strip_prefix("â†– ").unwrap_or_else(|| text.text());
                 let prompt = if !filled && inp.label == "Edges" { tr("Select edges") } else { selected_text };
-                let chip = crate::ui_kit::selection_field(ui, prompt, crate::ui_kit::Selection { active, filled });
+                let enabled = crate::dialogs_assembly::alignment_input_available(d, i);
+                let chip = ui.add_enabled_ui(enabled, |ui| crate::ui_kit::selection_field(ui, prompt, crate::ui_kit::Selection { active, filled })).inner;
                 if matches!(d.kind, Kind::Shell { .. }) && i == 0 {
                     chip.widget_info(|| {
                         let mut info = egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tr(inp.label));
@@ -2801,7 +2804,7 @@ pub(crate) fn fill_cells(st: &solidcraft_engine::doc::ModelState, tools: &[Strin
     let bb = bodies.iter().fold(solidcraft_engine::geom::Aabb3::EMPTY, |b, (_, m)| b.union(&m.bounds()));
     let n = 20;
     let at = |i: usize, lo: f64, hi: f64| lo + (hi - lo) * (i as f64 + 0.5) / n as f64;
-    // Signature (which tools hold the point) → the points with it.
+    // Signature (which tools hold the point) â†’ the points with it.
     let mut groups: Vec<(u32, Vec<Vec3>)> = Vec::new();
     for i in 0..n {
         for j in 0..n {
@@ -3013,7 +3016,7 @@ pub(crate) fn action_labels(kind: &Kind) -> (&'static str, &'static str) {
         Kind::Measure { .. } => ("", "Close"),
         Kind::ConfirmDelete { .. } => ("Delete", "Cancel"),
         Kind::SaveMesh(k) => (crate::dialogs_save_mesh::button(k), "Cancel"),
-        Kind::ViewDxf { .. } => ("Export DXF…", "Cancel"),
+        Kind::ViewDxf { .. } => ("Export DXFâ€¦", "Cancel"),
         _ => ("OK", "Cancel"),
     }
 }
@@ -3027,7 +3030,7 @@ pub(crate) fn corner_confirms(d: &Dialog) -> bool {
 /// Show the active dialog (if any), docked flush to an edge of the viewport just below the axis
 /// view, sized to its content. The right edge is its place, except while a sketch is open: the
 /// Sketch Palette keeps the right there, and the dialog takes the left so both stay on screen.
-/// With Dialogs › In the left column it holds the left column instead (`dialog_column`).
+/// With Dialogs â€º In the left column it holds the left column instead (`dialog_column`).
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     // A click in the view's corner is for the dialog open this frame, or for none.
     let corner = app.viewport.corner.take();
@@ -3154,7 +3157,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let repeatable =
         matches!(&d.kind, Kind::SketchModify(k) if crate::sketch_modify_ui::repeatable(k)) && d.editing.is_none() && !d.extra.contains_key("pattern");
     if let Kind::ConfirmDelete { with, fail, .. } = &d.kind {
-        let detail = with.join(" · ");
+        let detail = with.join(" Â· ");
         let (closed, action) = crate::ui_kit::Confirm::new(egui::Id::new(("sc_dialog", title(&d.kind))), "delete", &heading)
             .tone(crate::ui_kit::Tone::Danger)
             .actions("Delete", "Cancel", None)
@@ -3642,7 +3645,7 @@ pub(crate) fn spline_radii(extra: &mut serde_json::Map<String, Value>, radius: &
         })
         .collect();
     let knots = extra.get("knots").and_then(Value::as_array).map_or(0, Vec::len);
-    // All control radii (the start radius and these) plus the degree (1…3) plus one.
+    // All control radii (the start radius and these) plus the degree (1â€¦3) plus one.
     if !radii.is_empty() && (radii.len() + 3..=radii.len() + 5).contains(&knots) {
         return radii;
     }
