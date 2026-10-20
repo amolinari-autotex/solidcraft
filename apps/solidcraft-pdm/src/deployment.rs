@@ -100,38 +100,42 @@ pub fn start_loopback_rehearsal(config: DeploymentConfig) -> Result<RehearsalSer
     if !fs::symlink_metadata(&config.store)?.is_dir() {
         return Err(Error::Invalid("deployment store directory"));
     }
-    let registry = config.store.join("managed-principals.json");
-    validate_path(&registry)?;
-    let credentials: Vec<PrincipalCredential> = serde_json::from_slice(&read_file(&registry, MAX_CONFIG)?)?;
-    if credentials.is_empty() {
-        return Err(Error::Invalid("deployment requires enrolled principals"));
-    }
-    let generations = config.store.join("managed/generations");
-    validate_path(&generations)?;
-    if !fs::symlink_metadata(&generations)?.is_dir() {
-        return Err(Error::Invalid("deployment requires initialized metadata"));
-    }
-    let mut initialized = false;
-    for (index, entry) in fs::read_dir(&generations)?.enumerate() {
-        if index >= 4096 {
-            return Err(Error::Invalid("deployment generation entry limit"));
+    let transactional = config.store.join("managed/metadata.redb");
+    validate_path(&transactional)?;
+    if !transactional.try_exists()? {
+        let registry = config.store.join("managed-principals.json");
+        validate_path(&registry)?;
+        let credentials: Vec<PrincipalCredential> = serde_json::from_slice(&read_file(&registry, MAX_CONFIG)?)?;
+        if credentials.is_empty() {
+            return Err(Error::Invalid("deployment requires enrolled principals"));
         }
-        let entry = entry?;
-        if entry.file_name().to_str().and_then(|name| name.parse::<u64>().ok()).is_some_and(|number| number > 0) {
-            validate_path(&entry.path())?;
-            if !entry.file_type()?.is_dir() {
-                return Err(Error::Integrity);
-            }
-            let state = entry.path().join("state.json");
-            validate_path(&state)?;
-            if !fs::symlink_metadata(state)?.is_file() {
-                return Err(Error::Integrity);
-            }
-            initialized = true;
+        let generations = config.store.join("managed/generations");
+        validate_path(&generations)?;
+        if !fs::symlink_metadata(&generations)?.is_dir() {
+            return Err(Error::Invalid("deployment requires initialized metadata"));
         }
-    }
-    if !initialized {
-        return Err(Error::Invalid("deployment requires initialized metadata"));
+        let mut initialized = false;
+        for (index, entry) in fs::read_dir(&generations)?.enumerate() {
+            if index >= 4096 {
+                return Err(Error::Invalid("deployment generation entry limit"));
+            }
+            let entry = entry?;
+            if entry.file_name().to_str().and_then(|name| name.parse::<u64>().ok()).is_some_and(|number| number > 0) {
+                validate_path(&entry.path())?;
+                if !entry.file_type()?.is_dir() {
+                    return Err(Error::Integrity);
+                }
+                let state = entry.path().join("state.json");
+                validate_path(&state)?;
+                if !fs::symlink_metadata(state)?.is_file() {
+                    return Err(Error::Integrity);
+                }
+                initialized = true;
+            }
+        }
+        if !initialized {
+            return Err(Error::Invalid("deployment requires initialized metadata"));
+        }
     }
     let mut store = Store::open(&config.store)?;
     let server_id = match store.execute(Request::ManagedCatalog) {

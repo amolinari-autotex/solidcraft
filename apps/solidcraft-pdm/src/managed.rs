@@ -13,6 +13,7 @@ use std::{
 const MAX_STATE: usize = 4 * 1024 * 1024;
 const MAX_GENERATIONS: u64 = 4096;
 const MAX_METADATA_STORAGE: u64 = 64 * 1024 * 1024;
+mod metadata_db;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -228,6 +229,8 @@ pub(crate) struct ManagedStore {
     generation: u64,
     state: State,
     credentials: Vec<PrincipalCredential>,
+    metadata: Option<metadata_db::MetadataDb>,
+    portable_image: Option<metadata_db::Image>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -386,6 +389,45 @@ impl ManagedStore {
     }
     fn open_inner(root: PathBuf, blobs: Box<dyn BlobStore>, initialize: bool) -> Result<Self, Error> {
         crate::reject_symlink_ancestors(&root)?;
+        if root.join(metadata_db::PENDING).try_exists()? {
+            return Err(Error::Invalid("interrupted metadata conversion; restore to a new destination"));
+        }
+        let database = root.join(metadata_db::DATABASE);
+        if database.try_exists()? {
+            let metadata = metadata_db::MetadataDb::open(&database)?;
+            let image = &metadata.image;
+            return Ok(Self {
+                root,
+                blobs,
+                generation: image.generation,
+                state: image.state.clone(),
+                credentials: image.credentials.clone(),
+                metadata: Some(metadata),
+                portable_image: None,
+            });
+        }
+        // A missing database in a converted store must never fall back to JSON.
+        if root.join("generations").join((MAX_GENERATIONS + 1).to_string()).try_exists()? {
+            return Err(Error::Invalid("transactional metadata database is missing"));
+        }
+        let snapshot = root.join(metadata_db::SNAPSHOT);
+        if snapshot.try_exists()? {
+            let image = metadata_db::Image::from_file(&snapshot)?;
+            let mut store = Self {
+                root,
+                blobs,
+                generation: image.generation,
+                state: image.state.clone(),
+                credentials: image.credentials.clone(),
+                metadata: None,
+                portable_image: Some(image),
+            };
+            if initialize {
+                let image = store.portable_image.take().ok_or(Error::Integrity)?;
+                store.metadata = Some(metadata_db::MetadataDb::create(&store.root, image)?);
+            }
+            return Ok(store);
+        }
         crate::reject_symlink_ancestors(&root.join("generations"))?;
         if initialize {
             fs::create_dir_all(root.join("generations"))?;
@@ -434,7 +476,7 @@ impl ManagedStore {
                 return Err(Error::Invalid("principal configuration"));
             }
         }
-        let mut store = Self { root, blobs, generation, state, credentials };
+        let mut store = Self { root, blobs, generation, state, credentials, metadata: None, portable_image: None };
         if generation == 0 {
             store.publish(store.state.clone())?;
         }
@@ -459,6 +501,21 @@ impl ManagedStore {
     }
 
     fn publish(&mut self, state: State) -> Result<(), Error> {
+        self.publish_as(state, "system", "import")
+    }
+
+    fn publish_as(&mut self, state: State, actor: &str, operation: &str) -> Result<(), Error> {
+        state.validate()?;
+        if self.portable_image.is_some() {
+            return Err(Error::Invalid("immutable portable metadata snapshot"));
+        }
+        if let Some(database) = &mut self.metadata {
+            let image = database.image.next(state.clone(), actor, operation)?;
+            database.commit(image)?;
+            self.generation = database.image.generation;
+            self.state = state;
+            return Ok(());
+        }
         let next = self.generation.checked_add(1).filter(|n| *n <= MAX_GENERATIONS).ok_or(Error::Invalid("metadata generation quota"))?;
         let bytes = serde_json::to_vec(&state)?;
         if bytes.len() > MAX_STATE {
@@ -484,6 +541,20 @@ impl ManagedStore {
         fs::rename(&staging, self.root.join("generations").join(next.to_string()))?;
         self.state = state;
         self.generation = next;
+        Ok(())
+    }
+
+    pub(crate) fn database_snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
+        self.metadata.as_ref().map(|metadata| metadata.image.bytes()).transpose()
+    }
+
+    /// Only used after restoring a verified backup into a freshly reserved path.
+    pub(crate) fn convert_restored_to_database(&mut self) -> Result<(), Error> {
+        if self.metadata.is_some() {
+            return Ok(());
+        }
+        let image = metadata_db::Image::imported(self.generation, self.state.clone(), self.credentials.clone())?;
+        self.metadata = Some(metadata_db::MetadataDb::create(&self.root, image)?);
         Ok(())
     }
 
@@ -523,7 +594,7 @@ impl ManagedStore {
             CatalogEntry { document: document.clone(), logical_path, head: None, head_checked_in_unix_ms: None, head_author: None, checkout: None };
         let mut state = self.state.clone();
         state.documents.insert(document, entry.clone());
-        self.publish(state)?;
+        self.publish_as(state, &principal.id, "create")?;
         Ok(entry)
     }
 
@@ -548,7 +619,7 @@ impl ManagedStore {
         let token = crate::AuthToken::generate()?;
         state.checkout_tokens.insert(document.into(), token.clone());
         state.documents.insert(document.into(), entry.clone());
-        self.publish(state)?;
+        self.publish_as(state, &principal.id, "checkout")?;
         Ok(CheckoutGrant { entry, token })
     }
 
@@ -577,7 +648,7 @@ impl ManagedStore {
         let mut state = self.state.clone();
         state.checkout_tokens.remove(document);
         state.documents.insert(document.into(), entry.clone());
-        self.publish(state)?;
+        self.publish_as(state, &principal.id, "cancel_checkout")?;
         Ok(entry)
     }
 
@@ -658,7 +729,7 @@ impl ManagedStore {
         state.documents.insert(input.document, entry);
         state.versions.push(version.clone());
         state.receipts.insert(input.request_id, Receipt { owner: principal.id.clone(), fingerprint, version: version.clone() });
-        self.publish(state)?;
+        self.publish_as(state, &principal.id, "check_in")?;
         Ok(version)
     }
 

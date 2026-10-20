@@ -196,6 +196,43 @@ fn older_catalog_entries_without_optional_head_metadata_remain_readable() {
 }
 
 #[test]
+fn redb_import_preserves_pinned_graph_and_independent_future_heads() {
+    let temp = Temp::new();
+    let alice = user("alice");
+    let source = temp.0.join("source");
+    let mut store = Store::open(&source).unwrap();
+    let part = create(&mut store, &alice, "parts/widget.solidcraft");
+    let grant = checkout(&mut store, &alice, &part.document, "ws");
+    let part_v1 = committed(store.execute_as(Request::ManagedCheckIn { input: input(&grant, "part-v1") }, &alice));
+    let assembly = create(&mut store, &alice, "assembly.solidcraft");
+    let grant = checkout(&mut store, &alice, &assembly.document, "ws");
+    let mut assembly_input = input(&grant, "assembly-v1");
+    assembly_input.dependencies = vec![part_v1.version.reference.clone()];
+    let assembly_v1 = committed(store.execute_as(Request::ManagedCheckIn { input: assembly_input }, &alice));
+    let backup = temp.0.join("backup");
+    store.backup(&backup).unwrap();
+    drop(store);
+    let target = temp.0.join("database");
+    solidcraft_pdm::backup_restore::restore_backup_to_redb(&backup, &target).unwrap();
+    let mut store = Store::open(&target).unwrap();
+    let grant = checkout(&mut store, &alice, &part.document, "ws");
+    let mut next = input(&grant, "part-v2");
+    next.content = b"changed part".to_vec();
+    let part_v2 = committed(store.execute_as(Request::ManagedCheckIn { input: next }, &alice));
+    assert_eq!(part_v2.version.reference.version, 2);
+    drop(store);
+    let mut store = Store::open(&target).unwrap();
+    let (version, _) = store.download(&assembly_v1.version.reference).unwrap();
+    assert_eq!(version.dependencies, vec![part_v1.version.reference.clone()]);
+    assert_eq!(store.download(&part_v1.version.reference).unwrap().1, b"public toy design");
+    assert!(matches!(store.execute_as(Request::WhereUsed { reference: part_v1.version.reference }, &alice),
+        Response::WhereUsed { versions } if versions == vec![assembly_v1.version.reference]));
+    drop(store);
+    assert!(!source.join("managed/metadata.redb").exists());
+    assert!(solidcraft_pdm::backup_restore::verify_backup(&backup).is_ok());
+}
+
+#[test]
 fn managed_writes_cannot_bypass_checkout_through_legacy_api_or_viewer_role() {
     let temp = Temp::new();
     let alice = user("alice");

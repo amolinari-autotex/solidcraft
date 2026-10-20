@@ -55,6 +55,7 @@ fn allowed(path: &str) -> bool {
             document.strip_prefix("d-").is_some_and(crate::valid_id) && number(version) && matches!(*file, "content" | "version.json")
         }
         ["managed", "generations", generation, "state.json"] => number(generation),
+        ["managed", "metadata-snapshot.json"] => true,
         _ => false,
     }
 }
@@ -94,6 +95,12 @@ fn collect(
         }
         let relative =
             item.path().strip_prefix(root).map_err(|_| Error::Integrity)?.to_str().ok_or(Error::Invalid("backup path encoding"))?.replace('\\', "/");
+        if ignore_uncommitted
+            && root.join("managed/metadata.redb").try_exists()?
+            && matches!(relative.as_str(), "managed/metadata.redb" | "managed/generations" | "managed-principals.json")
+        {
+            continue;
+        }
         // Unpublished stages and the process lock are not part of a committed snapshot.
         if ignore_uncommitted
             && (relative == "writer.lock"
@@ -193,6 +200,18 @@ impl Store {
             crate::write_synced(&target, &bytes)?;
             files.push(BackupFile { path, bytes: bytes.len() as u64, sha256: digest(&bytes) });
         }
+        // Export the committed logical aggregate, never copy an open redb file.
+        // The store lock and immutable borrow exclude domain mutations throughout.
+        if let Some(bytes) = self.managed.database_snapshot()? {
+            total = total.checked_add(bytes.len() as u64).ok_or(Error::Invalid("backup size quota"))?;
+            if total > MAX_BYTES {
+                return Err(Error::Invalid("backup size quota"));
+            }
+            let path = "managed/metadata-snapshot.json".to_owned();
+            fs::create_dir_all(data.join("managed"))?;
+            crate::write_synced(&data.join(&path), &bytes)?;
+            files.push(BackupFile { path, bytes: bytes.len() as u64, sha256: digest(&bytes) });
+        }
         // Never copy a local managed/blobs cache. The active provider is the only
         // authority for both referenced bytes and complete published orphan blobs.
         fs::create_dir_all(data.join("managed/blobs"))?;
@@ -272,7 +291,7 @@ fn manifest(root: &Path) -> Result<(Manifest, Vec<u8>), Error> {
             return Err(Error::Invalid("backup size quota"));
         }
     }
-    if !manifest.files.iter().any(|file| file.path.starts_with("managed/generations/")) {
+    if !manifest.files.iter().any(|file| file.path.starts_with("managed/generations/") || file.path == "managed/metadata-snapshot.json") {
         return Err(Error::Integrity);
     }
     Ok((manifest, bytes))
@@ -311,6 +330,10 @@ pub fn verify_backup(root: &Path) -> Result<BackupReceipt, Error> {
 /// Restore only to a new directory, leaving the source and existing stores untouched.
 /// A failed/interrupted restore remains marked and cannot be opened as a service store.
 pub fn restore_backup(source: &Path, destination: &Path) -> Result<BackupReceipt, Error> {
+    restore_backup_inner(source, destination, false)
+}
+
+fn restore_backup_inner(source: &Path, destination: &Path, database: bool) -> Result<BackupReceipt, Error> {
     let receipt = verify_backup(source)?; // Reject corrupt/unbounded input before destination creation.
     let (manifest, _) = manifest(source)?;
     new_private_directory(destination)?;
@@ -327,11 +350,22 @@ pub fn restore_backup(source: &Path, destination: &Path) -> Result<BackupReceipt
         crate::write_synced(&target, &bytes)?;
     }
     let managed = crate::managed::ManagedStore::open(destination)?;
-    let store = Store { root: destination.to_path_buf(), _lock: lock, managed };
+    let mut store = Store { root: destination.to_path_buf(), _lock: lock, managed };
     verify_domain(&store)?;
     if store.managed.catalog().server_id != receipt.server_id {
         return Err(Error::Integrity);
     }
+    // Keep the same writer lock and incomplete-restore fence throughout the
+    // conversion. A failed/aborted import must never expose a usable JSON store.
+    if database {
+        store.managed.convert_restored_to_database()?;
+    }
     fs::remove_file(destination.join("restore.pending"))?;
     Ok(receipt)
+}
+
+/// Explicit JSON-to-database import, only via a verified backup and new directory.
+/// A failed conversion preserves its destination for diagnosis; never retry in place.
+pub fn restore_backup_to_redb(source: &Path, destination: &Path) -> Result<BackupReceipt, Error> {
+    restore_backup_inner(source, destination, true)
 }

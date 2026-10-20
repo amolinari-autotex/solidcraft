@@ -46,6 +46,144 @@ fn enroll(config: &DeploymentConfig) -> (String, String) {
     .unwrap();
     (receipt.server_id, bearer)
 }
+
+#[test]
+fn explicit_redb_restore_uses_a_new_destination_and_preserves_identity() {
+    let root = Temp::new();
+    let config = config(&root);
+    let (id, bearer) = enroll(&config);
+    let backup = root.0.join("backup");
+    Store::open(&config.store).unwrap().backup(&backup).unwrap();
+    let destination = root.0.join("database-store");
+    let output = Command::new(env!("CARGO_BIN_EXE_solidcraft-pdm")).args(["restore-redb"]).arg(&backup).arg(&destination).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(destination.join("managed/metadata.redb").is_file());
+    assert!(!config.store.join("managed/metadata.redb").exists());
+    let mut migrated_config = config;
+    migrated_config.store = destination.clone();
+    let server = start_loopback_rehearsal(migrated_config).unwrap();
+    let client = Client::https_with_ca(&format!("https://127.0.0.1:{}", server.receipt().address.port()), AuthToken::parse(bearer).unwrap(), CA)
+        .unwrap()
+        .bind_server(&id)
+        .unwrap();
+    assert_eq!(client.managed_catalog().unwrap().server_id, id);
+    server.shutdown().unwrap();
+    let retry = Command::new(env!("CARGO_BIN_EXE_solidcraft-pdm")).arg("restore-redb").arg(&backup).arg(&destination).output().unwrap();
+    assert!(!retry.status.success());
+    assert!(solidcraft_pdm::backup_restore::verify_backup(&backup).is_ok());
+}
+
+#[test]
+fn failed_redb_conversion_keeps_the_entire_restore_fenced() {
+    let root = Temp::new();
+    let config = config(&root);
+    enroll(&config);
+    let registry = config.store.join("managed-principals.json");
+    let mut accounts: Vec<solidcraft_pdm::managed::PrincipalCredential> = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+    // Legacy validation accepts differently cased hashes; the new adapter
+    // rejects this ambiguous normalized duplicate before database publication.
+    let mut duplicate = accounts.first().unwrap().clone();
+    duplicate.principal.id = "other-admin".into();
+    duplicate.token_sha256 = duplicate.token_sha256.to_ascii_uppercase();
+    accounts.push(duplicate);
+    fs::write(registry, serde_json::to_vec(&accounts).unwrap()).unwrap();
+    let backup = root.0.join("backup");
+    Store::open(&config.store).unwrap().backup(&backup).unwrap();
+    let destination = root.0.join("failed-import");
+    assert!(solidcraft_pdm::backup_restore::restore_backup_to_redb(&backup, &destination).is_err());
+    assert!(destination.join("restore.pending").is_file());
+    assert!(!destination.join("managed/metadata.redb").exists());
+    assert!(Store::open(&destination).is_err());
+    assert!(Store::open(&config.store).is_ok());
+    assert!(solidcraft_pdm::backup_restore::verify_backup(&backup).is_ok());
+}
+
+#[test]
+fn redb_https_preserves_checkout_receipts_roles_audit_and_logical_backup() {
+    let root = Temp::new();
+    let config = config(&root);
+    let (id, bearer) = enroll(&config);
+    let viewer_token = AuthToken::generate().unwrap();
+    let registry_path = config.store.join("managed-principals.json");
+    let mut registry: Vec<solidcraft_pdm::managed::PrincipalCredential> = serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    use sha2::{Digest, Sha256};
+    registry.push(solidcraft_pdm::managed::PrincipalCredential {
+        principal: solidcraft_pdm::managed::Principal { id: "reader".into(), role: solidcraft_pdm::managed::Role::Viewer },
+        token_sha256: format!("{:x}", Sha256::digest(viewer_token.as_bytes())),
+    });
+    fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    let backup = root.0.join("seed-backup");
+    Store::open(&config.store).unwrap().backup(&backup).unwrap();
+    let destination = root.0.join("database-store");
+    let output = Command::new(env!("CARGO_BIN_EXE_solidcraft-pdm")).arg("restore-redb").arg(&backup).arg(&destination).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let mut db_config = config;
+    db_config.store = destination.clone();
+    let server = start_loopback_rehearsal(DeploymentConfig {
+        store: destination.clone(),
+        bind: db_config.bind,
+        certificate_chain: db_config.certificate_chain.clone(),
+        private_key: db_config.private_key.clone(),
+    })
+    .unwrap();
+    let connect = |port, token: &str| {
+        Client::https_with_ca(&format!("https://127.0.0.1:{port}"), AuthToken::parse(token.into()).unwrap(), CA).unwrap().bind_server(&id).unwrap()
+    };
+    let client = connect(server.receipt().address.port(), &bearer);
+    let viewer = connect(server.receipt().address.port(), &viewer_token);
+    assert!(viewer.managed_create("denied.solidcraft".into()).is_err());
+    assert!(viewer.managed_catalog().unwrap().entries.is_empty());
+    let part = client.managed_create("parts/toy.solidcraft".into()).unwrap();
+    let grant = client.managed_checkout(part.document.clone(), "ws".into(), "machine".into()).unwrap();
+    server.shutdown().unwrap();
+    // The database, not a later edited JSON registry, is authoritative after import.
+    registry.last_mut().unwrap().principal.role = solidcraft_pdm::managed::Role::Administrator;
+    fs::write(destination.join("managed-principals.json"), serde_json::to_vec(&registry).unwrap()).unwrap();
+    let server = start_loopback_rehearsal(DeploymentConfig {
+        store: destination.clone(),
+        bind: db_config.bind,
+        certificate_chain: db_config.certificate_chain.clone(),
+        private_key: db_config.private_key.clone(),
+    })
+    .unwrap();
+    let client = connect(server.receipt().address.port(), &bearer);
+    let viewer = connect(server.receipt().address.port(), &viewer_token);
+    assert!(viewer.managed_create("still-denied.solidcraft".into()).is_err());
+    let resumed = client.managed_resume_checkout(part.document.clone(), "ws".into(), "machine".into()).unwrap();
+    assert_eq!(resumed.token, grant.token);
+    let input = ManagedCheckIn {
+        document: part.document.clone(),
+        workspace: "ws".into(),
+        machine: "machine".into(),
+        checkout_token: grant.token,
+        request_id: "database-first".into(),
+        parent: None,
+        content: b"version one".to_vec(),
+        dependencies: vec![],
+        comment: "database test".into(),
+    };
+    let version = client.managed_check_in(input.clone()).unwrap();
+    assert_eq!(client.managed_check_in(input.clone()).unwrap(), version);
+    server.shutdown().unwrap();
+    let db_backup = root.0.join("db-backup");
+    Store::open(&destination).unwrap().backup(&db_backup).unwrap();
+    let image_path = db_backup.join("data/managed/metadata-snapshot.json");
+    let image: serde_json::Value = serde_json::from_slice(&fs::read(&image_path).unwrap()).unwrap();
+    assert_eq!(image["audit"].as_array().unwrap().len(), 4);
+    assert_eq!(image["audit"][3]["operation"], "check_in");
+    assert_eq!(image["audit"][3]["actor"], "admin");
+    assert!(!serde_json::to_string(&image["audit"]).unwrap().contains(&bearer));
+    let restored = root.0.join("restored");
+    solidcraft_pdm::backup_restore::restore_backup(&db_backup, &restored).unwrap();
+    assert!(restored.join("managed/metadata.redb").exists());
+    db_config.store = restored;
+    let server = start_loopback_rehearsal(db_config).unwrap();
+    let client = connect(server.receipt().address.port(), &bearer);
+    assert_eq!(client.managed_check_in(input).unwrap(), version);
+    assert_eq!(client.download(&version.version.reference).unwrap().1, b"version one");
+    assert_eq!(client.managed_history(part.document).unwrap().len(), 1);
+    server.shutdown().unwrap();
+}
 #[test]
 fn enrolled_service_rehearsal_publishes_and_reopens_the_same_identity_and_content() {
     let root = Temp::new();

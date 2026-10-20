@@ -44,6 +44,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::to_writer_pretty(io::stdout().lock(), &receipt)?;
             println!();
         }
+        Some("restore-redb") if args.len() == 4 => {
+            let receipt = solidcraft_pdm::backup_restore::restore_backup_to_redb(Path::new(argument(2)?), Path::new(argument(3)?))?;
+            serde_json::to_writer_pretty(io::stdout().lock(), &receipt)?;
+            println!();
+        }
         Some("verify-backup") if args.len() == 3 => {
             let receipt = solidcraft_pdm::backup_restore::verify_backup(Path::new(argument(2)?))?;
             serde_json::to_writer_pretty(io::stdout().lock(), &receipt)?;
@@ -96,7 +101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::to_writer_pretty(io::stdout().lock(), &snapshot)?;
             println!();
         }
-        _ => return Err("usage: solidcraft-pdm token | serve STORE PORT | rehearse-https CONFIG | backup STORE NEW_BACKUP | restore BACKUP NEW_STORE | verify-backup BACKUP | request PORT | list PORT [DOCUMENT] | check-in PORT DOCUMENT PARENT_OR_- FILE [DEPENDENCIES_JSON] | retrieve PORT DOCUMENT VERSION NEW_DIRECTORY".into()),
+        _ => return Err("usage: solidcraft-pdm token | serve STORE PORT | rehearse-https CONFIG | backup STORE NEW_BACKUP | restore BACKUP NEW_STORE | restore-redb BACKUP NEW_STORE | verify-backup BACKUP | request PORT | list PORT [DOCUMENT] | check-in PORT DOCUMENT PARENT_OR_- FILE [DEPENDENCIES_JSON] | retrieve PORT DOCUMENT VERSION NEW_DIRECTORY".into()),
     }
     Ok(())
 }
