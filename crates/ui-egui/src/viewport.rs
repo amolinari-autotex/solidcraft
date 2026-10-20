@@ -215,7 +215,7 @@ pub struct ViewportState {
     pub(crate) occurrence_drag: Option<crate::occurrence_drag::Drag>,
     /// Extrude by pulling a face or profile.
     pub(crate) drag_extrude: crate::drag_extrude::State,
-    /// The plane the grid was last drawn on while Preferences â–¸ Grid follows the view is on
+    /// The plane the grid was last drawn on while Preferences ▸ Grid follows the view is on
     /// (#1470), kept so the choice is hysteretic near the thresholds (#1993).
     pub(crate) grid_plane: std::sync::Mutex<GridPlane>,
 }
@@ -292,7 +292,7 @@ fn display_proj(app: &SolveApp) -> Proj {
     projection(app, app.viewport.rect.unwrap_or_else(|| Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))))
 }
 
-/// World â†” screen mapping for the current frame.
+/// World ↔ screen mapping for the current frame.
 #[derive(Clone, Copy)]
 pub struct Proj {
     pub cam: Camera,
@@ -1869,7 +1869,7 @@ pub(crate) fn sketch_segments(pts: &[Vec3], mode: u8, unit: f64) -> Vec<(Vec3, V
     }
 }
 
-/// The drawn pieces of a polyline in a dash pattern (on, off, on, offâ€¦ lengths).
+/// The drawn pieces of a polyline in a dash pattern (on, off, on, off… lengths).
 pub(crate) fn dashes(pts: &[Vec3], pattern: &[f64]) -> Vec<(Vec3, Vec3)> {
     let mut out = Vec::new();
     if pattern.is_empty() || pattern.iter().any(|l| !(l.is_finite() && *l > 0.0)) {
@@ -2166,7 +2166,7 @@ pub(crate) fn ray_box(o: Vec3, d: Vec3, b: &solidcraft_engine::geom::Aabb3, pad:
     (t0 <= t1).then_some(t0)
 }
 
-/// The point of segment `a`â€“`b` nearest the ray from `o` along `d`.
+/// The point of segment `a`–`b` nearest the ray from `o` along `d`.
 pub(crate) fn ray_segment_closest(o: Vec3, d: Vec3, a: Vec3, b: Vec3) -> Vec3 {
     let u = b - a;
     let w = a - o;
@@ -2336,7 +2336,8 @@ impl<T: PartialOrd + Copy> Near<T> {
 }
 
 fn interaction_state(app: &SolveApp) -> std::sync::Arc<solidcraft_engine::doc::ModelState> {
-    if app.preview.draw_active()
+    if app.preview.active
+        && !app.preview.rolled_back
         && let Some(interaction) = &app.preview.interaction
     {
         return interaction.state.clone();
@@ -2345,7 +2346,7 @@ fn interaction_state(app: &SolveApp) -> std::sync::Arc<solidcraft_engine::doc::M
 }
 
 fn interaction_session(app: &SolveApp) -> Option<solidcraft_engine::Session> {
-    if !app.preview.draw_active() {
+    if !(app.preview.active && !app.preview.rolled_back) {
         return None;
     }
     let interaction = app.preview.interaction.as_ref()?;
@@ -2812,7 +2813,7 @@ fn selected_sketches(app: &SolveApp, items: &[Sel]) -> Vec<u64> {
 }
 
 fn displayed_selection(app: &SolveApp, item: &Sel) -> Vec<Sel> {
-    if app.preview.draw_active() && app.preview.interaction.is_some() && matches!(item, Sel::Face { .. } | Sel::Edge { .. }) {
+    if app.preview.active && !app.preview.rolled_back && app.preview.interaction.is_some() && matches!(item, Sel::Face { .. } | Sel::Edge { .. }) {
         return vec![item.clone()];
     }
     match item {
@@ -2936,9 +2937,9 @@ fn analysis_legend(app: &SolveApp, painter: &egui::Painter, rect: Rect) {
             tr("Draft Analysis"),
             Some(format!("{} {}", tr("Pull direction"), dir(pull))),
             vec![
-                (col(a.draft[0]), format!("â‰¥ {angle:.1}Â°"), false),
-                (col(a.draft[1]), format!("âˆ’{angle:.1}Â° â€¦ {angle:.1}Â°"), false),
-                (col(a.draft[2]), format!("â‰¤ âˆ’{angle:.1}Â°"), a.hatch),
+                (col(a.draft[0]), format!("≥ {angle:.1}°"), false),
+                (col(a.draft[1]), format!("−{angle:.1}° … {angle:.1}°"), false),
+                (col(a.draft[2]), format!("≤ −{angle:.1}°"), a.hatch),
             ],
         ),
         Some(A::Access { dir: d }) => (
@@ -2953,7 +2954,7 @@ fn analysis_legend(app: &SolveApp, painter: &egui::Painter, rect: Rect) {
             vec![
                 (col(a.curvature[0]), tr("ui.flat").to_string(), false),
                 (col(a.curvature[1]), format!("{} {}", tr("Radius"), crate::prefs::show_mm(app, 2.0 * radius, 1)), false),
-                (col(a.curvature[2]), format!("{} â‰¤ {}", tr("Radius"), crate::prefs::show_mm(app, radius, 1)), false),
+                (col(a.curvature[2]), format!("{} ≤ {}", tr("Radius"), crate::prefs::show_mm(app, radius, 1)), false),
             ],
         ),
         _ => return,
@@ -3139,7 +3140,8 @@ pub(crate) fn dialog_pick(app: &mut SolveApp, hit: &Hit, sel: Sel) {
     if crate::dialogs_assembly::alignment_dialog(&d)
         && matches!(&d.kind, crate::dialogs::Kind::Assembly(crate::dialogs_assembly::Asm::Joint(f)) if f.editing.is_none())
         && d.active < 2
-        && app.preview.draw_active()
+        && app.preview.active
+        && !app.preview.rolled_back
         && let Some(interaction) = &app.preview.interaction
     {
         match &mut sel {
@@ -4953,7 +4955,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         painter.text(
             at - vec2(0.0, 12.0),
             Align2::CENTER_BOTTOM,
-            "Saved sketch plane â€” attachment lost",
+            "Saved sketch plane — attachment lost",
             FontId::proportional(t.font_body),
             Tokens::view().warning,
         );
@@ -5031,7 +5033,7 @@ fn agent_chip(app: &mut SolveApp, ui: &egui::Ui, view: Rect, taken: &[Rect]) -> 
     if let Some((since, label)) = app.agent_computing() {
         let seconds = ((crate::now_ms() - since) / 1000.0).floor().max(0.0);
         let computing = crate::i18n::format("dialog.computing", &[("seconds", &format!("{seconds:.0}"))]);
-        let galley = painter.layout_no_wrap(format!("{label} Â· {computing}"), FontId::proportional(t.font_label), t.text);
+        let galley = painter.layout_no_wrap(format!("{label} · {computing}"), FontId::proportional(t.font_label), t.text);
         let stop = painter.layout_no_wrap(crate::i18n::tr("ui.agent_chat_stop").to_string(), FontId::proportional(t.font_label), t.text);
         let size = vec2(galley.size().x + stop.size().x + 54.0, galley.size().y.max(stop.size().y) + 8.0);
         // Above the navigation bar while it sits on the bottom edge; a bar on top leaves the bottom free.
@@ -6746,16 +6748,16 @@ mod tests {
         use crate::gpu::supersampled_size;
         assert_eq!(supersampled_size([1920.0, 1080.0], 2.0, 16384, 1), Some([3840, 2160]));
         assert_eq!(supersampled_size([1920.0, 1080.0], 1.5, 16384, 1), Some([2880, 1620]));
-        // A 4096 texture limit: a 2560 px wide view gets 1.6Ã—.
+        // A 4096 texture limit: a 2560 px wide view gets 1.6×.
         let [w, h] = supersampled_size([2560.0, 1440.0], 2.0, 4096, 1).unwrap();
         assert!((4095..=4096).contains(&w) && (2303..=2304).contains(&h), "{w} x {h}");
-        // Under 1.25Ã— is not worth it: drawn as usual.
+        // Under 1.25× is not worth it: drawn as usual.
         assert_eq!(supersampled_size([3840.0, 2160.0], 2.0, 4096, 1), None);
         assert_eq!(supersampled_size([1920.0, 1080.0], 1.0, 16384, 1), None);
         assert_eq!(supersampled_size([0.0, 1080.0], 2.0, 16384, 1), None);
         // Under 1: drawn smaller and filtered up (the product preview past its budget, #1464).
         assert_eq!(supersampled_size([3840.0, 2160.0], 0.5, 4096, 4), Some([1920, 1080]));
-        // 4Ã— MSAA at 1440p: the memory budget caps it below 2Ã—.
+        // 4× MSAA at 1440p: the memory budget caps it below 2×.
         let [w, h] = supersampled_size([2560.0, 1440.0], 2.0, 16384, 4).unwrap();
         assert!(w < 5120 && w as f32 >= 2560.0 * 1.25 && u64::from(w) * u64::from(h) * 32 <= 384 << 20, "{w} x {h}");
     }
@@ -6993,7 +6995,7 @@ mod tests {
         assert!(checked >= 3, "{checked} faces seen lit");
     }
 
-    /// Saves a failing pixel test's pictures (straight RGBA, `size` Ã— `size`) as PNGs in a folder
+    /// Saves a failing pixel test's pictures (straight RGBA, `size` × `size`) as PNGs in a folder
     /// of their own under the temporary folder, and says where.
     #[cfg(not(target_arch = "wasm32"))]
     fn keep_failed_pictures(name: &str, pictures: &[(&str, &Vec<u8>)], size: u32) -> String {
@@ -7623,7 +7625,7 @@ mod tests {
     }
 
     /// Manual GPU benchmark: 25 placements of the mesh `SOLIDCRAFT_BENCH_MESH` (an STL, OBJ or
-    /// 3MF) drawn offscreen at 3600 Ã— 2190 px (divided by `SOLIDCRAFT_BENCH_DIV`) with 4Ã— MSAA
+    /// 3MF) drawn offscreen at 3600 × 2190 px (divided by `SOLIDCRAFT_BENCH_DIV`) with 4× MSAA
     /// while the camera turns, each frame waited for: the placements' own triangles (`merged`, as
     /// before instancing) and as instances. Prints the median frame time of each.
     #[cfg(not(target_arch = "wasm32"))]
@@ -7824,7 +7826,7 @@ mod tests {
     #[test]
     fn a_large_meshs_shared_vertices_are_made_ahead_of_its_first_scene() {
         use solidcraft_engine::doc::{Document, FeatureKind, MeshData};
-        // A flat grid of 160 Ã— 160 squares: 51 200 triangles, each corner its own vertex.
+        // A flat grid of 160 × 160 squares: 51 200 triangles, each corner its own vertex.
         let n = 160u32;
         let corners: Vec<[u32; 2]> =
             (0..n).flat_map(|j| (0..n).flat_map(move |i| [[i, j], [i + 1, j], [i + 1, j + 1], [i, j], [i + 1, j + 1], [i, j + 1]])).collect();
@@ -9665,7 +9667,7 @@ mod tests {
         h.call("ui.move", json!({"x":800,"y":500}));
         let gesture =
             |phase| egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(60.0, -40.0), modifiers: egui::Modifiers::NONE, phase };
-        // A bracketed trackpad gesture pans (measured macOS Startâ€¦End bracketing).
+        // A bracketed trackpad gesture pans (measured macOS Start…End bracketing).
         let before = h.app.cam;
         h.app.synthetic.push(gesture(egui::TouchPhase::Start));
         h.frame();
@@ -9678,7 +9680,7 @@ mod tests {
         let after = h.app.cam;
         h.frames(30);
         assert_eq!(h.app.cam, after, "pan must not drift once input stops");
-        // Bare moves are a mouse: vertical zoomsâ€¦
+        // Bare moves are a mouse: vertical zooms…
         h.app.preferences.smooth_wheel_zoom = false;
         h.app.synthetic.push(egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
@@ -9688,7 +9690,7 @@ mod tests {
         });
         h.frame();
         assert!((h.app.cam.half_height() - after.half_height() * (-0.18_f64).exp()).abs() < 1e-6);
-        // â€¦and horizontal pans without zooming (thumb wheel).
+        // …and horizontal pans without zooming (thumb wheel).
         let zoomed = h.app.cam;
         h.app.synthetic.push(egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
@@ -10486,7 +10488,7 @@ mod tests {
             (-45.01, -90.0),
         ] {
             let got = nearest_quarter_turn(f64::to_radians(from)).to_degrees();
-            assert!((got - to).abs() < 1e-9, "{from}Â° â†’ {got}Â°, expected {to}Â°");
+            assert!((got - to).abs() < 1e-9, "{from}° → {got}°, expected {to}°");
         }
         assert_eq!(nearest_quarter_turn(f64::NAN), 0.0);
         assert_eq!(nearest_quarter_turn(f64::INFINITY), 0.0);
@@ -10980,12 +10982,12 @@ mod grid_plane_tests {
     /// away from a wall before it goes back, so a view wobbling at the threshold does not flicker.
     #[test]
     fn the_grid_plane_thresholds_have_hysteresis() {
-        // 9Â°: edge-on enough to enter the wall.
+        // 9°: edge-on enough to enter the wall.
         assert_eq!(grid_plane(back_at(0.0, 9.0), GridPlane::Ground), GridPlane::Xz);
-        // 12Â°: past the entering limit, but not enough to leave a wall the grid is already on.
+        // 12°: past the entering limit, but not enough to leave a wall the grid is already on.
         assert_eq!(grid_plane(back_at(0.0, 12.0), GridPlane::Ground), GridPlane::Ground);
         assert_eq!(grid_plane(back_at(0.0, 12.0), GridPlane::Xz), GridPlane::Xz);
-        // 16Â°: clearly off the ground, so even a wall goes back.
+        // 16°: clearly off the ground, so even a wall goes back.
         assert_eq!(grid_plane(back_at(0.0, 16.0), GridPlane::Xz), GridPlane::Ground);
         // Below the ground the same, and a view straight down stays on the ground.
         assert_eq!(grid_plane(back_at(30.0, -12.0), GridPlane::Yz), GridPlane::Yz);
@@ -10994,7 +10996,7 @@ mod grid_plane_tests {
     }
 
     /// #1993: orbiting at a low elevation keeps the wall until a side view is near; the other
-    /// wall takes over only there, never at the 45Â° crossing.
+    /// wall takes over only there, never at the 45° crossing.
     #[test]
     fn a_low_orbit_switches_walls_only_near_a_side_view() {
         let low = |yaw_deg: f64| back_at(yaw_deg, 3.0);
@@ -11003,7 +11005,7 @@ mod grid_plane_tests {
         assert_eq!(grid_plane(low(50.0), GridPlane::Ground), GridPlane::Yz);
         // A wall is kept across the crossing and only changes near the side view it faces.
         assert_eq!(grid_plane(low(44.0), GridPlane::Xz), GridPlane::Xz);
-        assert_eq!(grid_plane(low(50.0), GridPlane::Xz), GridPlane::Xz, "no swap at the 45Â° crossing");
+        assert_eq!(grid_plane(low(50.0), GridPlane::Xz), GridPlane::Xz, "no swap at the 45° crossing");
         assert_eq!(grid_plane(low(70.0), GridPlane::Xz), GridPlane::Xz);
         assert_eq!(grid_plane(low(80.0), GridPlane::Xz), GridPlane::Yz, "the Left view's wall takes over near it");
         assert_eq!(grid_plane(low(10.0), GridPlane::Yz), GridPlane::Xz, "the Front view's wall takes over near it");

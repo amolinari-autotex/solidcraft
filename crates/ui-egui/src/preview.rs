@@ -377,7 +377,7 @@ fn stream_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option
 /// take finished results. Called once per frame.
 pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
     crate::dialogs_assembly::update_alignment_order(app);
-    app.preview.retain_joint_pose = app.dialog.as_ref().is_some_and(crate::dialogs_assembly::alignment_dialog);
+    app.preview.retain_joint_pose = app.dialog.as_ref().is_some_and(|d| d.preview_enabled && crate::dialogs_assembly::alignment_dialog(d));
     let mut cmds = match app.dialog.as_ref().filter(|d| d.previews() && d.preview_enabled).map(|d| crate::dialogs::preview_commands(app, d)) {
         Some(Ok(c)) if !c.is_empty() => c,
         _ if crate::sketch_attachment_ui::commands(app).is_some() => crate::sketch_attachment_ui::commands(app).unwrap_or_default(),
@@ -1250,7 +1250,7 @@ mod tests {
         s.execute("occurrence.move", &json!({"occurrence": made["occurrence"], "axis": [1, 0, 0], "angle": "90 deg"})).unwrap();
         s.execute("component.activate", &json!({"component": made["component"], "occurrence": made["occurrence"], "path": [made["occurrence"]]}))
             .unwrap();
-        // Shown lying flat: 20 Ã— 30, 8 high. Its top face pulled up 10.
+        // Shown lying flat: 20 × 30, 8 high. Its top face pulled up 10.
         let cmd = ("solid.extrude".to_string(), json!({"face": [10, 15, 8], "face_body": "Plate", "distance": "10 mm", "operation": "join"}));
         let b = compute_tool(&s, &[cmd], colors()).unwrap().bounds;
         assert!((b.max.z - 18.0).abs() < 1e-6 && (b.max.y - 30.0).abs() < 1e-6, "on top, not at right angles: {b:?}");
@@ -1319,7 +1319,7 @@ mod tests {
         m.triangles.iter().filter_map(|t| m.tri(t)).any(|[a, b, c]| point_triangle_dist(p, a, b, c) < tol)
     }
 
-    /// A flat sheet of `n Ã— n` squares, two triangles and one face each, lifted by `z`.
+    /// A flat sheet of `n × n` squares, two triangles and one face each, lifted by `z`.
     fn sheet(n: usize, z: f64) -> Mesh {
         let mut m = Mesh::default();
         for i in 0..=n {
@@ -1352,7 +1352,7 @@ mod tests {
         assert!(SurfaceIndex::new(&Mesh::default()).is_none());
     }
 
-    /// How long the faces of a sheet of `n Ã— n` squares take to classify against an old sheet of
+    /// How long the faces of a sheet of `n × n` squares take to classify against an old sheet of
     /// the same size. The meshes are built before the clock starts and the faces are collected
     /// before it stops: only the classification, the work that used to freeze the app, is measured.
     fn classify_sheet(n: usize) -> std::time::Duration {
