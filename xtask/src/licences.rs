@@ -1,7 +1,7 @@
 //! `cargo xtask licences [--check]`: THIRD-PARTY-LICENSES.txt, the licences of every crate built
-//! into the shipped programs (solidcraft, solidcraft-cli, solidcraft-web), read from
-//! `cargo metadata` and the crates' own licence files. The programs embed it (Help ▸ About ▸
-//! Licences, `solidcraft-cli licences`), so a release download needs no licence files beside it.
+//! into the shipped CAD and PDM programs, read from
+//! `cargo metadata` and the crates' own licence files. The CAD programs embed it (Help ▸ About ▸
+//! Licences, `solidcraft-cli licences`); standalone PDM packages include it beside the executable.
 //! `--check` (part of `cargo xtask ci`) generates it without writing it: it fails when the
 //! dependency graph can't be read, and only reports a file that is out of date, since pull
 //! requests leave it to the Generated files workflow (`.github/workflows/generated.yml`), which
@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::cargo;
 
 pub const FILE: &str = "THIRD-PARTY-LICENSES.txt";
-const ROOTS: &[&str] = &["solidcraft", "solidcraft-cli", "solidcraft-web"];
+const ROOTS: &[&str] = &["solidcraft", "solidcraft-cli", "solidcraft-web", "solidcraft-pdm", "solidcraft-pdm-admin"];
 
 pub fn run(root: &Path, check: bool) -> Result<(), String> {
     let text = generate(root)?;

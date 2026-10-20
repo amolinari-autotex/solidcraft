@@ -4501,6 +4501,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "solidcraft-pdm-admin"
+version = "0.16.2"
+dependencies = [
+ "eframe",
+ "egui",
+ "image",
+ "keyring",
+ "pollster 0.4.0",
+ "rcgen",
+ "rfd",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "solidcraft-pdm",
+]
+
+[[package]]
 name = "solidcraft-render"
 version = "0.16.2"
 dependencies = [
