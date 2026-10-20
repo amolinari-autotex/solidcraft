@@ -294,6 +294,8 @@ pub struct Evaluated(solidcraft_doc::Model);
 /// ([`Session::preview`]). The session itself is not changed.
 #[derive(Clone, Debug)]
 pub struct Preview {
+    /// The scratch document, including the placements used by the displayed result.
+    pub document: Arc<Document>,
     /// The model now.
     pub before: Arc<ModelState>,
     /// The model after the commands.
@@ -1710,6 +1712,7 @@ impl Session {
     /// being edited.
     pub fn preview(&self, commands: &[(String, Value)]) -> Result<Preview> {
         self.scratch().preview_in_place(commands, None).map(|(after, replies)| Preview {
+            document: after.doc.clone(),
             before: self.model.state(),
             after: after.model.state(),
             replies,
@@ -1719,6 +1722,7 @@ impl Session {
     /// The same evaluated preview in occurrence coordinates, including uncaptured moves.
     pub fn preview_world(&self, commands: &[(String, Value)]) -> Result<Preview> {
         self.scratch().preview_in_place(commands, None).map(|(after, replies)| Preview {
+            document: after.doc.clone(),
             before: self.world_state(),
             after: after.world_state(),
             replies,
@@ -1733,7 +1737,12 @@ impl Session {
             shown.bodies.retain(|body| session.body_visible(&body.name));
             Arc::new(shown)
         };
-        self.scratch().preview_in_place(commands, None).map(|(after, replies)| Preview { before: visible(self), after: visible(&after), replies })
+        self.scratch().preview_in_place(commands, None).map(|(after, replies)| Preview {
+            document: after.doc.clone(),
+            before: visible(self),
+            after: visible(&after),
+            replies,
+        })
     }
 
     /// Run `commands` on a [`Session::scratch`] copy that keeps the undo and redo stacks: what

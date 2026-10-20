@@ -4,6 +4,8 @@
 //! tinted, removed material as a translucent ghost. The last good preview stays up while the
 //! next one computes; once the current inputs make the feature fail, nothing is previewed and
 //! the error shows in the dialog (#3254).
+//! Joint alignment is an exception: its last valid pose stays pickable while a secondary
+//! reference is incomplete or invalid; rejected hover candidates return to authored inputs.
 //! Nothing here touches the document or the undo history.
 //!
 //! A feature that adds or removes a tool body (join, cut, intersect) shows only its tool. That
@@ -63,6 +65,7 @@ pub struct SketchPreview {
 
 /// A computed preview: the scene to draw and the bodies it stands in for.
 pub struct Built {
+    pub interaction: Option<JointInteraction>,
     pub scene: GpuScene,
     pub sketches: Vec<SketchPreview>,
     pub replaced: Vec<String>,
@@ -87,8 +90,24 @@ type Job = Result<Built, String>;
 /// most this many kernel computations going beside the current one.
 const DETACHED: usize = 2;
 
+/// Picking and feedback use the same placed geometry as the joint preview. The inverse
+/// placement maps a primary re-pick back to the unchanged document's coordinates.
+pub struct JointInteraction {
+    pub document: std::sync::Arc<solidcraft_engine::doc::Document>,
+    pub state: std::sync::Arc<ModelState>,
+    pub to_document: std::collections::HashMap<String, solidcraft_engine::doc::Mat>,
+}
+
+#[derive(Default)]
+struct PreviewWork {
+    progress: Arc<Progress>,
+    fallback: Option<Vec<(String, Value)>>,
+}
+
 #[derive(Default)]
 pub struct PreviewState {
+    pub interaction: Option<JointInteraction>,
+    retain_joint_pose: bool,
     /// Key of the commands whose result (or error) is shown.
     shown_key: Option<u64>,
     running: Option<(u64, Receiver<Job>)>,
@@ -139,6 +158,7 @@ impl PreviewState {
 
     /// Stop drawing the preview scene and give the bodies it stood in for back to the model.
     fn hide_scene(&mut self) {
+        self.interaction = None;
         if self.active || !self.replaced.is_empty() {
             self.active = false;
             self.bounds = Aabb3::EMPTY;
@@ -148,6 +168,7 @@ impl PreviewState {
     }
 
     fn clear(&mut self) {
+        self.retain_joint_pose = false;
         self.straight.clear();
         self.moving.clear();
         self.detach();
@@ -186,6 +207,7 @@ impl PreviewState {
         self.ms = crate::now_ms() - self.started;
         match job {
             Ok(b) => {
+                self.interaction = b.interaction;
                 self.sketches = b.sketches;
                 self.replaced = b.replaced;
                 self.bounds = b.bounds;
@@ -199,7 +221,9 @@ impl PreviewState {
             // The current inputs make no feature: the last good geometry would contradict
             // them (a 1 mm extrusion still drawn at 0 mm), so nothing is drawn.
             Err(e) => {
-                self.hide_scene();
+                if !self.retain_joint_pose || self.interaction.is_none() {
+                    self.hide_scene();
+                }
                 self.sketches.clear();
                 self.error = Some(e);
                 self.applied = None;
@@ -349,7 +373,8 @@ fn stream_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option
 /// Keep the preview in step with the open dialog: start a computation when its inputs changed,
 /// take finished results. Called once per frame.
 pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
-    let cmds = match app.dialog.as_ref().filter(|d| d.previews() && d.preview_enabled).map(|d| crate::dialogs::preview_commands(app, d)) {
+    app.preview.retain_joint_pose = app.dialog.as_ref().is_some_and(crate::dialogs_assembly::alignment_dialog);
+    let mut cmds = match app.dialog.as_ref().filter(|d| d.previews() && d.preview_enabled).map(|d| crate::dialogs::preview_commands(app, d)) {
         Some(Ok(c)) if !c.is_empty() => c,
         _ if crate::sketch_attachment_ui::commands(app).is_some() => crate::sketch_attachment_ui::commands(app).unwrap_or_default(),
         // A parameter being edited in Change Parameters.
@@ -358,6 +383,14 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
         }
         // No dialog, or inputs still missing: nothing to preview.
         _ => {
+            if app.preview.retain_joint_pose && app.preview.interaction.is_some() {
+                app.preview.detach();
+                app.preview.running_stream_key = None;
+                app.preview.shown_key = None;
+                app.preview.busy = false;
+                app.preview.error = app.dialog.as_ref().and_then(|d| crate::dialogs::apply_commands(app, d).err());
+                return;
+            }
             app.preview.clear();
             return;
         }
@@ -366,7 +399,15 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
     if app.dialog.as_ref().is_some_and(|d| matches!(d.kind, crate::dialogs::Kind::Assembly(crate::dialogs_assembly::Asm::Drive { .. }))) {
         colors.ghost = app.preferences.drive_joints_ghost;
     }
-    let key = job_key(&cmds, app.session.revision, colors);
+    // A hover is transient: evaluate it off the UI thread and use authored commands as
+    // its fallback. Neither rejection nor leaving the candidate can author a reference.
+    let candidate = app.dialog.as_ref().and_then(|d| crate::dialogs_assembly::alignment_hover_commands(app, d));
+    let fallback = candidate.filter(|candidate| candidate != &cmds).map(|candidate| std::mem::replace(&mut cmds, candidate));
+    let key = if let Some(base) = &fallback {
+        job_key(&[cmds.clone(), base.clone()].concat(), app.session.revision, colors)
+    } else {
+        job_key(&cmds, app.session.revision, colors)
+    };
     let stream_key = stream_key(&cmds, app.session.revision, colors);
     let tool = as_new_body(&cmds).is_some();
     let pv = &mut app.preview;
@@ -388,7 +429,7 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
             return;
         }
         let scratch = app.session.scratch();
-        spawn(&mut app.preview, key, scratch, cmds, colors, tool, Arc::new(Progress::default()));
+        spawn(&mut app.preview, key, scratch, cmds, colors, tool, PreviewWork { fallback, ..PreviewWork::default() });
     }
     app.preview.busy = app.preview.running.is_some();
     if app.preview.busy {
@@ -408,14 +449,13 @@ fn job_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> u64 {
 
 /// Start computing the preview of `cmds`: for a tool feature (`tool`), only its tool.
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool, progress: Arc<Progress>) {
+fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool, work: PreviewWork) {
+    let PreviewWork { progress, fallback } = work;
     let (tx, rx) = std::sync::mpsc::channel();
     // Watched by `progress`, so a job left behind for other inputs skips its remaining features.
     let watched = progress.clone();
     let spawned = std::thread::Builder::new().name("preview".into()).spawn(move || {
-        let job = solidcraft_engine::doc::progress::watch(watched, || {
-            if tool { compute_tool(&scratch, &cmds, colors) } else { compute(&scratch, &cmds, colors) }
-        });
+        let job = solidcraft_engine::doc::progress::watch(watched, || compute_candidate(&scratch, &cmds, colors, tool, fallback.as_deref()));
         let _ = tx.send(job);
     });
     match spawned {
@@ -430,8 +470,26 @@ fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, V
 
 /// No threads on the web: compute right away.
 #[cfg(target_arch = "wasm32")]
-fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool, _progress: Arc<Progress>) {
-    pv.apply(key, if tool { compute_tool(&scratch, &cmds, colors) } else { compute(&scratch, &cmds, colors) });
+fn spawn(
+    pv: &mut PreviewState,
+    key: u64,
+    scratch: Session,
+    cmds: Vec<(String, Value)>,
+    colors: Colors,
+    tool: bool,
+    work: PreviewWork,
+) {
+    pv.apply(key, compute_candidate(&scratch, &cmds, colors, tool, work.fallback.as_deref()));
+}
+
+fn compute_candidate(scratch: &Session, cmds: &[(String, Value)], colors: Colors, tool: bool, fallback: Option<&[(String, Value)]>) -> Job {
+    let result = if tool { compute_tool(scratch, cmds, colors) } else { compute(scratch, cmds, colors) };
+    if result.is_err()
+        && let Some(base) = fallback
+    {
+        return compute(scratch, base, colors);
+    }
+    result
 }
 
 /// Evaluate the commands on the scratch session and build the preview scene.
@@ -593,6 +651,7 @@ fn build_tool(before: &ModelState, after: &ModelState, c: Colors, op: &str) -> B
         }
     }
     Built {
+        interaction: None,
         scene: sc,
         sketches: Vec::new(),
         replaced: Vec::new(),
@@ -752,7 +811,7 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
             if indices.is_empty() && points.is_empty() { None } else { Some(SketchPreview { sketch: sketch.clone(), curves: indices, points }) }
         })
         .collect();
-    Built { scene: sc, sketches, replaced, error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new(), stopped: None }
+    Built { interaction: None, scene: sc, sketches, replaced, error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new(), stopped: None }
 }
 
 /// Which of the `nf` faces of `m` are new surface, i.e. not on the old mesh? Each is decided by
@@ -975,6 +1034,7 @@ mod tests {
 
     fn pose() -> Built {
         Built {
+            interaction: None,
             scene: GpuScene::default(),
             sketches: Vec::new(),
             replaced: vec!["Lid".into()],
@@ -1175,7 +1235,7 @@ mod tests {
         s.execute("occurrence.move", &json!({"occurrence": made["occurrence"], "axis": [1, 0, 0], "angle": "90 deg"})).unwrap();
         s.execute("component.activate", &json!({"component": made["component"], "occurrence": made["occurrence"], "path": [made["occurrence"]]}))
             .unwrap();
-        // Shown lying flat: 20 × 30, 8 high. Its top face pulled up 10.
+        // Shown lying flat: 20 Ã— 30, 8 high. Its top face pulled up 10.
         let cmd = ("solid.extrude".to_string(), json!({"face": [10, 15, 8], "face_body": "Plate", "distance": "10 mm", "operation": "join"}));
         let b = compute_tool(&s, &[cmd], colors()).unwrap().bounds;
         assert!((b.max.z - 18.0).abs() < 1e-6 && (b.max.y - 30.0).abs() < 1e-6, "on top, not at right angles: {b:?}");
@@ -1225,7 +1285,7 @@ mod tests {
         m.triangles.iter().filter_map(|t| m.tri(t)).any(|[a, b, c]| point_triangle_dist(p, a, b, c) < tol)
     }
 
-    /// A flat sheet of `n × n` squares, two triangles and one face each, lifted by `z`.
+    /// A flat sheet of `n Ã— n` squares, two triangles and one face each, lifted by `z`.
     fn sheet(n: usize, z: f64) -> Mesh {
         let mut m = Mesh::default();
         for i in 0..=n {
@@ -1258,7 +1318,7 @@ mod tests {
         assert!(SurfaceIndex::new(&Mesh::default()).is_none());
     }
 
-    /// How long the faces of a sheet of `n × n` squares take to classify against an old sheet of
+    /// How long the faces of a sheet of `n Ã— n` squares take to classify against an old sheet of
     /// the same size. The meshes are built before the clock starts and the faces are collected
     /// before it stops: only the classification, the work that used to freeze the app, is measured.
     fn classify_sheet(n: usize) -> std::time::Duration {
