@@ -353,6 +353,9 @@ fn csv(rows: &[Value]) -> String {
 
 fn bom(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "assembly.bom";
+    if let Some(path) = str_(p, "path") {
+        s.check_output_path(path)?;
+    }
     let root = if p.get("component").is_some_and(|v| !v.is_null()) { component_id(s, p, cmd)? } else { 0 };
     let o = options(p, cmd)?;
     let ix = Index::new(s);

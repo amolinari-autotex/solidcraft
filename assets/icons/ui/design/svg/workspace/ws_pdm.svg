@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Managed document archive</title>
+  <path d="M19 6.5L36 6.5L44 14.5L44 30.5L16 30.5L16 9.5Q16 6.5 19 6.5Z" fill="#e2e8ef" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M36 6.5L36 14.5L44 14.5" fill="#b8c3cf" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M23 16.5L29 16.5M23 22.5L36 22.5" fill="none" stroke="#236ead" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M13 28.5L51 28.5Q54 28.5 54 31.5L54 54.5Q54 57.5 51 57.5L13 57.5Q10 57.5 10 54.5L10 31.5Q10 28.5 13 28.5Z" fill="#b8c3cf" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M10 42.5L54 42.5" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M25 35.5L39 35.5M25 49.5L39 49.5" fill="none" stroke="#236ead" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

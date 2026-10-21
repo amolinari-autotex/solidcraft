@@ -278,6 +278,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
         other => return Err(bad(cmd, format!("unknown format `{other}` (csv or json)"))),
     };
     if let Some(path) = path {
+        s.check_output_path(path)?;
         solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     }
     Ok(json!({"format": format, "path": path, "text": text}))

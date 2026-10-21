@@ -131,6 +131,41 @@ mod status_tests {
         let _ = app.run("edit.redo", serde_json::json!({}));
         assert!(app.session.log.last().is_some_and(|l| l.starts_with("Redo: ") && !l.contains("edit.redo")), "{:?}", app.session.log.last());
     }
+    #[test]
+    fn native_drop_reaches_pdm_when_a_closed_chat_retains_a_drop_rectangle() {
+        #[derive(Debug)]
+        struct DroppedPath(std::path::PathBuf);
+        impl egui::DroppedFile for DroppedPath {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                std::fs::read(&self.0).map_err(|error| error.to_string())
+            }
+        }
+        let mut h = crate::scenario::Harness::new();
+        crate::pdm_panel::enter(&mut h.app).unwrap();
+        h.app.preferences.ai_features = true;
+        h.app.agent_chat.open = false;
+        h.app.agent_chat.drop_rect = Some(egui::Rect::EVERYTHING);
+        let before = h.app.session.doc.clone();
+        let before_path = h.app.session.path.clone();
+        let before_tabs = h.app.docs.count();
+        let source = h.dir.join("attachment.pdf");
+        std::fs::write(&source, b"attachment").unwrap();
+        h.drop_files(egui::pos2(500.0, 300.0), vec![std::sync::Arc::new(DroppedPath(source))]);
+        assert!(
+            h.app.status.as_ref().is_some_and(|(message, _, error)| *error && message == h.app.tr("ui.pdm_reason_disconnected")),
+            "PDM reports its disconnected-archive error instead of losing the native drop to a closed chat"
+        );
+        assert!(h.ctx.input(|input| input.raw.dropped_files.is_empty()), "the native drop was consumed");
+        assert_eq!(h.app.session.path, before_path);
+        assert_eq!(h.app.docs.count(), before_tabs);
+        assert!(!h.app.file_load.busy(), "the dropped attachment did not start a CAD open");
+        assert!(h.app.agent_chat.attachments.is_empty());
+        assert_eq!(*h.app.session.doc, *before);
+        assert!(h.app.pdm.workspace_active);
+    }
 }
 #[cfg(test)]
 mod apply_off_thread_tests;
@@ -144,6 +179,9 @@ pub(crate) mod frame_watch;
 #[cfg(test)]
 mod history_off_thread_tests;
 pub use file_picker::FilePickerFuture;
+pub mod pdm_panel;
+#[cfg(test)]
+mod pdm_panel_tests;
 #[cfg(test)]
 mod blend_arrow_tests;
 #[cfg(test)]
@@ -322,10 +360,17 @@ impl Default for UiState {
 /// Host services injected by the app so this crate stays portable.
 #[derive(Default)]
 pub struct Services {
+    /// Native authenticated PDM worker. Credentials never enter engine/UI state.
+    pub pdm: Option<pdm_panel::Start>,
+    /// Show legacy loopback tools only when the native host has that setup.
+    /// This presentation hint never authorizes a connection or file operation.
+    pub pdm_local_diagnostics: bool,
     /// Ask for a file to open. The extensions are the file type the command reads, offered as
     /// the picker's first filter (`&[]`: designs, CAD files and meshes, #1801).
     pub pick_open: Option<Box<dyn Fn(&[&str]) -> FilePickerFuture>>,
-    pub pick_save: Option<Box<dyn Fn(&str, &[&str]) -> FilePickerFuture>>,
+    pub pick_save: Option<Box<dyn Fn(&str, &[&str], Option<&str>) -> FilePickerFuture>>,
+    /// Select a client directory; unavailable on hosts without a native folder picker.
+    pub pick_folder: Option<Box<dyn Fn(Option<&str>) -> FilePickerFuture>>,
     /// Open a dialog for one file of a kind (its name, its extensions): on macOS a dialog allows
     /// only the types it names, so the agent chat's files need a dialog of their own. `None`: the
     /// Open dialog.
@@ -359,6 +404,7 @@ pub struct Services {
 }
 
 pub struct SolveApp {
+    pub pdm: pdm_panel::Panel,
     pub session: Session,
     pub ui: UiState,
     pub(crate) shell: shell::State,
@@ -516,6 +562,16 @@ pub struct SolveApp {
 }
 
 impl SolveApp {
+    /// Interactive commands share PDM availability across ribbons, menus and the palette.
+    /// Programmatic commands still validate their explicit target in the engine and host.
+    pub(crate) fn command_info(&self, command: &solidcraft_engine::CommandSpec) -> solidcraft_engine::CommandInfo {
+        let mut info = command.info(&self.session);
+        if let Some(reason) = pdm_panel::command_unavailable(self, command.id) {
+            info.enabled = false;
+            info.disabled_reason = Some(self.tr(reason).to_string());
+        }
+        info
+    }
     pub fn new(mut session: Session, services: Services) -> Self {
         #[cfg(test)]
         let image_host = Some(solidcraft_engine::render::job::CpuHost::cooperative());
@@ -526,7 +582,11 @@ impl SolveApp {
         }
         let mut render_workspace = render_workspace::State::default();
         render_workspace.image_host = image_host;
+        let pdm = pdm_panel::Panel::default();
+        let _ = pdm.runtime.set_available(services.pdm.is_some());
+        session.pdm = pdm.runtime.clone();
         SolveApp {
+            pdm,
             session,
             ui: UiState::default(),
             shell: Default::default(),
@@ -674,7 +734,9 @@ impl SolveApp {
 
     /// Restore preferences saved with [`SolveApp::prefs`].
     pub fn load_prefs(&mut self, prefs: &str) {
-        let Ok(v) = serde_json::from_str::<Value>(prefs) else { return };
+        let Ok(v) = serde_json::from_str::<Value>(prefs) else {
+            return;
+        };
         let flag = |k: &str| v.get(k).and_then(Value::as_bool);
         self.home.opened_at = v.get("recent_opened_at").and_then(|x| serde_json::from_value(x.clone()).ok()).unwrap_or_default();
         if let Some(d) = flag("dark") {
@@ -747,11 +809,94 @@ impl SolveApp {
 
     /// Run a command programmatically (JSON parameters, no dialogs).
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        self.session.pdm = self.pdm.runtime.clone();
+        if id == "pdm.workspace.change" && documents::any_managed_open_for_change(self) {
+            return Err(self.tr("ui.pdm_workspace_close_editors").into());
+        }
+        if id == "pdm.workspace.change" && (self.docs.closing.is_some() || self.docs.quitting.is_some()) {
+            return Err(self.tr("ui.pdm_reason_busy").into());
+        }
+        if matches!(id, "pdm.connection.recover" | "pdm.recover_workspace") && documents::any_dirty(self) {
+            return Err("Save or Save As all unsaved editors before recovering a working folder".into());
+        }
+        let managed_dirty = matches!(
+            id,
+            "pdm.checkout" | "pdm.get_latest" | "pdm.cancel_checkout" | "pdm.open_document" | "pdm.open_referenced" | "pdm.restore_version"
+        ) && documents::managed_target_dirty(self, params.get("document").and_then(Value::as_str));
+        let preserving_checkout = id == "pdm.checkout"
+            && self.session.is_dirty()
+            && documents::managed_editor_stamp(self, params.get("document").and_then(Value::as_str)).is_some_and(|stamp| stamp.matches_active(self));
+        let explicit_discard = id == "pdm.cancel_checkout" && params.get("discard").and_then(Value::as_bool) == Some(true);
+        if matches!(
+            id,
+            "pdm.checkout" | "pdm.get_latest" | "pdm.cancel_checkout" | "pdm.open_document" | "pdm.open_referenced" | "pdm.restore_version"
+        ) && managed_dirty
+            && !preserving_checkout
+            && !explicit_discard
+        {
+            return Err("Save or Save As the unsaved editor before replacing its managed working copy".into());
+        }
+        if !id.starts_with("pdm.")
+            && solidcraft_engine::find_command(id).is_some_and(|c| c.undoable)
+            && self.session.path.as_ref().is_some_and(|p| self.pdm.runtime.blocks_path(p))
+        {
+            return Err("Wait for the PDM operation before editing this managed document".into());
+        }
+        if id == "pdm.check_in" && (self.dialog.is_some() || self.tool.is_some() || self.applying.is_some() || self.deferred.is_some()) {
+            return Err("Finish or cancel interactive edits before checking in the saved design".into());
+        }
         if self.file_load.busy() || self.file_picker.is_some() || self.saving.is_some() {
             return Err("a file operation is in progress".into());
         }
+        if id == "pdm.archive"
+            && params.get("reconcile").and_then(Value::as_bool) != Some(true)
+            && !self.pdm.runtime.status().is_ok_and(|status| status.attachment_path(params.get("document").and_then(Value::as_str)).is_some())
+        {
+            solidcraft_engine::cmd::validate_pdm_params(id, &params).map_err(|error| error.to_string())?;
+            if self.dialog.is_some()
+                || self.tool.is_some()
+                || self.applying.is_some()
+                || self.deferred.is_some()
+                || self.docs.closing.is_some()
+                || self.docs.quitting.is_some()
+                || self.session.active_sketch.is_some()
+                || !self.session.pending_moves.is_empty()
+            {
+                return Err("Finish or cancel interactive edits before checking in the design".into());
+            }
+            let status = self.pdm.runtime.status()?;
+            if let Some(reason) = status.action_unavailable(
+                id,
+                params.get("document").and_then(Value::as_str),
+                self.session.path.as_deref(),
+                true,
+                self.session.pdm_read_only,
+                None,
+            ) {
+                return Err(reason.into());
+            }
+            self.session.check_pdm_reopen().map_err(|error| error.to_string())?;
+            if self.session.is_dirty() || !self.session.doc.links.is_empty() {
+                let graph = documents::prepare_archive_graph(self)?;
+                if graph.needs_save() {
+                    if self.session.doc.links.is_empty() {
+                        return save_job::archive(self, params);
+                    }
+                    return save_job::archive_graph(self, params, graph);
+                }
+            }
+        }
+        let discard_stamp = explicit_discard.then(|| documents::managed_editor_stamp(self, params.get("document").and_then(Value::as_str))).flatten();
         let t0 = now_ms();
-        let r = self.session.execute(id, &params).map_err(|e| e.to_string());
+        let r = match pdm_panel::run_historical(self, id, &params) {
+            Some(result) => result,
+            None => self.session.execute(id, &params).map_err(|error| error.to_string()),
+        };
+        if let (Some(stamp), Ok(value)) = (discard_stamp, &r)
+            && let Some(request) = value.get("request").and_then(Value::as_u64)
+        {
+            self.pdm.discard_ack = Some((request, stamp));
+        }
         self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
         if let Ok(v) = &r {
             if id == "view.layout" {
@@ -871,6 +1016,30 @@ impl SolveApp {
             shortcut_box::open(self, None);
             return;
         }
+        self.session.pdm = self.pdm.runtime.clone();
+        if solidcraft_engine::find_command(id).is_some_and(|command| command.undoable)
+            && let Err(error) = self.session.check_pdm_reopen()
+        {
+            self.set_status(error.to_string(), true);
+            return;
+        }
+        if solidcraft_engine::find_command(id).is_some_and(|c| c.undoable)
+            && let Some(path) = &self.session.path
+        {
+            let managed = self.pdm.runtime.managed_for_path(path);
+            if self.pdm.runtime.blocks_path(path) {
+                self.set_status("Wait for the PDM operation before editing this managed document", true);
+                return;
+            }
+            if (self.session.pdm_read_only || managed.is_some_and(|entry| !entry.checked_out))
+                && !self.pdm.ram_paths.contains(&solidcraft_engine::pdm::cached_path_key(path))
+            {
+                self.pdm.pending_edit_path = Some(solidcraft_engine::pdm::cached_path_key(path));
+                self.pdm.pending_edit = Some(id.to_string());
+                return;
+            }
+        }
+
         // A file is loading: the design waits for it.
         if self.file_load.busy() || self.file_picker.is_some() {
             return;
@@ -885,7 +1054,7 @@ impl SolveApp {
         // A disabled command starts nothing, however it was reached. The toolbar greys its
         // button, but a shortcut, the command palette and the control channel all land here.
         // Its reason goes to the status line, so the refusal is never silent.
-        if let Some(info) = solidcraft_engine::find_command(id).map(|c| c.info(&self.session))
+        if let Some(info) = solidcraft_engine::find_command(id).map(|c| self.command_info(c))
             && let Some(why) = info.disabled_reason
         {
             let label = self.tr_label(info.label).to_string();
@@ -907,6 +1076,29 @@ impl SolveApp {
         if id == "material.properties.validate" {
             self.material_card_review = Some(material_card_review::ReviewWindow::default());
             self.home.open = false;
+            return;
+        }
+        if id.starts_with("pdm.") {
+            if pdm_panel::start_action(self, id) {
+                return;
+            }
+            if matches!(id, "pdm.panel" | "pdm.connections" | "pdm.setup.create" | "pdm.connection.open" | "pdm.connection.recover") {
+                if let Err(error) = pdm_panel::enter(self) {
+                    self.set_status(error, true);
+                }
+                self.pdm.open = true;
+            }
+            if id == "pdm.connect" {
+                self.pdm.open = true;
+            }
+            if id == "pdm.cancel_checkout" {
+                self.pdm.cancel_confirmation = true;
+            }
+            if matches!(id, "pdm.refresh" | "pdm.disconnect" | "pdm.archive" | "pdm.checkout" | "pdm.get_latest")
+                && let Err(error) = self.run(id, json!({}))
+            {
+                self.set_status(error, true);
+            }
             return;
         }
         // A display toggle leaves the current modelling tool and camera in place.
@@ -1081,7 +1273,9 @@ impl SolveApp {
     /// timeline back to just before themselves and reopen their dialog, filled in.
     pub fn edit_feature(&mut self, id: u64) {
         use solidcraft_engine::doc::FeatureKind;
-        let Some(f) = self.session.doc.feature(id) else { return };
+        let Some(f) = self.session.doc.feature(id) else {
+            return;
+        };
         if matches!(f.kind, FeatureKind::Sketch { .. }) {
             self.edit_sketch(id);
             return;
@@ -1089,7 +1283,9 @@ impl SolveApp {
         if self.session.active_sketch.is_some() {
             self.finish_sketch();
         }
-        let Some(idx) = self.session.doc.feature_index(id) else { return };
+        let Some(idx) = self.session.doc.feature_index(id) else {
+            return;
+        };
         let marker = self.session.doc.marker;
         self.tool = None;
         if dialogs::roll_marker(self, Some(idx)).is_err() {
@@ -1126,7 +1322,9 @@ impl SolveApp {
         }
         self.tool = None;
         self.dialog = None;
-        let Some(idx) = self.session.doc.feature_index(id) else { return };
+        let Some(idx) = self.session.doc.feature_index(id) else {
+            return;
+        };
         let marker = self.session.doc.marker;
         let rolled = marker != Some(idx + 1) && self.run("timeline.roll_to", json!({ "position": idx + 1 })).is_ok();
         if self.run("sketch.edit", json!({ "sketch": id })).is_err() {
@@ -1235,6 +1433,9 @@ impl SolveApp {
     /// A dropped file: a STEP or mesh file (3MF, STL, OBJ, glTF) joins a design that has features, anything else
     /// opens.
     pub fn drop_path(&mut self, path: &str) {
+        if pdm_panel::drop_path(self, path) {
+            return;
+        }
         let import = solidcraft_engine::io::is_step_path(path) || solidcraft_engine::io::is_mesh_path(path);
         if import && !self.session.doc.features.is_empty() {
             self.insert_path_async(path);
@@ -1405,7 +1606,9 @@ impl SolveApp {
     /// Move the viewport to the camera a command asked for (`view.apply`): animated like a view
     /// change, or at once (control requests, so a screenshot right after shows it).
     pub fn follow_view_request(&mut self, animate: bool) {
-        let Some(mut to) = self.session.camera.take() else { return };
+        let Some(mut to) = self.session.camera.take() else {
+            return;
+        };
         if render_workspace::active(self) {
             self.ui.up_axis = to.up;
         } else {
@@ -1448,6 +1651,7 @@ impl SolveApp {
     /// Per-frame logic before layout.
     pub fn logic(&mut self, ctx: &egui::Context) {
         frame_watch::begin(self);
+        pdm_panel::tick(self, ctx);
         file_picker::tick(self, ctx);
         render_workspace::sync_backend(self);
         render_workspace::tick(self, ctx);
@@ -1490,13 +1694,20 @@ impl SolveApp {
         }
         recovery_ui::tick(self);
         update::tick(self, ctx);
-        if self.issue_report.draft.is_none() && self.file_picker.is_none() {
-            // Files dropped on the agent chat attach to its next message instead.
-            agent_chat::take_drops(self, ctx);
-            for f in ctx.input(|i| i.raw.dropped_files.clone()) {
-                let p = f.path().to_string_lossy().to_string();
-                if !p.is_empty() {
-                    self.drop_path(&p);
+        if self.issue_report.draft.is_none() && (self.file_picker.is_none() || self.pdm.workspace_active) {
+            // A visible chat in this viewport takes its own drops, including an embedded
+            // floating chat. A closed chat must not claim a stale drop rectangle.
+            if agent_chat::shown(self) && self.agent_chat.open {
+                agent_chat::take_drops(self, ctx);
+            }
+            // Consume each native drop once, including egui layout retries. PDM handles
+            // busy/unavailable failures too, so dropping during a picker is not silent.
+            for file in ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files)) {
+                let path = file.path().to_string_lossy().to_string();
+                if !path.is_empty() {
+                    self.drop_path(&path);
+                } else if self.pdm.workspace_active {
+                    self.set_status("The dropped file has no local path to import", true);
                 }
             }
         }
@@ -1604,7 +1815,7 @@ impl SolveApp {
             }
         }
         let floating = ui_kit::Container::new(ui.ctx(), ui_kit::Surface::Panel).floating();
-        let show_timeline = self.ui.show_timeline && !render_workspace::active(self);
+        let show_timeline = self.ui.show_timeline && !render_workspace::active(self) && !self.pdm.workspace_active;
         let left_timeline = show_timeline && self.preferences.timeline_left;
         timeline_left::animate_folds(self, ui.ctx());
         if !floating {
@@ -1618,7 +1829,7 @@ impl SolveApp {
             timeline::timeline(self, ui);
         }
         // Browser hugs its contents in either layout; it never becomes a full-height blank column.
-        if !self.ui.show_browser {
+        if !self.ui.show_browser || self.pdm.workspace_active {
             self.shell.browser = None;
         }
         if floating || left_timeline || !show_timeline {
@@ -1636,22 +1847,24 @@ impl SolveApp {
             };
             // Draw the scene first, then let the unchanged panel layouts cover it. The
             // viewport keeps its full projection even underneath the browser and cards.
-            preview::update(self, ui.ctx());
-            // A camera drag that began on the model keeps capture across cards. New
-            // gestures over chrome are blocked, as are selection drags into the ribbon.
-            let continuing_navigation = ui.input(|i| {
-                (i.pointer.middle_down() || i.pointer.secondary_down())
-                    && i.pointer.press_origin().is_some_and(|p| full.contains(p) && !shell::covered(self, p))
-            });
-            let blocked = !continuing_navigation && ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| shell::covered(self, p));
-            let mut viewport_ui = ui.new_child(egui::UiBuilder::new().max_rect(full).id_salt("floating_viewport"));
-            if blocked {
-                // Disabled only to shield the scene from input under a card or menu; it must
-                // not fade, or the whole viewport dims whenever the pointer is over the shell.
-                viewport_ui.visuals_mut().disabled_alpha = 1.0;
-                viewport_ui.disable();
+            if !self.pdm.workspace_active {
+                preview::update(self, ui.ctx());
+                // A camera drag that began on the model keeps capture across cards. New
+                // gestures over chrome are blocked, as are selection drags into the ribbon.
+                let continuing_navigation = ui.input(|i| {
+                    (i.pointer.middle_down() || i.pointer.secondary_down())
+                        && i.pointer.press_origin().is_some_and(|p| full.contains(p) && !shell::covered(self, p))
+                });
+                let blocked = !continuing_navigation && ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| shell::covered(self, p));
+                let mut viewport_ui = ui.new_child(egui::UiBuilder::new().max_rect(full).id_salt("floating_viewport"));
+                if blocked {
+                    // Disabled only to shield the scene from input under a card or menu; it must
+                    // not fade, or the whole viewport dims whenever the pointer is over the shell.
+                    viewport_ui.visuals_mut().disabled_alpha = 1.0;
+                    viewport_ui.disable();
+                }
+                self.show_workspace(&mut viewport_ui);
             }
-            self.show_workspace(&mut viewport_ui);
             shell::paint_top_corners(ui.painter(), full, theme::Tokens::get().app_bar);
             toolbar::toolbar(self, ui);
             theme::TabAccent::publish(self, ui.ctx());
@@ -1662,10 +1875,10 @@ impl SolveApp {
         if left_timeline {
             timeline_left::left_panel(self, ui);
         }
-        if render_workspace::active(self) {
+        if render_workspace::active(self) && !self.pdm.workspace_active {
             render_workspace::panel(self, ui);
         }
-        if self.ui.show_browser {
+        if self.ui.show_browser && !self.pdm.workspace_active {
             browser::browser(self, ui);
         }
         if floating {
@@ -1677,7 +1890,9 @@ impl SolveApp {
             .show(ui, |ui| {
                 let panel_content = ui.max_rect();
                 self.shell.content = Some(shell::workspace_content(self, panel_content));
-                if floating {
+                if self.pdm.workspace_active {
+                    pdm_panel::workspace(self, ui);
+                } else if floating {
                     self.shell.panels = [
                         egui::Rect::from_min_max(egui::pos2(full.left(), panel_content.top()), egui::pos2(panel_content.left(), full.bottom())),
                         egui::Rect::from_min_max(egui::pos2(panel_content.right(), panel_content.top()), full.max),
@@ -1698,6 +1913,7 @@ impl SolveApp {
         params_dialog::show(self, ui.ctx());
         design_properties::show(self, ui.ctx());
         bom_panel::show(self, ui.ctx());
+        pdm_panel::show(self, ui.ctx());
         material_card_review::show(self, ui.ctx());
         recovery_ui::show(self, ui.ctx());
         stand_up::show(self, ui.ctx());
@@ -1711,7 +1927,9 @@ impl SolveApp {
     }
 
     fn show_workspace(&mut self, ui: &mut egui::Ui) {
-        if render_workspace::active(self) {
+        if self.pdm.workspace_active {
+            pdm_panel::workspace(self, ui);
+        } else if render_workspace::active(self) {
             render_workspace::show(self, ui);
         } else {
             viewport::show(self, ui);

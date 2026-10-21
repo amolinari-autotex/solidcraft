@@ -93,6 +93,8 @@ egui = "0.36"
 eframe = { version = "0.36", default-features = false, features = ["persistence"] }
 # Instant/SystemTime that also work in the browser (std panics on wasm32-unknown-unknown).
 web-time = "1"
+# Native file identity across hardlink aliases (MIT OR Unlicense; already locked through walkdir).
+same-file = "1.0.6"
 egui-wgpu = "0.36"
 # the wgpu egui-wgpu uses, for compute (crates/gpu); backends come from the apps' features
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }

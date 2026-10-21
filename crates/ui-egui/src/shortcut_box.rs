@@ -138,6 +138,7 @@ pub fn search(app: &SolveApp, q: &str) -> Vec<Row> {
     let mut v: Vec<(u32, Row)> = command_specs()
         .into_iter()
         .filter(|c| !crate::workspace::AGENT_ONLY.contains(&c.id))
+        .filter(|c| crate::pdm_panel::command_visible(app, c.id))
         .filter_map(|c| {
             let (home_tab, home_panel) = crate::workspace::destination(c).unwrap_or(("", ""));
             let (label, tab, panel) = (crate::i18n::tr_label(c.label), crate::i18n::tr_label(home_tab), crate::i18n::tr_label(home_panel));
@@ -150,7 +151,7 @@ pub fn search(app: &SolveApp, q: &str) -> Vec<Row> {
                 .max(score(&q, panel).max(score(&q, home_panel)) / 3);
             let recent = app.sbox.recent.iter().position(|r| r == c.id).map_or(0, |i| 2000u32.saturating_sub(i.min(2000) as u32));
             // Commands that can run now come before those that can't.
-            let usable = if c.info(&app.session).enabled { 150 } else { 0 };
+            let usable = if app.command_info(c).enabled { 150 } else { 0 };
             (s > 0).then_some((s + usable + if q.is_empty() { recent } else { recent / 20 }, (c.id, label, c.icon, place)))
         })
         .collect();
@@ -177,6 +178,9 @@ fn bounded(text: &str) -> String {
 }
 
 fn design_rows(app: &mut SolveApp, query: &str) -> Vec<DesignRow> {
+    if app.pdm.workspace_active {
+        return Vec::new();
+    }
     if app.sbox.design.as_ref().is_none_or(|(revision, _)| *revision != app.session.revision) {
         let doc = &app.session.doc;
         let params = doc.param_rows();
@@ -284,7 +288,9 @@ fn run_typed(app: &mut SolveApp, line: &str) {
         match result {
             Ok(params) => {
                 app.sbox.used(id);
-                let _ = app.run(id, params);
+                if let Err(error) = app.run(id, params) {
+                    app.set_status(error, true);
+                }
             }
             Err(error) => app.set_status(error, true),
         }
@@ -415,7 +421,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     }
                     let enabled: Vec<_> = rows
                         .iter()
-                        .map(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| c.info(&app.session).enabled))
+                        .map(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| app.command_info(c).enabled))
                         .chain(design.iter().map(|_| true))
                         .take(MAX_RESULTS)
                         .collect();
@@ -484,6 +490,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                                         item.shortcut = &shortcut;
                                         let path = place.map_or_else(|| id.to_string(), |(tab, panel)| format!("{tab} › {panel}"));
                                         let response = item.search_row(ui, &query, &path, None);
+                                        let response = match solidcraft_engine::find_command(id).and_then(|c| app.command_info(c).disabled_reason) {
+                                            Some(reason) => response.on_hover_text(reason),
+                                            None => response,
+                                        };
                                         if item.highlighted && (up || down) {
                                             ui.scroll_to_rect(response.rect, None);
                                         }
@@ -580,7 +590,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
         } else {
             let index = picked.unwrap_or(app.sbox.index);
-            if let Some((id, ..)) = rows.get(index).filter(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| c.info(&app.session).enabled)) {
+            if let Some((id, ..)) = rows.get(index).filter(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| app.command_info(c).enabled)) {
                 app.sbox.used(id);
                 close(app);
                 app.start(id);

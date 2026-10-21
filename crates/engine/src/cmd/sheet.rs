@@ -827,6 +827,12 @@ fn export_dxf(s: &mut Session, p: &Value) -> Result<Value> {
             })
             .collect::<Result<Vec<_>>>()?;
         let paths = path.map(|path| body_paths(path, &sheets.iter().map(|sh| sh.body.clone()).collect::<Vec<_>>()));
+        if let Some(paths) = &paths {
+            for file in paths {
+                s.check_output_path(file)?;
+                solidcraft_io::vfs::check(file).map_err(|e| EngineError::Other(format!("{file}: {e}")))?;
+            }
+        }
         let mut files = Vec::new();
         for (i, (sh, text)) in sheets.iter().zip(&texts).enumerate() {
             let bends = sh.bends().len();
@@ -843,6 +849,7 @@ fn export_dxf(s: &mut Session, p: &Value) -> Result<Value> {
     sh.flat_matches_body()?;
     let text = flat_dxf(&sh, &options)?;
     if let Some(path) = path {
+        s.check_output_path(path)?;
         solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
         return Ok(json!({"path": path, "bends": sh.bends().len()}));
     }
@@ -888,6 +895,7 @@ fn export_bend_table(s: &mut Session, p: &Value) -> Result<Value> {
         csv
     };
     if let Some(path) = str_(p, "path").filter(|x| !x.trim().is_empty()) {
+        s.check_output_path(path)?;
         solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
         return Ok(json!({"path": path, "format": format, "bends": sh.bends().len()}));
     }

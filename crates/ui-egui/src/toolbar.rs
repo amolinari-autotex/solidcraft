@@ -321,6 +321,7 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
         }
         icons::paint_app_bar(ui.painter(), home.shrink(7.0), "home", if idle { 1.0 } else { 0.35 });
         if home_response.on_hover_text(home_tip).clicked() && idle {
+            crate::pdm_panel::leave(app);
             app.home.show(app.session.revision);
         }
         x = home.right() + 8.0;
@@ -559,6 +560,10 @@ fn file_menu(app: &mut SolveApp, ctx: &egui::Context) {
                     download_design(app);
                     close = true;
                 }
+                if item(ui, app.tr_label("Local PDM"), "", "") {
+                    app.start("pdm.panel");
+                    close = true;
+                }
                 if app.services.browser_files.is_some() && item(ui, "Files in this browser…", "", "open") {
                     if let Some(show) = &app.services.browser_files {
                         show();
@@ -633,7 +638,7 @@ fn file_menu(app: &mut SolveApp, ctx: &egui::Context) {
 /// Whether the design is on screen: viewport/menu editing stays disabled behind File.
 /// File owns its explicit Save/Save As/export actions and returns to the design before dispatch.
 pub fn design_shown(app: &SolveApp) -> bool {
-    !app.home.open
+    !app.home.open && !app.pdm.workspace_active
 }
 
 pub fn save(app: &mut SolveApp) {
@@ -654,7 +659,15 @@ pub(crate) fn save_as(app: &mut SolveApp) {
 
 fn save_as_with_extension(app: &mut SolveApp, extension: &str) {
     let name = format!("{}.{extension}", app.session.doc.name);
-    app.pick_save(&name, &[solidcraft_engine::io::DESIGN_EXT, "json"], |app, path| {
+    let initial_directory = app
+        .session
+        .path
+        .is_none()
+        .then(|| app.pdm.runtime.status().ok())
+        .flatten()
+        .filter(|status| status.connection.is_some())
+        .and_then(|status| status.managed.root);
+    app.pick_save_in(&name, &[solidcraft_engine::io::DESIGN_EXT, "json"], initial_directory.as_deref(), |app, path| {
         // A save under way answers a closing tab when it ends.
         if let Some(path) = path
             && crate::save_job::start(app, "file.save_as", json!({"path": path}))
@@ -957,7 +970,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             painter.line_segment([ws.right_top(), ws.right_bottom()], Stroke::new(1.0, t.border));
         }
         let render = crate::render_workspace::active(app);
-        let workspace_icon = if render { "ws_render" } else { "ws_design" };
+        let workspace_icon = if app.pdm.workspace_active { "ws_pdm" } else if render { "ws_render" } else { "ws_design" };
         icons::paint_icon(
             &painter,
             Rect::from_center_size(pos2(ws.center().x, ws.top() + if labels { 39.0 } else { 25.0 }), vec2(30.0, 30.0)),
@@ -967,7 +980,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
         ribbon_text(
             ui,
             pos2(ws.center().x, ws.top() + if labels { 69.0 } else { 50.0 }),
-            app.tr(if render { "ui.render" } else { "ui.design" }),
+            if app.pdm.workspace_active { app.tr_label("PDM") } else { app.tr(if render { "ui.render" } else { "ui.design" }) },
             t.font_button,
             t.text,
             true,
@@ -984,6 +997,11 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
         crate::scenario::publish_rect("workspace_switcher", ws);
         crate::scenario::publish_target("ribbon:workspace", ws);
         ribbon_tabs(app, ui, Rect::from_min_max(pos2(ribbon_left, r.top()), pos2(r.right(), r.top() + TAB_ROW_HEIGHT)));
+        if app.ui.tab == "PDM" {
+            let rect = Rect::from_min_max(pos2(ribbon_left, r.top() + TAB_ROW_HEIGHT), r.right_bottom());
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| crate::pdm_panel::actions(app, ui));
+            return;
+        }
         // Panels.
         let tab = app.ui.tab.clone();
         // The command whose tool or dialog is open right now, shown pressed in the toolbar.
@@ -1008,7 +1026,9 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
         let lists: Vec<_> = crate::toolbar_custom::panel_lists(&tab)
             .into_iter()
             .map(|(panel, cmds, promote)| {
+                let cmds: Vec<_> = cmds.into_iter().filter(|command| crate::pdm_panel::command_visible(app, command.id)).collect();
                 let mut shown = crate::toolbar_custom::buttons(app, &tab, panel, &cmds, promote);
+                shown.retain(|command| crate::pdm_panel::command_visible(app, command.id));
                 // Gallery cells are painted together after the large buttons, in reading order.
                 if tab == "SKETCH" && panel == "CONSTRAIN" {
                     shown.sort_by_key(|c| crate::workspace::CONSTRAINT_GALLERY.iter().position(|id| *id == c.id).map(|i| i + 1).unwrap_or(0));
@@ -1131,7 +1151,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                         br.max.x -= 14.0;
                     }
                 }
-                let info = selected.info(&app.session);
+                let info = app.command_info(selected);
                 let resp = ui.interact(br, ui.id().with(("cmd", c.id)), Sense::click_and_drag());
                 crate::scenario::publish_handle(&format!("toolbar:{}", c.id), br.center());
                 // The button itself (`toolbar:<id>` is also a drop-down row's while one is open).
@@ -1223,7 +1243,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                         pos2(button_x + (index % columns) as f32 * 27.0, top + 6.0 + (index / columns) as f32 * 23.0),
                         vec2(24.0, 20.0),
                     );
-                    let info = c.info(&app.session);
+                    let info = app.command_info(c);
                     let resp = ui.interact(cell, ui.id().with(("cmd", c.id)), Sense::click_and_drag());
                     let active = running.as_deref() == Some(c.id);
                     let accent = crate::theme::TabAccent::for_tab(&t, &tab);
@@ -1355,7 +1375,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                             // focused: the first or the last), instead of egui's own spatial move.
                             let (down, up) = ui.input(|i| (i.key_pressed(egui::Key::ArrowDown), i.key_pressed(egui::Key::ArrowUp)));
                             if down || up {
-                                let enabled: Vec<&str> = cmds.iter().filter(|c| c.info(&app.session).enabled).map(|c| c.id).collect();
+                                let enabled: Vec<&str> = cmds.iter().filter(|c| app.command_info(c).enabled).map(|c| c.id).collect();
                                 let focused = ui.ctx().memory(|m| m.focused());
                                 let at = enabled.iter().position(|id| focused == Some(dropdown_row_id(id)));
                                 let n = enabled.len();
@@ -1423,7 +1443,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                                 selection_filter(app, ui);
                             }
                             for c in cmds {
-                                let info = c.info(&app.session);
+                                let info = app.command_info(c);
                                 let response = crate::ui_kit::command_menu_button(ui, c.id, c.label, c.icon, c.shortcut.unwrap_or(""), info.enabled);
                                 crate::scenario::publish_handle(&format!("toolbar:{}", c.id), response.rect.center());
                                 if response.clicked() {
@@ -1613,7 +1633,7 @@ fn dropdown_width(app: &SolveApp, ui: &egui::Ui, cmds: &[&'static solidcraft_eng
 /// under the pointer or keyboard focus (like every menu).
 fn dropdown_row(app: &SolveApp, ui: &mut egui::Ui, c: &'static solidcraft_engine::CommandSpec, width: f32, pinned: bool) -> RowAction {
     let t = Tokens::get();
-    let info = c.info(&app.session);
+    let info = app.command_info(c);
     let (rect, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
     // Every row drags onto the toolbar (to pin it there); enabled rows also start their command.
     let sense = if info.enabled { Sense::click_and_drag() } else { Sense::drag() };
@@ -1711,7 +1731,7 @@ fn dropdown_keys(app: &SolveApp, ui: &egui::Ui, cmds: &[&'static solidcraft_engi
         return;
     }
     ui.ctx().data_mut(|d| d.insert_temp(handled, pass));
-    let enabled: Vec<_> = cmds.iter().filter(|c| c.info(&app.session).enabled).collect();
+    let enabled: Vec<_> = cmds.iter().filter(|c| app.command_info(c).enabled).collect();
     if enabled.is_empty() {
         return;
     }
@@ -1765,7 +1785,9 @@ struct ToolbarDrag {
 /// The dragged command's icon under the pointer, crossed out when releasing removes it.
 fn drag_ghost(ctx: &egui::Context, id: &str, at: egui::Pos2, removing: bool) {
     let t = Tokens::get();
-    let Some(c) = solidcraft_engine::find_command(id) else { return };
+    let Some(c) = solidcraft_engine::find_command(id) else {
+        return;
+    };
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("sc_toolbar_drag")));
     let r = Rect::from_center_size(at + vec2(14.0, 16.0), vec2(30.0, 30.0));
     p.rect(r, t.radius_sm, t.toolbar.gamma_multiply(0.92), Stroke::new(1.0, if removing { t.error } else { t.accent }), egui::StrokeKind::Inside);
@@ -1853,6 +1875,7 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
         if mods.command {
             match k {
                 Key::N => crate::documents::new_design(app),
+                Key::W if !mods.shift && !mods.alt => crate::documents::close_active_tab(app),
                 Key::Comma => crate::prefs::open_at(app, 0),
                 Key::O => {
                     app.pick_open(|app, path| {
@@ -1947,8 +1970,9 @@ mod header_report_tests {
         let mut h = crate::scenario::Harness::new();
         h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
         let dir = h.dir.clone();
-        h.app.services.pick_save =
-            Some(Box::new(move |name, _extensions| Box::pin(std::future::ready(Some(dir.join(name).to_string_lossy().into_owned())))));
+        h.app.services.pick_save = Some(Box::new(move |name, _extensions, _initial_directory| {
+            Box::pin(std::future::ready(Some(dir.join(name).to_string_lossy().into_owned())))
+        }));
         h.frames(3);
         h.step(&json!({"click":{"handle":"appbar:folder"}})).unwrap();
         h.step(&json!({"widget":"Save As JSON…"})).unwrap();
@@ -2816,7 +2840,9 @@ mod fill_width_tests {
                 let mut end = bar.left();
                 let mut on_bar = 0;
                 for (panel, cmds, promote) in &lists {
-                    let Some(rect) = crate::scenario::rect_of(&format!("panel:{tab}:{panel}")) else { continue };
+                    let Some(rect) = crate::scenario::rect_of(&format!("panel:{tab}:{panel}")) else {
+                        continue;
+                    };
                     on_bar += 1;
                     if *panel != "FINISH SKETCH" {
                         end = end.max(rect.right() + PANEL_GAP);
@@ -2883,6 +2909,56 @@ mod fill_width_tests {
                     "{at}: the title bar's right-hand controls overlap"
                 );
             }
+        }
+    }
+    #[test]
+    fn only_a_new_design_suggests_the_freshly_verified_managed_working_folder() {
+        use solidcraft_engine::pdm::{ActiveConnection, ManagedState, Outcome, Task};
+        use std::{cell::RefCell, rc::Rc};
+        for (verified, existing, exporting) in [(true, false, false), (false, false, false), (true, true, false), (true, false, true)] {
+            let mut h = crate::scenario::Harness::new();
+            let root = h.dir.join("managed").to_string_lossy().into_owned();
+            h.app.pdm.runtime.set_available(true).unwrap();
+            let id = h.app.pdm.runtime.enqueue(Task::Connect { port: 48231 }).unwrap();
+            let state = ManagedState {
+                root: Some(root.clone()),
+                server_id: Some("server".into()),
+                workspace: Some("workspace".into()),
+                ..Default::default()
+            };
+            let outcome = if verified {
+                Outcome::ManagedConnected {
+                    port: 48231,
+                    state,
+                    connections: vec![],
+                    connection: ActiveConnection {
+                        id: "a".repeat(64),
+                        label: "Verified archive".into(),
+                        origin: "https://localhost:48231".into(),
+                        server_id: "server".into(),
+                        account: "actual-account".into(),
+                        role: "Contributor".into(),
+                    },
+                }
+            } else {
+                Outcome::Managed { port: 48231, state }
+            };
+            h.app.pdm.runtime.finish(id, Ok(outcome)).unwrap();
+            if existing {
+                h.app.session.path = Some(h.dir.join("existing.solidcraft").to_string_lossy().into_owned());
+            }
+            let observed = Rc::new(RefCell::new(Vec::new()));
+            let captured = observed.clone();
+            h.app.services.pick_save = Some(Box::new(move |_, _, directory| {
+                captured.borrow_mut().push(directory.map(str::to_owned));
+                Box::pin(std::future::ready(None))
+            }));
+            if exporting {
+                export(&mut h.app, "step");
+            } else {
+                save_as(&mut h.app);
+            }
+            assert_eq!(observed.borrow().as_slice(), &[if verified && !existing && !exporting { Some(root) } else { None }]);
         }
     }
 }

@@ -257,6 +257,64 @@ fn an_agent_export_runs_on_a_copy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Background exports keep the editor's shared PDM destination protection.
+#[test]
+fn an_agent_export_on_a_copy_preserves_managed_and_historical_destination_guards() {
+    use solidcraft_engine::pdm::{LocalEntry, ManagedState, Outcome, Task};
+
+    for historical in [false, true] {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        h.app.apply_off_thread = Some(Duration::ZERO);
+        h.app.preferences.agent_off_thread = true;
+        let target = h.dir.join("protected.stl");
+        let original = b"original protected working file";
+        std::fs::write(&target, original).unwrap();
+        let path = target.to_string_lossy().into_owned();
+        h.app.pdm.runtime.set_available(true).unwrap();
+        let connected = h.app.pdm.runtime.enqueue(Task::Connect { port: 48231 }).unwrap();
+        h.app
+            .pdm
+            .runtime
+            .finish(
+                connected,
+                Ok(Outcome::Managed {
+                    port: 48231,
+                    state: ManagedState {
+                        server_id: Some("export-server".into()),
+                        workspace: Some("export-workspace".into()),
+                        local: vec![LocalEntry {
+                            document: "protected".into(),
+                            path: path.clone(),
+                            relative_path: "protected.stl".into(),
+                            base_version: 1,
+                            sha256: "ab".repeat(32),
+                            checked_out: false,
+                            modified: false,
+                            present: true,
+                        }],
+                        historical_paths: if historical { vec![path.clone()] } else { Vec::new() },
+                        ..Default::default()
+                    },
+                }),
+            )
+            .unwrap();
+        h.app.session.pdm = h.app.pdm.runtime.clone();
+        h.app.session.pdm_read_only = historical;
+        h.app.session.path = Some(path.clone());
+        let before = h.app.session.doc.clone();
+        for command in ["file.export", "file.save_mesh"] {
+            let (request, answer) = crate::ControlRequest::new("engine.execute", json!({"command":command,"params":{"path":path,"format":"stl"}}));
+            assert!(h.app.offload_control(&crate::fonts::test_context(), request).is_none(), "the export ran on the worker");
+            let result = reply_to(&mut h, &answer);
+            assert_eq!(result["ok"], false, "{command}, historical {historical}: {result}");
+            assert_eq!(std::fs::read(&target).unwrap(), original, "the worker must not overwrite a protected destination");
+            assert!(std::sync::Arc::ptr_eq(&before, &h.app.session.doc));
+        }
+    }
+}
+
 /// With the preference off (Preferences > AI, the default) an agent's design change runs on the
 /// window thread, as before: answered in the frame it arrives.
 #[test]

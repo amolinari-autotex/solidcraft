@@ -25,6 +25,18 @@ mod native_crash;
 mod native_frame;
 #[cfg(target_os = "macos")]
 mod open_documents;
+mod pdm;
+mod pdm_connection_import;
+pub mod pdm_connections;
+pub mod pdm_credentials;
+mod pdm_external;
+pub mod pdm_guided;
+#[cfg(test)]
+mod pdm_guided_capture;
+pub mod pdm_login;
+mod pdm_managed;
+pub mod pdm_profiles;
+pub mod pdm_setup;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 mod space_mouse;
 mod startup;
@@ -171,7 +183,24 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
     let open_parent = parent.clone();
     let program_parent = parent.clone();
     let file_parent = parent.clone();
+    let folder_parent = parent.clone();
+    let mut pdm_protected_roots: Vec<_> = settings_dir().into_iter().collect();
+    if let Some(installation) = std::env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf)) {
+        pdm_protected_roots.push(installation);
+    }
     Services {
+        pdm_local_diagnostics: std::env::var_os("SOLIDCRAFT_PDM_TOKEN").is_some(),
+        pdm: Some(pdm::service_with_boundaries(
+            settings_dir().map(|p| p.join("pdm-workspaces")),
+            settings_dir().map(|p| p.join("pdm-connections")),
+            pdm_protected_roots,
+        )),
+        pick_folder: Some(Box::new(move |initial: Option<&str>| {
+            let dialog = folder_parent.clone();
+            let dialog = if let Some(path) = initial { dialog.set_directory(path) } else { dialog };
+            let future = dialog.pick_folder();
+            Box::pin(async move { future.await.map(|folder| folder.path().to_string_lossy().into_owned()) })
+        })),
         pick_open: Some(Box::new(move |first: &[&str]| {
             // The file type the command reads comes first, so the picker opens on it (#1801).
             let mut dialog = open_parent.clone();
@@ -243,8 +272,9 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
             let future = dialog.pick_file();
             Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
         })),
-        pick_save: Some(Box::new(move |name: &str, exts: &[&str]| {
+        pick_save: Some(Box::new(move |name: &str, exts: &[&str], initial_directory: Option<&str>| {
             let dialog = parent.clone().set_file_name(name);
+            let dialog = if let Some(directory) = initial_directory { dialog.set_directory(directory) } else { dialog };
             let dialog = if exts == [io::DESIGN_EXT, "json"] {
                 if name.ends_with(".json") {
                     dialog.add_filter("Plain JSON design", &["json"]).add_filter("SolidCraft container", &[io::DESIGN_EXT])
@@ -426,9 +456,24 @@ fn http_call(url: &str, timeout: std::time::Duration) -> Result<ureq::http::Resp
     Ok(response)
 }
 
-/// The per-user settings folder: eframe's storage (`app.ron`) and the anti-aliasing preference.
+/// An absolute settings-directory override for isolated native profiles.
+const SETTINGS_DIR_ENV: &str = "SOLIDCRAFT_SETTINGS_DIR";
+
+fn settings_dir_override(value: Option<std::ffi::OsString>) -> Result<Option<std::path::PathBuf>, &'static str> {
+    value
+        .map(|value| {
+            let path = std::path::PathBuf::from(value);
+            if path.is_absolute() { Ok(path) } else { Err("SOLIDCRAFT_SETTINGS_DIR must be an absolute directory path") }
+        })
+        .transpose()
+}
+
 fn settings_dir() -> Option<std::path::PathBuf> {
-    eframe::storage_dir("SolidCraft")
+    match settings_dir_override(std::env::var_os(SETTINGS_DIR_ENV)) {
+        Ok(Some(path)) => Some(path),
+        Ok(None) => eframe::storage_dir("SolidCraft"),
+        Err(_) => None,
+    }
 }
 
 /// The anti-aliasing preference, kept next to eframe's storage (it is needed before the
@@ -444,11 +489,21 @@ fn graphics_path() -> Option<std::path::PathBuf> {
 /// old app id's `~/.var/app` folder; that copy comes first, as it is the newest. The old folders
 /// are never changed.
 fn adopt_legacy_settings() {
-    let (Some(current), Some(legacy)) = (settings_dir(), eframe::storage_dir("SolveCraft")) else { return };
-    let legacy_eframe = eframe::storage_dir(solidcraft_engine::io::LEGACY_APP_ID);
-    let old_flatpak = solidcraft_engine::io::legacy_flatpak_path(&current);
-    if let Err(e) = adopt_settings(&current, old_flatpak.as_deref(), &legacy, legacy_eframe.as_deref()) {
-        log::warn!("settings: could not copy the previous release's settings into {}: {e}", current.display());
+    adopt_legacy_for_default_profile(std::env::var_os(SETTINGS_DIR_ENV), || {
+        let (Some(current), Some(legacy)) = (settings_dir(), eframe::storage_dir("SolveCraft")) else {
+            return;
+        };
+        let legacy_eframe = eframe::storage_dir(solidcraft_engine::io::LEGACY_APP_ID);
+        let old_flatpak = solidcraft_engine::io::legacy_flatpak_path(&current);
+        if let Err(e) = adopt_settings(&current, old_flatpak.as_deref(), &legacy, legacy_eframe.as_deref()) {
+            log::warn!("settings: could not copy the previous release's settings into {}: {e}", current.display());
+        }
+    });
+}
+
+fn adopt_legacy_for_default_profile(override_dir: Option<std::ffi::OsString>, adopt: impl FnOnce()) {
+    if override_dir.is_none() {
+        adopt();
     }
 }
 
@@ -530,6 +585,24 @@ const APP_ID: &str = solidcraft_engine::io::APP_ID;
 
 fn main() -> eframe::Result {
     mark("main");
+    // Reject an invalid override before startup can inspect or write the normal profile.
+    settings_dir_override(std::env::var_os(SETTINGS_DIR_ENV)).map_err(|message| {
+        let import = std::env::args_os().nth(1).is_some_and(|arg| arg == "--pdm-import-connection");
+        eframe::Error::AppCreation(if import { "ui.pdm_error_invalid" } else { message }.into())
+    })?;
+    let mut import_args = std::env::args_os().skip(1);
+    if import_args.next().is_some_and(|arg| arg == "--pdm-import-connection") {
+        let descriptor = import_args.next().map(std::path::PathBuf::from).ok_or_else(|| eframe::Error::AppCreation("ui.pdm_error_invalid".into()))?;
+        if import_args.next().is_some() {
+            return Err(eframe::Error::AppCreation("ui.pdm_error_invalid".into()));
+        }
+        let settings = settings_dir().ok_or_else(|| eframe::Error::AppCreation("ui.pdm_error_metadata".into()))?;
+        let protected: Vec<_> = std::env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf)).into_iter().collect();
+        let receipt = pdm_connection_import::import_file(&descriptor, &settings, &pdm_credentials::OsCredentialStore, &protected)
+            .map_err(|error| eframe::Error::AppCreation(error.to_string().into()))?;
+        println!("{}", serde_json::to_string(&receipt).map_err(|_| eframe::Error::AppCreation("ui.pdm_error_metadata".into()))?);
+        return Ok(());
+    }
     adopt_legacy_settings();
     let mut safe_mode = startup::env_on(std::env::var(startup::SAFE_MODE_ENV).ok().as_deref());
     let mut control_port: Option<u16> = solidcraft_engine::geom::env::var("CONTROL_PORT").and_then(|p| p.parse().ok());
@@ -559,7 +632,9 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             "--help" | "-h" => {
-                println!("usage: solidcraft [--control PORT] [--sample] [--crash-log] [--safe-mode] [design.solidcraft | part.step]");
+                println!(
+                    "usage: solidcraft [--control PORT] [--sample] [--crash-log] [--safe-mode] [design.solidcraft | part.step] | --pdm-import-connection DESCRIPTOR"
+                );
                 return Ok(());
             }
             _ => files.push(a),
@@ -872,6 +947,29 @@ mod icon_tests {
         assert_eq!((icon.width, icon.height), (64, 64));
         assert_eq!(icon.rgba, super::app_icon::rgba(64).expect("original mark"));
         assert_eq!(viewport.app_id.as_deref(), Some(super::APP_ID));
+    }
+}
+
+#[cfg(test)]
+mod native_settings_tests {
+    #[test]
+    fn isolated_settings_override_requires_an_absolute_path_without_environment_mutation() {
+        let path = std::env::temp_dir().join("solidcraft-pdm-private-settings");
+        assert_eq!(super::settings_dir_override(Some(path.clone().into_os_string())).unwrap(), Some(path));
+        assert_eq!(super::settings_dir_override(None).unwrap(), None);
+        for value in ["", "relative-settings"] {
+            assert!(super::settings_dir_override(Some(value.into())).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_settings_are_not_even_looked_up_for_an_explicit_profile() {
+        for value in [std::env::temp_dir().into_os_string(), "".into()] {
+            super::adopt_legacy_for_default_profile(Some(value), || panic!("legacy settings were inspected"));
+        }
+        let called = std::cell::Cell::new(false);
+        super::adopt_legacy_for_default_profile(None, || called.set(true));
+        assert!(called.get());
     }
 }
 

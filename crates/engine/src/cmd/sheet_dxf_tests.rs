@@ -520,3 +520,25 @@ fn the_file_of_a_body_is_named_after_it_and_no_two_share_a_name() {
     // Two bodies that would share a file (in any case) get a number.
     assert_eq!(names("p.dxf", &["Lid", "lid", "LID", "Lid_2"]), ["p-Lid.dxf", "p-lid_2.dxf", "p-LID_3.dxf", "p-Lid_2_2.dxf"]);
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn pdm_multi_sheet_export_checks_later_target_before_writing_first() {
+    let mut s = lid_and_wall();
+    let dir = std::env::temp_dir().join(format!("solidcraft-sheet-output-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("panel.dxf").to_string_lossy().to_string();
+    let names: Vec<_> = s.model.state().sheets.iter().map(|sheet| sheet.body.clone()).collect();
+    let paths = super::body_paths(&path, &names);
+    assert_eq!(paths.len(), 2);
+    std::fs::write(&paths[0], b"first existing file").unwrap();
+    std::fs::write(&paths[1], b"protected existing file").unwrap();
+    s.path = Some(paths[1].clone());
+    s.pdm_read_only = true;
+    let error = s.execute("sheet.export_dxf", &json!({"per_body":true,"path":path})).unwrap_err().to_string();
+    assert!(error.contains("Historical"), "{error}");
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"first existing file");
+    assert_eq!(std::fs::read(&paths[1]).unwrap(), b"protected existing file");
+    s.execute("sheet.export_dxf", &json!({"per_body":true,"path":dir.join("separate.dxf")})).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

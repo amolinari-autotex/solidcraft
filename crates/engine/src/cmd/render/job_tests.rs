@@ -217,3 +217,24 @@ fn native_start_and_cancel_measure_cached_capture_without_timing_assertions() {
     );
     assert!(status.progress.phase.terminal());
 }
+
+#[cfg(unix)]
+#[test]
+fn pdm_render_export_rejects_a_png_symlink_to_historical_design() {
+    let (mut s, host) = session();
+    let id = start(&mut s);
+    finish(&host);
+    let dir = std::env::temp_dir().join(format!("solidcraft-render-output-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("historical.solidcraft");
+    let alias = dir.join("alias.png");
+    std::fs::write(&target, b"protected design").unwrap();
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    s.path = Some(target.to_string_lossy().into_owned());
+    s.pdm_read_only = true;
+    let error = s.execute("render.export", &json!({"job":id,"path":alias,"overwrite":true})).unwrap_err().to_string();
+    assert!(error.contains("Historical"), "{error}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"protected design");
+    s.execute("render.export", &json!({"job":id,"path":dir.join("separate.png")})).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -4,7 +4,7 @@
 use solidcraft_engine::CommandSpec;
 use solidcraft_engine::doc::FeatureKind;
 
-pub const TABS: &[&str] = &["MODEL", "SURFACE", "ASSEMBLE", "INSERT", "INSPECT", "MANAGE", "VIEW"];
+pub const TABS: &[&str] = &["MODEL", "SURFACE", "ASSEMBLE", "INSERT", "INSPECT", "MANAGE", "PDM", "VIEW"];
 
 /// Reading order of the compact, three-column constraint gallery. Icons come from each spec.
 pub const CONSTRAINT_GALLERY: &[&str] = &[
@@ -70,6 +70,9 @@ const CONFIGURE: &[&str] = &["parameters.change", "config.table", "config.config
 pub const AGENT_ONLY: &[&str] = &["sketch.solve"];
 
 pub const SECTIONS: &[Section] = &[
+    // PDM paints its guarded browser/editor actions; these sections retain command discovery.
+    Section { tab: "PDM", panel: "WORKSPACE", promoted: 0, ids: &["pdm.archive", "pdm.checkout", "pdm.cancel_checkout", "pdm.get_latest"] },
+    Section { tab: "PDM", panel: "ARCHIVE", promoted: 0, ids: &["pdm.open_document", "pdm.open_archived"] },
     Section {
         tab: "MODEL",
         panel: "SKETCH",
@@ -444,6 +447,9 @@ pub fn sheet_body(app: &crate::SolveApp) -> Option<String> {
 }
 
 pub fn visible_tabs(app: &crate::SolveApp) -> Vec<&'static str> {
+    if app.pdm.workspace_active {
+        return vec!["PDM"];
+    }
     if crate::render_workspace::active(app) {
         return vec!["RENDER"];
     }
@@ -460,7 +466,7 @@ pub fn visible_tabs(app: &crate::SolveApp) -> Vec<&'static str> {
 /// Select contextual tabs on entry (or a different sheet body), allowing the other tabs to
 /// remain usable for the rest of that context. Sketch takes precedence over sheet metal.
 pub fn sync_context(app: &mut crate::SolveApp) {
-    if crate::render_workspace::active(app) {
+    if app.pdm.workspace_active || crate::render_workspace::active(app) {
         return;
     }
     let context = app.session.active_sketch.map(|id| format!("sketch:{id}")).or_else(|| sheet_body(app).map(|body| format!("sheet:{body}")));
@@ -482,6 +488,9 @@ pub fn sync_context(app: &mut crate::SolveApp) {
 
 pub fn select_command_tab(app: &mut crate::SolveApp, id: &str) {
     sync_context(app);
+    if app.pdm.workspace_active {
+        return;
+    }
     let Some(c) = solidcraft_engine::find_command(id) else { return };
     // Keep the tab a toolbar click came from when it already lists this shared command.
     if crate::toolbar_custom::panel_lists(&app.ui.tab).iter().any(|(_, cmds, _)| cmds.iter().any(|c| c.id == id)) {
@@ -641,6 +650,21 @@ mod tests {
         ] {
             assert!(layout(tab, panel, &specs).unwrap().0.iter().any(|c| c.id == id));
         }
+    }
+
+    #[test]
+    fn pdm_browser_keeps_its_ribbon_and_returning_restores_the_modern_editor_tabs() {
+        let mut h = crate::scenario::Harness::new();
+        let previous = h.app.ui.tab.clone();
+        crate::pdm_panel::enter(&mut h.app).unwrap();
+        sync_context(&mut h.app);
+        select_command_tab(&mut h.app, "solid.extrude");
+        assert_eq!(visible_tabs(&h.app), vec!["PDM"]);
+        assert_eq!(h.app.ui.tab, "PDM");
+        crate::pdm_panel::leave(&mut h.app);
+        assert_eq!(h.app.ui.tab, previous);
+        assert!(visible_tabs(&h.app).contains(&"MODEL"));
+        assert!(visible_tabs(&h.app).contains(&"PDM"), "editor PDM actions remain reachable");
     }
 
     #[test]

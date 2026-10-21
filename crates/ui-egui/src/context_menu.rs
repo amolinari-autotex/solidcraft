@@ -162,7 +162,7 @@ impl Item {
 
 /// A command entry: label, icon, shortcut and enablement come from the registry.
 pub(crate) fn cmd(app: &SolveApp, id: &str, label: &str) -> Item {
-    let info = solidcraft_engine::find_command(id).map(|c| c.info(&app.session));
+    let info = solidcraft_engine::find_command(id).map(|c| app.command_info(c));
     let shortcut = match id {
         "edit.undo" => "Ctrl+Z".to_string(),
         "edit.redo" => "Ctrl+Y".to_string(),
@@ -361,13 +361,19 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
         Target::Toolbar => crate::toolbar_custom::toolbar_items(app),
         Target::Workspace => {
             let rendering = crate::render_workspace::active(app);
+            let pdm = app.pdm.workspace_active;
             let mut v = vec![
-                act("ui.workspace.design", "Design", "ws_design").with(json!({"workspace":"design"})).key(if rendering { "" } else { "current" }),
+                act("ui.workspace.design", "Design", "ws_design").with(json!({"workspace":"design"})).key(if rendering || pdm {
+                    ""
+                } else {
+                    "current"
+                }),
                 act("ui.workspace.render", "Render", "ws_render")
                     .with(json!({"workspace":"render"}))
                     .key(if rendering { "current" } else { "" })
                     .on(app.session.active_sketch.is_none() && app.tool.is_none() && app.dialog.is_none() && !app.file_load.busy()),
             ];
+            v.push(act("ui.workspace.pdm", "PDM", "ws_pdm").with(json!({"workspace":"pdm"})).key(if pdm { "current" } else { "" }));
             for (w, icon) in [("Animation", "ws_animate"), ("Simulation", ""), ("Manufacture", ""), ("Drawing", "ws_drawing")] {
                 v.push(act("ui.workspace", w, icon).key("coming later").on(false));
             }
@@ -1174,11 +1180,18 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
         "ui.toolbarPin" | "ui.toolbarRemove" | "ui.toolbarReset" | "ui.toolbarCustomize" | "ui.shortcutPin" => {
             crate::toolbar_custom::run(app, &item.id, &p)
         }
-        "ui.workspace" | "ui.workspace.design" | "ui.workspace.render" => {
-            if let Some(workspace) = p.get("workspace").and_then(Value::as_str)
-                && let Err(e) = crate::render_workspace::enter(app, workspace == "render")
-            {
-                app.set_status(e, true);
+        "ui.workspace" | "ui.workspace.design" | "ui.workspace.render" | "ui.workspace.pdm" => {
+            if let Some(workspace) = p.get("workspace").and_then(Value::as_str) {
+                let result = if workspace == "pdm" {
+                    crate::pdm_panel::enter(app)
+                } else {
+                    crate::pdm_panel::leave(app);
+                    app.home.open = false;
+                    crate::render_workspace::enter(app, workspace == "render")
+                };
+                if let Err(error) = result {
+                    app.set_status(error, true);
+                }
             }
         }
         "ui.findJoint" => {
@@ -1767,7 +1780,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 menu_frame(ui, |ui| {
                     for (k, item) in list.iter().enumerate() {
                         if item.children.is_empty() {
-                            if let Some(p) = list_row_lit(ui, item, key_row == Some(k)) {
+                            if let Some(p) = list_row_command(ui, item, key_row == Some(k), app) {
                                 picked = Some(p);
                             }
                         } else {
@@ -1814,7 +1827,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     let handle = format!("{}:{}", child.id, child.label);
                     let mut row = kit_item(child, app.menu.submenu_key == Some(n));
                     row.id = &handle;
-                    if row.show(ui).clicked() && child.enabled {
+                    let response = command_reason(row.show(ui), app, &child.id);
+                    if response.clicked() && child.enabled {
                         picked = Some(child.clone());
                     }
                 }
@@ -1840,6 +1854,21 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         close(app);
         run_item(app, &item, at);
     }
+}
+
+fn command_reason(response: egui::Response, app: &SolveApp, id: &str) -> egui::Response {
+    match solidcraft_engine::find_command(id).and_then(|command| app.command_info(command).disabled_reason) {
+        Some(reason) => response.on_hover_text(reason),
+        None => response,
+    }
+}
+
+fn list_row_command(ui: &mut egui::Ui, item: &Item, lit: bool, app: &SolveApp) -> Option<Item> {
+    if item.is_sep() || item.is_heading() {
+        return list_row_lit(ui, item, lit);
+    }
+    let response = command_reason(kit_item(item, lit).show(ui), app, &item.id);
+    (response.clicked() && item.enabled).then(|| item.clone())
 }
 
 /// Shared kit surface; legacy callers retain their menu positioning and dispatch.
@@ -2095,14 +2124,14 @@ mod workspace_menu_tests {
         h.call("ui.resize", json!({"width":1200,"height":1000}));
         h.step(&json!({"click":{"handle":"ribbon:workspace"}})).unwrap();
         let opener = rect_of("ribbon:workspace").unwrap();
-        let rows: Vec<_> = ["design", "render", "animation", "simulation", "manufacture", "drawing"]
+        let rows: Vec<_> = ["design", "render", "pdm", "animation", "simulation", "manufacture", "drawing"]
             .iter()
             .map(|slug| rect_of(&format!("workspace:menu:{slug}")).unwrap())
             .collect();
         assert!(rows.windows(2).all(|pair| pair[0].bottom() <= pair[1].top()));
         assert!(rows[0].top() > opener.bottom());
         assert_eq!(rows[0].width(), 450.0);
-        assert!(items(&h.app, &Target::Workspace).iter().skip(2).all(|item| !item.enabled));
+        assert!(items(&h.app, &Target::Workspace).iter().skip(3).all(|item| !item.enabled));
         h.step(&json!({"click":{"handle":"workspace:menu:animation"}})).unwrap();
         assert!(!crate::render_workspace::active(&h.app));
         assert!(h.app.viewport.context_menu.is_some());

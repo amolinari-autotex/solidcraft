@@ -96,6 +96,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
         "prepare_ms":prepare_ms,"projection_ms":drawing.projection_ms,"occlusion_ms":drawing.occlusion_ms});
     if let Some(path) = path {
         solidcraft_io::vfs::check(path).map_err(|e| crate::EngineError::Other(e.to_string()))?;
+        s.check_output_path(path)?;
         solidcraft_io::write_atomic(std::path::Path::new(path), text.as_bytes(), false).map_err(|e| crate::EngineError::Other(e.to_string()))?;
         result["path"] = json!(path);
     } else {

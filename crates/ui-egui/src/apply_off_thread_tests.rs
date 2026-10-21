@@ -49,8 +49,21 @@ fn ok_computes_off_the_window_thread_saying_so_then_applies() {
     h.app.apply_gate = Some(std::sync::Arc::new(std::sync::Mutex::new(gate)));
     h.step(&json!({"key": "Enter"})).unwrap();
     assert!(h.app.applying.is_some() && h.app.dialog.is_some(), "computing, the dialog open");
+    // Keep the current worker gate; test elapsed feedback without waiting.
+    if let Some(job) = h.app.applying.as_mut() {
+        job.started -= 2000.0;
+    }
     h.frames(1);
-    assert!(h.widget("Computing… 0 s").is_some(), "the dialog says it computes");
+    let computing_label = h.output.accesskit_update.as_ref().and_then(|tree| {
+        tree.nodes.iter().flat_map(|(_, node)| [node.label(), node.value()].into_iter().flatten()).find(|label| {
+            label
+                .strip_prefix("Computing… ")
+                .and_then(|tail| tail.strip_suffix(" s"))
+                .and_then(|seconds| seconds.parse::<u64>().ok())
+                .is_some_and(|seconds| seconds >= 2)
+        })
+    });
+    assert!(computing_label.is_some_and(|label| h.widget(label).is_some()), "the visible dialog says it computes with elapsed seconds");
     // Enter again does not start it twice.
     h.step(&json!({"key": "Enter"})).unwrap();
     finish.send(()).unwrap();

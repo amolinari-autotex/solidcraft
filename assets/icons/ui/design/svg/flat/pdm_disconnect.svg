@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Disconnect archive</title>
+  <path d="M25 7L25 24M39 7L39 24" fill="none" stroke="currentColor" stroke-width="5" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M16 25L48 25L48 31Q48 41 38 41L36 41L36 47L28 47L28 41L26 41Q16 41 16 31Z" fill="currentColor" stroke="currentColor" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 47L32 57" fill="none" stroke="currentColor" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M53 8L11 56" fill="none" stroke="#ffffff" stroke-width="9.25" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M53 8L11 56" fill="none" stroke="currentColor" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

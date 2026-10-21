@@ -103,6 +103,7 @@ fn inspect(_s: &mut Session, p: &Value) -> Result<Value> {
 fn export(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "library.export";
     let request: Export = serde_json::from_value(p.clone()).map_err(|e| bad(cmd, e.to_string()))?;
+    s.check_output_path(&request.path)?;
     path(cmd, &request.path)?;
     if !request.path.to_ascii_lowercase().ends_with(".json") {
         return Err(bad(cmd, "library export path must end in .json"));

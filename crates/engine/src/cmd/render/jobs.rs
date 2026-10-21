@@ -113,6 +113,7 @@ struct Export {
 
 pub(super) fn export(s: &mut Session, params: &Value) -> Result<Value> {
     let input: Export = serde_json::from_value(params.clone()).map_err(|e| bad("render.export", e.to_string()))?;
+    s.check_output_path(&input.path)?;
     let path = std::path::Path::new(&input.path);
     if input.path.len() > 4096 || input.path.chars().any(char::is_control) || !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")) {
         return Err(bad("render.export", "a bounded PNG destination path is required"));

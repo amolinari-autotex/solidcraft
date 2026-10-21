@@ -16,6 +16,7 @@ pub mod fuzz;
 pub mod licences;
 pub mod occurrences;
 pub mod params;
+pub mod pdm;
 pub mod product_scene;
 pub mod recovery;
 pub mod render_jobs;
@@ -231,6 +232,12 @@ impl WorldCache {
 
 /// An editing session on one design.
 pub struct Session {
+    /// Host-only PDM connection and operation queue; never part of the design or undo history.
+    pub pdm: pdm::Runtime,
+    /// Host-only historical snapshot guard; never serialized into a design.
+    pub pdm_read_only: bool,
+    /// Host-only editor freshness; never stored in a design or public status.
+    pub pdm_recovery_epoch: u64,
     pub doc: Arc<Document>,
     pub model: Model,
     pub undo: Vec<Snapshot>,
@@ -400,6 +407,9 @@ impl Session {
             model
         });
         Session {
+            pdm: pdm::Runtime::default(),
+            pdm_read_only: false,
+            pdm_recovery_epoch: 0,
             saved: doc.clone(),
             doc,
             model,
@@ -446,6 +456,7 @@ impl Session {
     /// design before the batch, which is what the batch promised (#3242). The design is what a
     /// checkpoint keeps, not the replaced session's file path (docs/mcp.md).
     pub fn replace_design(&mut self, fresh: Session) {
+        let pdm = self.pdm.clone();
         let auto_project = self.auto_project;
         let param_check = self.param_check;
         let render_viewport = self.render_viewport.clone();
@@ -453,6 +464,7 @@ impl Session {
         let checkpoints = std::mem::take(&mut self.checkpoints);
         let next_checkpoint = self.next_checkpoint;
         *self = fresh;
+        self.pdm = pdm;
         self.auto_project = auto_project;
         self.param_check = param_check;
         self.render_viewport = render_viewport;
@@ -773,6 +785,15 @@ impl Session {
     /// the model up to date before anything reads it.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        if spec.undoable || matches!(id, "edit.undo" | "edit.redo") {
+            self.check_pdm_reopen()?;
+        }
+        if spec.undoable && self.path.as_deref().is_some_and(|path| self.pdm.blocks_path(path)) {
+            return Err(EngineError::Other("Wait for the managed operation before editing this file".into()));
+        }
+        if id.starts_with("pdm.") {
+            cmd::validate_pdm_params(id, params)?;
+        }
         let host_viewport = self.render_viewport.clone();
         let host_jobs = self.render_jobs.host.clone();
         let live = spec.live.filter(|_| params.get("live").and_then(Value::as_bool) == Some(true));
@@ -933,6 +954,9 @@ impl Session {
     pub fn scratch(&self) -> Session {
         Session {
             doc: self.doc.clone(),
+            pdm: pdm::Runtime::default(),
+            pdm_read_only: false,
+            pdm_recovery_epoch: 0,
             model: self.model.clone(),
             undo: Vec::new(),
             redo: Vec::new(),

@@ -325,6 +325,14 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
             "quit_requested": app.quit_requested,
             "quitting": app.docs.quitting.is_some(),
         })),
+        "ui.drop_path" => {
+            let Some(path) = s("path") else { return err("path is required") };
+            if path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control) {
+                return err("invalid dropped path");
+            }
+            app.drop_path(path);
+            ok(json!({"handled": true, "pdm_browser": app.pdm.workspace_active}))
+        }
         "ui.file" => {
             let Some(path) = s("path") else { return err("path is required") };
             if p.get("insert").and_then(Value::as_bool).unwrap_or(false) {

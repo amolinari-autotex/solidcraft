@@ -27,7 +27,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          reuse?: bool (default false): insert another occurrence of an existing link to the same file",
     ),
     CommandSpec::new("component.update_links", "Update Links", update_links).icon("update").params(
-        "component?: id or name (default: every linked component) — reads the linked designs again and replaces their bodies where they changed",
+        "component?: id or name (default: every linked component); recursive?: bool (default false), resolves current nested linked designs in memory without saving source files",
     ),
     CommandSpec::new("component.relink", "Relink Source", relink).icon("update").params(
         "component: id or name of a linked component; path: a saved .solidcraft design — replaces the source and linked bodies for all its occurrences, preserving identities and placements; returns path, previous_path, warnings, joint_errors and joint_conflicts",
@@ -106,29 +106,74 @@ pub(super) fn rebased(doc: &Document, from: Option<&str>, to: &str) -> std::coll
 
 /// The solid bodies of the design at `file`, evaluated, as an Import feature.
 fn linked_bodies(file: &Path, own: Option<&str>) -> Result<(String, solidcraft_io::StepFeature)> {
+    linked_bodies_with(file, own, None)
+}
+
+#[derive(Default)]
+struct LinkWalk {
+    active: Vec<PathBuf>,
+    files: usize,
+    bytes: usize,
+}
+
+fn link_key(path: &Path) -> PathBuf {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(path) = std::fs::canonicalize(path) {
+        return path;
+    }
+    absolute(path)
+}
+
+fn linked_bodies_with(file: &Path, own: Option<&str>, mut walk: Option<&mut LinkWalk>) -> Result<(String, solidcraft_io::StepFeature)> {
     let shown = file.display().to_string();
     if own.is_some_and(|o| absolute(Path::new(o)) == absolute(file)) {
         return Err(EngineError::Other(format!("{shown}: a design can't be linked into itself")));
     }
-    let bytes = solidcraft_io::vfs::read(&shown, solidcraft_io::MAX_DESIGN_BYTES).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
-    let doc = solidcraft_io::read_design(&bytes).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
-    let name = doc.name.clone();
-    let part = Session::new(doc);
-    if let Some(e) = part.model.results.iter().find_map(|r| r.error.clone()) {
-        return Err(EngineError::Other(format!("{shown}: the design has a feature that fails ({e}); fix it before linking it")));
+    if let Some(walk) = walk.as_deref_mut() {
+        let key = link_key(file);
+        if walk.files >= 256 || walk.active.len() >= 32 || walk.active.contains(&key) {
+            return Err(EngineError::Other("Linked design graph contains a cycle or exceeds the refresh limit".into()));
+        }
+        walk.files += 1;
+        walk.active.push(key);
     }
-    let world = part.world_state();
-    let solids: Vec<String> = world.bodies.iter().filter(|b| !b.body.is_mesh()).map(|b| b.name.clone()).collect();
-    if solids.is_empty() {
-        return Err(EngineError::Other(format!("{shown}: the design has no solid bodies to link")));
+    let result = (|| {
+        let limit = walk
+            .as_ref()
+            .map_or(solidcraft_io::MAX_DESIGN_BYTES, |walk| (64_usize << 20).saturating_sub(walk.bytes).min(solidcraft_io::MAX_DESIGN_BYTES));
+        let bytes = solidcraft_io::vfs::read(&shown, limit).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
+        if let Some(walk) = walk.as_deref_mut() {
+            walk.bytes = walk.bytes.saturating_add(bytes.len());
+        }
+        let doc = solidcraft_io::read_design(&bytes).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
+        let name = doc.name.clone();
+        let mut part = Session::new(doc);
+        part.path = Some(shown.clone());
+        if !part.doc.links.is_empty()
+            && let Some(walk) = walk.as_deref_mut()
+        {
+            update_links_with(&mut part, &json!({}), Some(walk))?;
+        }
+        if let Some(e) = part.model.results.iter().find_map(|r| r.error.clone()) {
+            return Err(EngineError::Other(format!("{shown}: the design has a feature that fails ({e}); fix it before linking it")));
+        }
+        let world = part.world_state();
+        let solids: Vec<String> = world.bodies.iter().filter(|b| !b.body.is_mesh()).map(|b| b.name.clone()).collect();
+        if solids.is_empty() {
+            return Err(EngineError::Other(format!("{shown}: the design has no solid bodies to link")));
+        }
+        let step = solidcraft_io::export(&part.doc.painted(&world), &solids, solidcraft_io::Format::Step, &name)
+            .map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
+        let mut feature = solidcraft_io::step_import_feature(&step, &shown).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
+        if world.bodies.len() > solids.len() {
+            feature.warnings.push(format!("{} mesh bodies of {shown} are not linked", world.bodies.len() - solids.len()));
+        }
+        Ok((name, feature))
+    })();
+    if let Some(walk) = walk {
+        walk.active.pop();
     }
-    let step = solidcraft_io::export(&part.doc.painted(&world), &solids, solidcraft_io::Format::Step, &name)
-        .map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
-    let mut feature = solidcraft_io::step_import_feature(&step, &shown).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
-    if world.bodies.len() > solids.len() {
-        feature.warnings.push(format!("{} mesh bodies of {shown} are not linked", world.bodies.len() - solids.len()));
-    }
-    Ok((name, feature))
+    result
 }
 
 fn component_key(s: &Session, p: &Value, key: &str, cmd: &str) -> Result<u64> {
@@ -189,6 +234,19 @@ fn insert_design(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
+    let recursive = match p.get("recursive") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(bad("component.update_links", "recursive must be a boolean")),
+    };
+    let mut walk = LinkWalk::default();
+    if let Some(path) = &s.path {
+        walk.active.push(link_key(Path::new(path)));
+    }
+    update_links_with(s, p, recursive.then_some(&mut walk))
+}
+
+fn update_links_with(s: &mut Session, p: &Value, mut walk: Option<&mut LinkWalk>) -> Result<Value> {
     let cmd = "component.update_links";
     let only = if p.get("component").is_some() { Some(component_key(s, p, "component", cmd)?) } else { None };
     if let Some(c) = only
@@ -213,7 +271,7 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
         };
         let old = old.clone();
         let file = resolve(s.path.as_deref(), &link.path);
-        let (_, sf) = linked_bodies(&file, s.path.as_deref()).map_err(|e| bad(cmd, format!("{cname}: {e}")))?;
+        let (_, sf) = linked_bodies_with(&file, s.path.as_deref(), walk.as_deref_mut()).map_err(|e| bad(cmd, format!("{cname}: {e}")))?;
         warnings.extend(sf.warnings.iter().cloned());
         if matches!(&sf.kind, FeatureKind::Import { step, .. } if *step == old) {
             unchanged.push(cname);

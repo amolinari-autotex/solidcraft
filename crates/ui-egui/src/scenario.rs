@@ -201,7 +201,7 @@ impl Harness {
     fn install(&mut self) {
         let dir = self.dir.clone();
         self.app.services.pick_save =
-            Some(Box::new(move |name, _| Box::pin(std::future::ready(Some(dir.join(name).to_string_lossy().into_owned())))));
+            Some(Box::new(move |name, _, _initial_directory| Box::pin(std::future::ready(Some(dir.join(name).to_string_lossy().into_owned())))));
         let next = self.next_file.clone();
         self.app.services.pick_open = Some(Box::new(move |_| Box::pin(std::future::ready(next.borrow_mut().take()))));
     }

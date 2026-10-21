@@ -615,6 +615,32 @@ fn moving_a_parameter_refuses_bad_targets() {
     assert_eq!(s.doc.to_json(), before);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn pdm_output_guard_preserves_historical_bytes_and_allows_separate_exports() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-parameter-output-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("historical.json");
+    let mut s = Session::default();
+    s.execute("file.save", &json!({"path":path})).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    s.pdm_read_only = true;
+    for (id, extra) in
+        [("parameters.export", json!({"format":"json"})), ("timeline.export_script", json!({})), ("library.export", json!({"overwrite":true}))]
+    {
+        let mut params = extra;
+        params["path"] = json!(path);
+        let error = s.execute(id, &params).unwrap_err().to_string();
+        assert!(error.contains("Historical"), "{id}: {error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    let separate = dir.join("parameters.json");
+    s.execute("parameters.export", &json!({"path":separate,"format":"json"})).unwrap();
+    assert!(separate.exists());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn a_large_import_is_checked_once_and_keeps_each_rows_unit() {
     // 3000 parameters, each the one before plus a millimetre, then an angle, a unit-less

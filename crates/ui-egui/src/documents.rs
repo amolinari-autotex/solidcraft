@@ -55,6 +55,7 @@ impl DocSlot {
 #[derive(Default)]
 pub struct Documents {
     slots: Vec<Option<DocSlot>>,
+    historical: Vec<HistoricalIdentity>,
     pub active: usize,
     /// A tab waiting for the answer to "save changes?".
     pub closing: Option<usize>,
@@ -68,6 +69,16 @@ pub struct Documents {
     /// is closed first, so the ones before it keep their places). One with unsaved changes asks
     /// first; Cancel stops the rest (#3055).
     pub batch: Option<Vec<usize>>,
+}
+
+// Local provenance is not permission: a fresh exact server authorization is
+// required before activating this editor. Weak identity prevents a same-path
+// reload from inheriting the previous native snapshot's exact Reference.
+struct HistoricalIdentity {
+    server: String,
+    reference: solidcraft_engine::pdm::Reference,
+    path: String,
+    document: std::sync::Weak<solidcraft_engine::doc::Document>,
 }
 
 impl Documents {
@@ -149,6 +160,7 @@ pub fn switch(app: &mut SolveApp, i: usize) {
     if app.file_picker_busy() {
         return;
     }
+    crate::pdm_panel::leave(app);
     app.home.open = false;
     if i == app.docs.active || i >= app.docs.slots.len() {
         return;
@@ -163,7 +175,9 @@ pub fn switch(app: &mut SolveApp, i: usize) {
 }
 
 /// Open `session` in a new tab after the active one and switch to it (`fit`: frame its model).
-pub fn open_tab(app: &mut SolveApp, session: Session) -> Result<(), String> {
+pub fn open_tab(app: &mut SolveApp, mut session: Session) -> Result<(), String> {
+    // Bind shared protection without renewing this session's reload receipt.
+    session.pdm = app.pdm.runtime.clone();
     if app.docs.slots.is_empty() {
         app.docs.slots.push(None);
         app.docs.active = 0;
@@ -186,7 +200,9 @@ pub fn active_is_blank(app: &SolveApp) -> bool {
 
 /// Show `session` (a design built or read elsewhere): in place of a blank active design,
 /// otherwise in a new tab.
-pub fn adopt(app: &mut SolveApp, session: Session) {
+pub fn adopt(app: &mut SolveApp, mut session: Session) {
+    // Adoption may use an old cached sample or autosave, so never stamp here.
+    session.pdm = app.pdm.runtime.clone();
     if active_is_blank(app) {
         let rev = app.session.revision;
         crate::dialogs::cancel(app);
@@ -203,6 +219,506 @@ pub fn adopt(app: &mut SolveApp, session: Session) {
     }
 }
 
+fn same_managed_path(candidate: Option<&String>, path: &str) -> bool {
+    candidate.is_some_and(|candidate| solidcraft_engine::pdm::cached_path_key(candidate) == solidcraft_engine::pdm::cached_path_key(path))
+}
+
+/// Check every open editor before a managed transfer can touch its local path.
+pub fn managed_target_dirty(app: &SolveApp, document: Option<&str>) -> bool {
+    let path = if let Some(document) = document {
+        app.pdm.runtime.status().ok().and_then(|s| s.managed.local.into_iter().find(|v| v.document == document).map(|v| v.path))
+    } else {
+        app.session.path.clone()
+    };
+    let Some(path) = path else { return false };
+    (same_managed_path(app.session.path.as_ref(), &path) && app.session.is_dirty())
+        || app.docs.slots.iter().flatten().any(|s| same_managed_path(s.session.path.as_ref(), &path) && s.session.is_dirty())
+}
+
+/// Only real native/IO load completions call this, with a receipt captured BEFORE
+/// reading. Generic adoption and tab switching must never renew cached sessions.
+pub(crate) fn bind_fresh_pdm_load(app: &SolveApp, session: &mut Session, expected_epoch: u64) -> Result<(), String> {
+    session.pdm = app.pdm.runtime.clone();
+    session.mark_pdm_reloaded_from(expected_epoch)
+}
+
+/// Refresh a managed path in its existing tab. Never discard an unsaved editor.
+pub fn apply_managed(app: &mut SolveApp, mut session: Session) -> Result<(), String> {
+    if app.docs.slots.is_empty() && active_is_blank(app) {
+        adopt(app, session);
+        return Ok(());
+    }
+    let Some(path) = session.path.as_ref() else { return open_tab(app, session) };
+    if same_managed_path(app.session.path.as_ref(), path) {
+        if app.session.is_dirty() {
+            return Err("Managed refresh cannot replace unsaved changes".into());
+        }
+        session.pdm = app.pdm.runtime.clone();
+        app.session.replace_design(session);
+        crate::render_workspace::reset_document(app);
+        app.preview.reset();
+        return Ok(());
+    }
+    for slot in app.docs.slots.iter_mut().flatten() {
+        if same_managed_path(slot.session.path.as_ref(), path) {
+            if slot.session.is_dirty() {
+                return Err("Managed refresh cannot replace unsaved changes in another tab".into());
+            }
+            session.pdm = app.pdm.runtime.clone();
+            slot.session = session;
+            return Ok(());
+        }
+    }
+    open_tab(app, session)
+}
+
+/// Consent is bound to one editor, its exact memory, path and authority epoch.
+#[derive(Clone)]
+pub(crate) struct EditorStamp {
+    index: usize,
+    document: std::sync::Arc<solidcraft_engine::doc::Document>,
+    revision: u64,
+    visibility: solidcraft_engine::Visibility,
+    path: Option<String>,
+    load_epoch: u64,
+    read_only: bool,
+    runtime_epoch: u64,
+    authentication_epoch: u64,
+    context: (Option<u16>, Option<String>, Option<String>, Option<solidcraft_engine::pdm::ActiveConnection>),
+}
+impl EditorStamp {
+    fn capture(app: &SolveApp, index: usize, session: &Session) -> Result<Self, String> {
+        let status = app.pdm.runtime.status()?;
+        Ok(Self {
+            index,
+            document: session.doc.clone(),
+            revision: session.revision,
+            visibility: session.visibility.clone(),
+            path: session.path.clone(),
+            load_epoch: session.pdm_recovery_epoch,
+            read_only: session.pdm_read_only,
+            runtime_epoch: app.pdm.runtime.recovery_epoch()?,
+            authentication_epoch: status.authentication_epoch,
+            context: (status.port, status.managed.server_id, status.managed.workspace, status.connection),
+        })
+    }
+    pub(crate) fn active(app: &SolveApp) -> Result<Self, String> {
+        Self::capture(app, app.docs.active, &app.session)
+    }
+    pub(crate) fn matches(&self, app: &SolveApp) -> bool {
+        let session = if self.index == app.docs.active {
+            Some(&app.session)
+        } else {
+            app.docs.slots.get(self.index).and_then(Option::as_ref).map(|slot| &slot.session)
+        };
+        session.is_some_and(|session| {
+            std::sync::Arc::ptr_eq(&self.document, &session.doc)
+                && self.revision == session.revision
+                && self.visibility == session.visibility
+                && self.path.as_ref().map(|p| solidcraft_engine::pdm::cached_path_key(p))
+                    == session.path.as_ref().map(|p| solidcraft_engine::pdm::cached_path_key(p))
+                && self.load_epoch == session.pdm_recovery_epoch
+                && self.read_only == session.pdm_read_only
+        }) && app.pdm.runtime.recovery_epoch().ok() == Some(self.runtime_epoch)
+            && app.pdm.runtime.status().is_ok_and(|status| {
+                self.authentication_epoch == status.authentication_epoch
+                    && self.context == (status.port, status.managed.server_id, status.managed.workspace, status.connection)
+            })
+    }
+    pub(crate) fn matches_active(&self, app: &SolveApp) -> bool {
+        self.index == app.docs.active && self.matches(app)
+    }
+}
+
+/// One bounded graph prepared before any local save or server publication.
+/// Scratch sessions retain current RAM; their original editors stay in place.
+pub(crate) struct ArchiveNode {
+    pub(crate) session: Session,
+    pub(crate) stamp: Option<EditorStamp>,
+    pub(crate) save: bool,
+}
+pub(crate) struct ArchiveGraph {
+    pub(crate) nodes: Vec<ArchiveNode>,
+}
+impl ArchiveGraph {
+    pub(crate) fn needs_save(&self) -> bool {
+        self.nodes.iter().any(|node| node.save)
+    }
+}
+
+fn archive_path(path: &std::path::Path, root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    for ancestor in path.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor).map_err(|_| "A linked working file is missing or unavailable")?;
+        if metadata.file_type().is_symlink() {
+            return Err("Working-folder links are not allowed while archiving".into());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err("Working-folder reparse points are not allowed while archiving".into());
+            }
+        }
+    }
+    let path = std::fs::canonicalize(path).map_err(|_| "A linked working file is unavailable")?;
+    if !path.starts_with(root) || !path.is_file() {
+        return Err("Save every linked design inside the configured working folder before archiving".into());
+    }
+    Ok(path)
+}
+
+fn archive_editor<'a>(app: &'a SolveApp, path: &str) -> Result<Option<(usize, &'a Session)>, String> {
+    let mut found = None;
+    for (index, session) in std::iter::once((app.docs.active, &app.session))
+        .chain(app.docs.slots.iter().enumerate().filter_map(|(index, slot)| slot.as_ref().map(|slot| (index, &slot.session))))
+    {
+        if session.path.as_deref().is_some_and(|candidate| solidcraft_engine::pdm::same_file_path(candidate, path)) {
+            if found.is_some() {
+                return Err("Close duplicate editors of this linked working file before archiving".into());
+            }
+            found = Some((index, session));
+        }
+    }
+    Ok(found)
+}
+
+pub(crate) fn prepare_archive_graph(app: &SolveApp) -> Result<ArchiveGraph, String> {
+    use std::io::Read;
+    let status = app.pdm.runtime.status()?;
+    let root = std::fs::canonicalize(status.managed.root.as_deref().ok_or("Choose a working folder before archiving")?)
+        .map_err(|_| "The configured working folder is unavailable")?;
+    let start = app.session.path.as_deref().ok_or("Save this design inside the working folder before archiving")?;
+    let start = archive_path(std::path::Path::new(start), &root)?;
+    let mut stack = vec![(start, false)];
+    let mut visiting = std::collections::BTreeSet::new();
+    let mut complete = std::collections::BTreeSet::new();
+    let mut pending = std::collections::BTreeMap::new();
+    let mut nodes = Vec::new();
+    while let Some((path, finish)) = stack.pop() {
+        let key = solidcraft_engine::pdm::cached_path_key(&path.to_string_lossy());
+        if finish {
+            visiting.remove(&key);
+            complete.insert(key.clone());
+            let (mut node, children): (ArchiveNode, Vec<String>) = pending.remove(&key).ok_or("Invalid linked design graph")?;
+            if children.iter().any(|child| {
+                nodes.iter().any(|node: &ArchiveNode| {
+                    node.save && node.session.path.as_deref().is_some_and(|path| solidcraft_engine::pdm::cached_path_key(path) == *child)
+                })
+            }) {
+                node.save = true;
+            }
+            if node.save {
+                node.session.check_output_path(node.session.path.as_deref().ok_or("Missing working path")?).map_err(|error| error.to_string())?;
+                let path = node.session.path.as_deref();
+                let document = status
+                    .managed
+                    .local
+                    .iter()
+                    .find(|local| path.is_some_and(|path| solidcraft_engine::pdm::same_file_path(&local.path, path)))
+                    .map(|local| local.document.as_str());
+                if let Some(reason) = status.action_unavailable("pdm.archive", document, path, true, false, None) {
+                    return Err(reason.into());
+                }
+            }
+            nodes.push(node);
+            continue;
+        }
+        if complete.contains(&key) {
+            continue;
+        }
+        if !visiting.insert(key.clone()) {
+            return Err("Linked design cycles must be resolved before archiving".into());
+        }
+        if complete.len().saturating_add(visiting.len()) > 256 {
+            return Err("Managed assembly exceeds 256 linked designs".into());
+        }
+        let text = path.to_str().ok_or("Invalid linked working path")?;
+        let (mut copy, stamp) = if let Some((index, editor)) = archive_editor(app, text)? {
+            if editor.pdm_read_only || editor.active_sketch.is_some() || !editor.pending_moves.is_empty() {
+                return Err("Finish linked editor operations and close historical copies before archiving".into());
+            }
+            editor.check_pdm_reopen().map_err(|error| error.to_string())?;
+            let stamp = EditorStamp::capture(app, index, editor)?;
+            let mut copy = editor.scratch();
+            copy.path = Some(text.into());
+            copy.pdm_recovery_epoch = editor.pdm_recovery_epoch;
+            (copy, Some(stamp))
+        } else {
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .map_err(|_| "A linked design is unavailable")?
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "A linked design cannot be read")?;
+            if bytes.len() > 1024 * 1024 {
+                return Err("A linked managed design exceeds the content limit".into());
+            }
+            let doc = solidcraft_engine::io::read_design(&bytes).map_err(|_| "A linked native design is invalid")?;
+            let mut copy = Session::new(doc);
+            copy.path = Some(text.into());
+            copy.mark_saved();
+            copy.pdm_recovery_epoch = app.pdm.runtime.begin_pdm_reload()?;
+            (copy, None)
+        };
+        copy.pdm = app.pdm.runtime.clone();
+        if app.pdm.runtime.is_managed_or_historical_path(text)
+            && status.managed.historical_paths.iter().any(|historical| solidcraft_engine::pdm::same_file_path(historical, text))
+        {
+            return Err("Historical copies cannot be archived in place".into());
+        }
+        let local = status.managed.local.iter().find(|local| solidcraft_engine::pdm::same_file_path(&local.path, text));
+        if local.is_none() && app.pdm.runtime.is_managed_or_historical_path(text) {
+            return Err("A protected historical or other-workspace file cannot be archived here".into());
+        }
+        let remote = local.and_then(|local| status.managed.catalog.iter().find(|remote| remote.document == local.document)).or_else(|| {
+            status.managed.catalog.iter().find(|remote| {
+                let relative = path.strip_prefix(&root).ok().map(|path| path.to_string_lossy().replace('\\', "/"));
+                relative.as_deref() == Some(remote.logical_path.as_str())
+            })
+        });
+        if remote.is_some_and(|remote| {
+            remote.checkout.as_ref().is_some_and(|checkout| {
+                !local.is_some_and(|local| local.checked_out && Some(local.base_version) == remote.head)
+                    || Some(checkout.workspace.as_str()) != status.managed.workspace.as_deref()
+                    || status.connection.as_ref().is_some_and(|connection| connection.account != checkout.owner)
+            })
+        }) {
+            return Err("A linked design is checked out by another working folder or account".into());
+        }
+        let mut children = Vec::new();
+        for link in copy.doc.links.values() {
+            let child = archive_path(&path.parent().ok_or("Missing working folder")?.join(&link.path), &root)?;
+            children.push(solidcraft_engine::pdm::cached_path_key(&child.to_string_lossy()));
+        }
+        // Validate derived geometry against saved children now, before any save.
+        // Dirty RAM children are saved first and refreshed once more on the worker.
+        if !copy.doc.links.is_empty() {
+            let authority = std::mem::take(&mut copy.pdm);
+            let derived = copy.execute("component.update_links", &json!({"recursive":true}));
+            copy.pdm = authority;
+            derived.map_err(|error| error.to_string())?;
+        }
+        let save = copy.is_dirty();
+        let child_paths: Vec<_> = copy.doc.links.values().map(|link| path.parent().unwrap_or(&root).join(&link.path)).collect();
+        pending.insert(key, (ArchiveNode { session: copy, stamp, save }, children));
+        stack.push((path, true));
+        for child in child_paths.into_iter().rev() {
+            stack.push((archive_path(&child, &root)?, false));
+        }
+    }
+    Ok(ArchiveGraph { nodes })
+}
+
+pub(crate) fn apply_archive_save(app: &mut SolveApp, stamp: &EditorStamp, done: &Session) -> Result<(), String> {
+    if !stamp.matches(app) {
+        return Err("A linked editor changed while saving; archive was not started".into());
+    }
+    let session = if stamp.index == app.docs.active {
+        &mut app.session
+    } else {
+        &mut app.docs.slots.get_mut(stamp.index).and_then(Option::as_mut).ok_or("A linked editor was closed while saving")?.session
+    };
+    adopt_derived_links(session, done);
+    session.adopt_save(done);
+    Ok(())
+}
+
+fn adopt_derived_links(session: &mut Session, done: &Session) {
+    if *session.doc == *done.doc {
+        return;
+    }
+    session.undo.push(solidcraft_engine::Snapshot {
+        label: "Update Links".into(),
+        doc: session.doc.clone(),
+        active_sketch: session.active_sketch,
+        pending_moves: session.pending_moves.clone(),
+    });
+    session.redo.clear();
+    session.doc = done.doc.clone();
+    session.refresh();
+}
+
+/// Refresh derived linked geometry in RAM only; do not acquire grants, save,
+/// replace editors, or publish any containing assembly.
+pub(crate) fn refresh_linked_assemblies(app: &mut SolveApp) -> Vec<String> {
+    if app.tool.is_some() || app.dialog.is_some() || app.applying.is_some() || app.deferred.is_some() {
+        return Vec::new();
+    }
+    let Ok(status) = app.pdm.runtime.status() else { return Vec::new() };
+    if status.port.is_none() || status.blocking {
+        return Vec::new();
+    }
+    let mut prepared = Vec::new();
+    for (index, session) in std::iter::once((app.docs.active, &app.session))
+        .chain(app.docs.slots.iter().enumerate().filter_map(|(index, slot)| slot.as_ref().map(|slot| (index, &slot.session))))
+    {
+        if session.pdm_read_only
+            || session.doc.links.is_empty()
+            || session.active_sketch.is_some()
+            || !session.pending_moves.is_empty()
+            || session.check_pdm_reopen().is_err()
+            || session
+                .path
+                .as_deref()
+                .is_none_or(|path| !status.managed.local.iter().any(|local| solidcraft_engine::pdm::same_file_path(&local.path, path)))
+        {
+            continue;
+        }
+        let Ok(stamp) = EditorStamp::capture(app, index, session) else { continue };
+        let mut copy = session.scratch();
+        copy.path = session.path.clone();
+        // Detached authority is intentional for derived RAM geometry only.
+        // No save/publication command is run on this scratch session.
+        prepared.push((stamp, copy));
+    }
+    let mut errors = Vec::new();
+    for (stamp, mut copy) in prepared {
+        if let Err(error) = copy.execute("component.update_links", &json!({"recursive":true})) {
+            errors.push(error.to_string());
+            continue;
+        }
+        if !stamp.matches(app) {
+            errors.push("A linked editor changed before its geometry refresh".into());
+            continue;
+        }
+        let session = if stamp.index == app.docs.active {
+            &mut app.session
+        } else if let Some(Some(slot)) = app.docs.slots.get_mut(stamp.index) {
+            &mut slot.session
+        } else {
+            continue;
+        };
+        adopt_derived_links(session, &copy);
+    }
+    errors
+}
+
+pub(crate) fn managed_editor_stamp(app: &SolveApp, document: Option<&str>) -> Option<EditorStamp> {
+    let path = document.map_or_else(
+        || app.session.path.clone(),
+        |document| app.pdm.runtime.status().ok()?.managed.local.into_iter().find(|entry| entry.document == document).map(|entry| entry.path),
+    )?;
+    if same_managed_path(app.session.path.as_ref(), &path) {
+        return EditorStamp::active(app).ok();
+    }
+    app.docs.slots.iter().enumerate().find_map(|(index, slot)| {
+        slot.as_ref()
+            .filter(|slot| same_managed_path(slot.session.path.as_ref(), &path))
+            .and_then(|slot| EditorStamp::capture(app, index, &slot.session).ok())
+    })
+}
+
+pub(crate) fn managed_path_is_open(app: &SolveApp, path: &str) -> bool {
+    same_managed_path(app.session.path.as_ref(), path)
+        || app.docs.slots.iter().flatten().any(|slot| same_managed_path(slot.session.path.as_ref(), path))
+}
+
+/// Only the exact editor covered by an explicit discard acknowledgement may be
+/// replaced while dirty. Ordinary managed refresh never calls this boundary.
+pub(crate) fn apply_acknowledged_discard(app: &mut SolveApp, mut session: Session, consent: &EditorStamp) -> Result<(), String> {
+    if !consent.matches(app) || consent.path.as_deref().is_none_or(|path| !same_managed_path(session.path.as_ref(), path)) {
+        return Err("The editor changed after discard was confirmed; reopen the restored working copy".into());
+    }
+    session.pdm = app.pdm.runtime.clone();
+    if consent.index == app.docs.active {
+        app.session.replace_design(session);
+        crate::render_workspace::reset_document(app);
+        app.preview.reset();
+    } else if let Some(Some(slot)) = app.docs.slots.get_mut(consent.index) {
+        slot.session = session;
+    } else {
+        return Err("The confirmed editor is no longer open".into());
+    }
+    Ok(())
+}
+
+/// Activate an already loaded managed path without opening a duplicate editor.
+/// Call only after the native load was accepted and applied successfully.
+pub(crate) fn activate_managed_path(app: &mut SolveApp, path: &str) {
+    let index = app.docs.slots.iter().position(|slot| slot.as_ref().is_some_and(|slot| same_managed_path(slot.session.path.as_ref(), path)));
+    if let Some(index) = index {
+        switch(app, index);
+    }
+}
+
+/// An immutable historical tab may be reused only after a fresh native
+/// authorization, with the exact clean editor captured before that request.
+fn historical_session<'a>(app: &'a SolveApp, path: &str) -> Option<&'a Session> {
+    if same_managed_path(app.session.path.as_ref(), path) {
+        return Some(&app.session);
+    }
+    app.docs.slots.iter().flatten().find(|slot| same_managed_path(slot.session.path.as_ref(), path)).map(|slot| &slot.session)
+}
+
+fn prune_historical(app: &mut SolveApp) {
+    let entries = std::mem::take(&mut app.docs.historical);
+    app.docs.historical = entries
+        .into_iter()
+        .filter(|entry| {
+            historical_session(app, &entry.path).is_some_and(|session| {
+                // Keep a changed dirty target only to refuse replacement/duplication.
+                // A clean external reload has no native exact-reference provenance.
+                session.is_dirty()
+                    || (session.pdm_read_only && entry.document.upgrade().is_some_and(|doc| std::sync::Arc::ptr_eq(&doc, &session.doc)))
+            })
+        })
+        .collect();
+}
+
+pub(crate) fn register_historical(app: &mut SolveApp, server: &str, reference: solidcraft_engine::pdm::Reference, path: &str) -> Result<(), String> {
+    prune_historical(app);
+    let session =
+        historical_session(app, path).filter(|session| session.pdm_read_only && !session.is_dirty()).ok_or("ui.pdm_reference_open_failed")?;
+    let document = std::sync::Arc::downgrade(&session.doc);
+    app.docs.historical.retain(|entry| entry.path != path);
+    if app.docs.historical.len() >= MAX_OPEN {
+        return Err("ui.pdm_reference_unavailable".into());
+    }
+    app.docs.historical.push(HistoricalIdentity { server: server.into(), reference, path: path.into(), document });
+    Ok(())
+}
+
+pub(crate) fn registered_historical(
+    app: &mut SolveApp,
+    server: &str,
+    reference: &solidcraft_engine::pdm::Reference,
+) -> Result<Option<(String, EditorStamp)>, String> {
+    prune_historical(app);
+    let Some(path) = app.docs.historical.iter().find(|entry| entry.server == server && entry.reference == *reference).map(|entry| entry.path.clone())
+    else {
+        return Ok(None);
+    };
+    let session = historical_session(app, &path).ok_or("ui.pdm_reference_unavailable")?;
+    if session.is_dirty() {
+        return Err("ui.pdm_reason_modified".into());
+    }
+    let stamp = historical_editor_stamp(app, &path).ok_or("ui.pdm_reference_unavailable")?;
+    Ok(Some((path, stamp)))
+}
+
+pub(crate) fn historical_editor_stamp(app: &SolveApp, path: &str) -> Option<EditorStamp> {
+    let eligible = |session: &Session| {
+        same_managed_path(session.path.as_ref(), path) && session.pdm_read_only && !session.is_dirty() && session.check_pdm_reopen().is_ok()
+    };
+    if eligible(&app.session) {
+        return EditorStamp::active(app).ok();
+    }
+    app.docs.slots.iter().enumerate().find_map(|(index, slot)| {
+        slot.as_ref().filter(|slot| eligible(&slot.session)).and_then(|slot| EditorStamp::capture(app, index, &slot.session).ok())
+    })
+}
+
+pub(crate) fn activate_authorized_historical(app: &mut SolveApp, path: &str, stamp: &EditorStamp) -> Result<(), String> {
+    if !stamp.matches(app) || historical_editor_stamp(app, path).is_none() {
+        return Err("ui.pdm_reference_unavailable".into());
+    }
+    activate_managed_path(app, path);
+    if !same_managed_path(app.session.path.as_ref(), path) || !app.session.pdm_read_only || app.session.is_dirty() {
+        return Err("ui.pdm_reference_unavailable".into());
+    }
+    Ok(())
+}
+
 /// A new, empty design in its own tab. One that is already empty keeps its tab and still
 /// takes Units of new designs (#1205): a launch starts on that empty design, so returning
 /// here used to leave it in millimetres.
@@ -210,6 +726,7 @@ pub fn new_design(app: &mut SolveApp) {
     if app.file_picker_busy() {
         return;
     }
+    crate::pdm_panel::leave(app);
     app.home.open = false;
     if active_is_blank(app) {
         crate::prefs::apply_new_design(app);
@@ -232,6 +749,7 @@ pub fn new_tab(app: &mut SolveApp) {
         new_design(app);
         return;
     }
+    crate::pdm_panel::leave(app);
     app.home.open = false;
     if let Err(e) = open_tab(app, Session::default()) {
         app.set_status(e, true);
@@ -269,7 +787,11 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
         return;
     }
     app.docs.closing = None;
+    let browser = app.pdm.workspace_active;
     if n <= 1 {
+        if browser {
+            crate::pdm_panel::leave(app);
+        }
         // The last design: a blank one takes its place.
         if let Some(a) = app.autosave.as_mut().and_then(|a| a.active.take()) {
             a.discard();
@@ -286,7 +808,13 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
         app.fit_view();
         put_view(app, DocView::default());
         app.docs = Documents::default();
-        app.home.open = true;
+        if browser {
+            app.ui.tab = "SOLID".into();
+            if let Err(error) = crate::pdm_panel::enter(app) {
+                app.set_status(error, true);
+            }
+        }
+        app.home.open = !browser;
         return;
     }
     if i == app.docs.active {
@@ -301,6 +829,26 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
     }
     if app.docs.active > i {
         app.docs.active -= 1;
+    }
+    if browser
+        && !app.pdm.workspace_active
+        && let Err(error) = crate::pdm_panel::enter(app)
+    {
+        app.set_status(error, true);
+    }
+}
+
+/// Close the visible page. PDM is a reusable application tab, so leaving it
+/// returns to Home without changing any document or server reservation.
+pub fn close_active_tab(app: &mut SolveApp) {
+    if app.file_picker_busy() || app.file_load.busy() {
+        return;
+    }
+    if app.pdm.workspace_active {
+        crate::pdm_panel::leave(app);
+        app.home.show(app.session.revision);
+    } else if !app.home.open {
+        close(app, app.docs.active, false);
     }
 }
 
@@ -376,6 +924,28 @@ pub fn any_dirty(app: &SolveApp) -> bool {
     (0..app.docs.count()).any(|i| dirty(app, i))
 }
 
+/// Changing the client working directory requires all managed editors closed,
+/// including inactive tabs and historical read-only copies. Ordinary documents
+/// outside the PDM working directory retain their current editor state.
+pub(crate) fn any_managed_open(app: &SolveApp) -> bool {
+    let root = app.pdm.runtime.status().ok().and_then(|status| status.managed.root).map(|root| solidcraft_engine::pdm::cached_path_key(&root));
+    let managed = |session: &Session| {
+        session.pdm_read_only
+            || session.path.as_ref().is_some_and(|path| {
+                let key = solidcraft_engine::pdm::cached_path_key(path);
+                app.pdm.runtime.managed_for_path(path).is_some()
+                    || root.as_ref().is_some_and(|root| key == *root || key.starts_with(&format!("{}/", root.trim_end_matches('/'))))
+            })
+    };
+    managed(&app.session) || app.docs.slots.iter().flatten().any(|slot| managed(&slot.session))
+}
+
+/// Resolve aliases only when submitting the change, never on ordinary UI frames.
+pub(crate) fn any_managed_open_for_change(app: &SolveApp) -> bool {
+    let protected = |session: &Session| session.path.as_deref().is_some_and(|path| app.pdm.runtime.is_managed_or_historical_path(path));
+    any_managed_open(app) || protected(&app.session) || app.docs.slots.iter().flatten().any(|slot| protected(&slot.session))
+}
+
 fn dirty(app: &SolveApp, i: usize) -> bool {
     if i == app.docs.active || app.docs.slots.is_empty() {
         return app.session.is_dirty();
@@ -432,7 +1002,41 @@ pub fn control(app: &mut SolveApp, p: &Value) -> Value {
 /// + for a new design.
 pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
     let t = Tokens::get();
-    let info = tabs_info(app);
+    let mut x0 = x0;
+    if app.pdm.tab_open() {
+        let label_width = ui.painter().layout_no_wrap(app.tr("ui.pdm_title").into(), FontId::proportional(t.font_button), t.app_bar_text).size().x;
+        let tab_width = (label_width + 34.0).max(66.0);
+        let pdm = Rect::from_min_size(pos2(x0, r.top() + 4.0), vec2(tab_width, r.height() - 8.0));
+        let response = ui.interact(pdm, ui.id().with("pdm_tab"), Sense::click());
+        tab_shape(ui.painter(), &t, pdm, app.pdm.workspace_active && !app.home.open, response.hovered());
+        crate::icons::paint_on(
+            ui.painter(),
+            Rect::from_center_size(pos2(pdm.left() + 13.0, pdm.center().y), vec2(18.0, 18.0)),
+            "ws_pdm",
+            Some(true),
+            1.0,
+        );
+        ui.painter().text(
+            pos2(pdm.left() + 26.0, pdm.center().y),
+            egui::Align2::LEFT_CENTER,
+            app.tr("ui.pdm_title"),
+            FontId::proportional(t.font_button),
+            if app.pdm.workspace_active && !app.home.open { t.text } else { t.app_bar_text },
+        );
+        crate::scenario::publish_handle("tab:pdm", pdm.center());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !app.file_picker_busy(), app.tr("ui.pdm_title")));
+        if response.clicked()
+            && !app.file_picker_busy()
+            && let Err(error) = crate::pdm_panel::enter(app)
+        {
+            app.set_status(error, true);
+        }
+        x0 += tab_width + 4.0;
+    }
+    // Home and PDM can be used before a real design exists. The startup session
+    // remains internal; no dummy file or extra document tab is created.
+    let info =
+        if app.docs.slots.is_empty() && active_is_blank(app) && (app.home.open || app.pdm.workspace_active) { Vec::new() } else { tabs_info(app) };
     let n = info.len();
     let (first, shown, w) = layout(n, app.docs.active, x1 - x0);
     let mut x = x0;
@@ -456,7 +1060,7 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
     for (i, (name, dirty)) in info.iter().enumerate().skip(first).take(shown) {
         let w = if fit_all { natural.get(i).copied().unwrap_or(w) } else { w };
         let tr = Rect::from_min_size(pos2(x, r.top() + 4.0), vec2(w - 2.0, r.height() - 8.0));
-        let active = !app.home.open && (i == app.docs.active || app.docs.slots.is_empty());
+        let active = !app.home.open && !app.pdm.workspace_active && (i == app.docs.active || app.docs.slots.is_empty());
         let resp = ui.interact(tr, ui.id().with(("doc_tab", i)), Sense::click_and_drag());
         crate::scenario::publish_target(&format!("tab:design:{i}"), tr);
         // The tabs are part of the title bar: dragging one moves the window, a double click
@@ -771,6 +1375,99 @@ mod tests {
     use crate::Services;
     use egui::Color32;
 
+    #[test]
+    fn pdm_tab_home_opens_one_browser_without_creating_a_design_file() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.show(h.app.session.revision);
+        h.frames(3);
+        assert!(crate::scenario::handles("tab:pdm").is_empty(), "PDM does not occupy a document tab before explicit use");
+        let original = h.app.session.doc.clone();
+        let count = h.app.docs.count();
+        h.step(&json!({"click":{"handle":"home:pdm"}})).unwrap();
+        h.frames(3);
+        assert!(h.app.pdm.workspace_active && !h.app.home.open);
+        assert_eq!(h.app.docs.count(), count);
+        assert_eq!(*h.app.session.doc, *original);
+        assert!(h.app.session.path.is_none() && !h.app.session.is_dirty());
+        for _ in 0..2 {
+            h.step(&json!({"click":{"handle":"tab:pdm"}})).unwrap();
+            h.frames(2);
+        }
+        assert_eq!(crate::scenario::handles("tab:pdm").len(), 1);
+        assert_eq!(h.app.docs.count(), count);
+        h.step(&json!({"click":{"handle":"tab:home"}})).unwrap();
+        h.frames(2);
+        assert!(h.app.home.open && !h.app.pdm.workspace_active);
+        assert!(crate::scenario::handle_at("home:pdm").is_some());
+    }
+
+    #[test]
+    fn pdm_tab_preserves_document_render_workspace_memory_and_browser_navigation() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        h.app.ui.tab = "RENDER".into();
+        h.app.cam.distance = 42.0;
+        let original = h.app.session.doc.clone();
+        let undo = h.app.session.undo.len();
+        h.app.pdm.folder = "Projects".into();
+        h.app.pdm.document = "part".into();
+        crate::pdm_panel::enter(&mut h.app).unwrap();
+        h.frames(2);
+        h.step(&json!({"click":{"handle":"tab:design:0"}})).unwrap();
+        h.frames(2);
+        assert!(!h.app.pdm.workspace_active && !h.app.home.open);
+        assert_eq!(h.app.ui.tab, "RENDER");
+        assert_eq!(*h.app.session.doc, *original);
+        assert_eq!(h.app.session.undo.len(), undo);
+        assert_eq!(h.app.cam.distance, 42.0);
+        assert!(h.app.session.is_dirty());
+        h.step(&json!({"click":{"handle":"tab:pdm"}})).unwrap();
+        h.frames(2);
+        assert!(h.app.pdm.workspace_active);
+        assert_eq!(h.app.pdm.folder, "Projects");
+        assert_eq!(h.app.pdm.document, "part");
+    }
+
+    #[test]
+    fn pdm_tab_first_native_working_load_does_not_create_a_dummy_document_tab() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.show(h.app.session.revision);
+        crate::pdm_panel::enter(&mut h.app).unwrap();
+        let mut loaded = Session::default();
+        loaded.path = Some("Working/part.solidcraft".into());
+        loaded.mark_saved();
+        apply_managed(&mut h.app, loaded).unwrap();
+        assert_eq!(h.app.docs.count(), 1);
+        assert_eq!(h.app.session.path.as_deref(), Some("Working/part.solidcraft"));
+        assert!(!h.app.home.open);
+    }
+
+    #[test]
+    fn pdm_tab_last_document_close_and_ctrl_w_preserve_the_connection() {
+        use solidcraft_engine::pdm::{Outcome, Task};
+        let mut h = crate::scenario::Harness::new();
+        h.app.services.pdm = Some(std::sync::Arc::new(|_| std::sync::mpsc::channel().1));
+        h.app.pdm.runtime.set_available(true).unwrap();
+        let id = h.app.pdm.runtime.enqueue(Task::Connect { port: 48231 }).unwrap();
+        h.app.pdm.runtime.finish(id, Ok(Outcome::Connected { port: 48231, versions: vec![] })).unwrap();
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        crate::pdm_panel::enter(&mut h.app).unwrap();
+        // Select a folder after entering the authenticated browser context.
+        h.app.pdm.folder = "Projects".into();
+        close(&mut h.app, 0, true);
+        h.frames(2);
+        assert!(h.app.pdm.workspace_active && !h.app.home.open);
+        assert!(h.app.session.path.is_none() && h.app.session.doc.features.is_empty());
+        assert_eq!(h.app.pdm.runtime.status().unwrap().port, Some(48231));
+        h.step(&json!({"key":"W","cmd":true})).unwrap();
+        h.frames(2);
+        assert!(h.app.home.open && !h.app.pdm.workspace_active);
+        assert_eq!(h.app.pdm.runtime.status().unwrap().port, Some(48231));
+        h.step(&json!({"click":{"handle":"tab:pdm"}})).unwrap();
+        h.frames(2);
+        assert_eq!(h.app.pdm.folder, "Projects");
+    }
+
     fn app() -> SolveApp {
         SolveApp::new(Session::default(), Services::default())
     }
@@ -989,7 +1686,7 @@ mod tests {
         let file = std::env::temp_dir().join(format!("solidcraft-quit-saveas-{}.solidcraft", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let to = file.to_string_lossy().to_string();
-        a.services.pick_save = Some(Box::new(move |_: &str, _: &[&str]| Box::pin(std::future::ready(Some(to.clone())))));
+        a.services.pick_save = Some(Box::new(move |_: &str, _: &[&str], _initial_directory| Box::pin(std::future::ready(Some(to.clone())))));
         request_quit(&mut a);
         answer_prompt(&mut a, Answer::Save);
         assert!(!a.quit_requested && a.file_picker_busy());
@@ -1084,5 +1781,131 @@ mod tests {
         let v = control(&mut a, &json!({"action": "switch", "index": 0}));
         assert_eq!(v["active"], 0);
         assert_eq!(v["documents"].as_array().map(Vec::len), Some(2));
+    }
+
+    fn ram_graph_fixture() -> (crate::scenario::Harness, std::path::PathBuf, std::path::PathBuf, solidcraft_engine::pdm::ManagedState) {
+        use solidcraft_engine::pdm::{CatalogEntry, Checkout, LocalEntry, ManagedState, Outcome, Task};
+        let mut h = crate::scenario::Harness::new();
+        let root = h.dir.join("Working");
+        std::fs::create_dir(&root).unwrap();
+        let child = root.join("child.solidcraft");
+        let assembly = root.join("assembly.solidcraft");
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        h.app.run("file.save", json!({"path":child})).unwrap();
+        open_tab(&mut h.app, Session::default()).unwrap();
+        h.app.run("file.save", json!({"path":assembly})).unwrap();
+        h.app.run("component.insert_design", json!({"path":child})).unwrap();
+        h.app.run("file.save", json!({})).unwrap();
+        let mut state = ManagedState {
+            root: Some(root.to_string_lossy().into_owned()),
+            server_id: Some("ram-server".into()),
+            workspace: Some("ram-workspace".into()),
+            ..Default::default()
+        };
+        for (id, path) in [("child", &child), ("assembly", &assembly)] {
+            state.catalog.push(CatalogEntry {
+                document: id.into(),
+                logical_path: format!("{id}.solidcraft"),
+                head: Some(1),
+                checkout: Some(Checkout {
+                    owner: "alice".into(),
+                    workspace: "ram-workspace".into(),
+                    machine: "desktop".into(),
+                    checked_out_unix_ms: 1,
+                    base_version: Some(1),
+                }),
+                head_checked_in_unix_ms: None,
+                head_author: None,
+            });
+            state.local.push(LocalEntry {
+                document: id.into(),
+                path: path.to_string_lossy().into_owned(),
+                relative_path: format!("{id}.solidcraft"),
+                base_version: 1,
+                sha256: "ab".repeat(32),
+                checked_out: true,
+                modified: false,
+                present: true,
+            });
+        }
+        let reply = state.clone();
+        h.app.services.pdm = Some(std::sync::Arc::new(move |_| {
+            let (send, receive) = std::sync::mpsc::channel();
+            send.send(crate::pdm_panel::Completion { result: Ok(Outcome::Managed { port: 48231, state: reply.clone() }), open: None }).unwrap();
+            receive
+        }));
+        h.app.pdm.runtime.set_available(true).unwrap();
+        let id = h.app.pdm.runtime.enqueue(Task::Connect { port: 48231 }).unwrap();
+        h.app.pdm.runtime.finish(id, Ok(Outcome::Managed { port: 48231, state: state.clone() })).unwrap();
+        h.app.session.pdm = h.app.pdm.runtime.clone();
+        (h, child, assembly, state)
+    }
+
+    #[test]
+    fn recursive_archive_saves_dirty_inactive_component_ram_before_root_publication() {
+        let (mut h, child, assembly, _) = ram_graph_fixture();
+        switch(&mut h.app, 0);
+        h.app.session.doc_mut().name = "Unsaved component RAM".into();
+        h.app.run("solid.box", json!({"length":1,"width":1,"height":1})).unwrap();
+        switch(&mut h.app, 1);
+        assert!(!h.app.session.is_dirty());
+        h.app.run("pdm.archive", json!({"document":"assembly"})).unwrap();
+        assert!(h.app.saving.is_some(), "a clean assembly still needs its open dirty component saved first");
+        while h.app.saving.is_some() {
+            crate::save_job::tick(&mut h.app, true);
+        }
+        h.frames(4);
+        assert_eq!(solidcraft_engine::io::read_design(&std::fs::read(child).unwrap()).unwrap().name, "Unsaved component RAM");
+        assert_eq!(solidcraft_engine::io::read_design(&std::fs::read(assembly).unwrap()).unwrap(), *h.app.session.doc);
+        assert!(!h.app.session.is_dirty());
+        assert!(!h.app.docs.slots[0].as_ref().unwrap().session.is_dirty());
+    }
+
+    #[test]
+    fn recursive_archive_external_component_is_rejected_before_any_autosave() {
+        let (mut h, child, assembly, _) = ram_graph_fixture();
+        let external = h.dir.join("external.solidcraft");
+        std::fs::copy(&child, &external).unwrap();
+        h.app.session.doc_mut().links.values_mut().next().unwrap().path = "../external.solidcraft".into();
+        h.app.session.doc_mut().name = "Unsaved assembly".into();
+        let before = std::fs::read(&assembly).unwrap();
+        assert!(h.app.run("pdm.archive", json!({"document":"assembly"})).is_err());
+        assert!(h.app.saving.is_none());
+        assert_eq!(std::fs::read(assembly).unwrap(), before);
+        assert!(h.app.session.is_dirty());
+    }
+
+    #[test]
+    fn recursive_archive_component_completion_refreshes_dirty_open_assembly_without_saving_it() {
+        use solidcraft_engine::pdm::{Outcome, Task};
+        let (mut h, child, assembly, mut state) = ram_graph_fixture();
+        state.local.iter_mut().find(|entry| entry.document == "assembly").unwrap().checked_out = false;
+        state.catalog.iter_mut().find(|entry| entry.document == "assembly").unwrap().checkout = None;
+        let id = h.app.pdm.runtime.enqueue(Task::Refresh).unwrap();
+        h.app.pdm.runtime.finish(id, Ok(Outcome::ManagedRefreshed { port: 48231, state: state.clone() })).unwrap();
+        h.app.services.pdm = Some(std::sync::Arc::new(move |_| {
+            let (send, receive) = std::sync::mpsc::channel();
+            send.send(crate::pdm_panel::Completion { result: Ok(Outcome::Managed { port: 48231, state: state.clone() }), open: None }).unwrap();
+            receive
+        }));
+        h.app.session.doc_mut().name = "Keep my unsaved assembly edits".into();
+        let before = h.app.session.doc.clone();
+        let undo = h.app.session.undo.len();
+        let disk = std::fs::read(&assembly).unwrap();
+        switch(&mut h.app, 0);
+        h.app.run("solid.box", json!({"length":5,"width":6,"height":7})).unwrap();
+        h.app.run("file.save", json!({})).unwrap();
+        h.app.run("pdm.archive", json!({"document":"child"})).unwrap();
+        while h.app.saving.is_some() {
+            crate::save_job::tick(&mut h.app, true);
+        }
+        h.frames(4);
+        let linked = &h.app.docs.slots[1].as_ref().unwrap().session;
+        assert_eq!(linked.doc.name, "Keep my unsaved assembly edits");
+        assert_ne!(*linked.doc, *before, "component completion must refresh cached linked geometry");
+        assert!(linked.is_dirty());
+        assert!(linked.undo.len() >= undo);
+        assert_eq!(std::fs::read(assembly).unwrap(), disk, "derived refresh must not save or archive the parent");
+        assert!(child.exists());
     }
 }

@@ -427,3 +427,61 @@ fn opening_a_large_design_never_stalls_the_window() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn pdm_recovery_epoch_changed_during_real_file_read_refuses_loaded_result() {
+    use solidcraft_engine::pdm::{Failure, LocalEntry, ManagedState, ManagedTask, Outcome, Task};
+    let dir = scratch("epoch-race");
+    let path = dir.join("part.solidcraft");
+    let mut w = Win::new();
+    w.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+    w.app.run("file.save", json!({"path":path})).unwrap();
+    w.app.pdm.runtime.set_available(true).unwrap();
+    let request = w.app.pdm.runtime.enqueue(Task::Connect { port: 48231 }).unwrap();
+    w.app
+        .pdm
+        .runtime
+        .finish(
+            request,
+            Ok(Outcome::Managed {
+                port: 48231,
+                state: ManagedState {
+                    server_id: Some("epoch-server".into()),
+                    workspace: Some("epoch-workspace".into()),
+                    local: vec![LocalEntry {
+                        document: "part".into(),
+                        path: path.to_string_lossy().into_owned(),
+                        relative_path: "part.solidcraft".into(),
+                        base_version: 1,
+                        sha256: "ab".repeat(32),
+                        checked_out: true,
+                        modified: false,
+                        present: true,
+                    }],
+                    ..Default::default()
+                },
+            }),
+        )
+        .unwrap();
+    let before = w.app.session.doc.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    w.app.file_load.worker_gate = Some((started_tx, release_rx));
+    w.app.open_path_async(path.to_str().unwrap());
+    started_rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+    // Simulate another accepted recovery racing this already-started IO. The UI
+    // normally refuses it; the receipt must still fail closed independently.
+    let request = w.app.pdm.runtime.enqueue(Task::Managed(ManagedTask::RecoverConnection { connection_id: "a".repeat(64) })).unwrap();
+    w.app.pdm.runtime.finish(request, Err(Failure { message: "Recovery completion lost".into(), disconnect: false })).unwrap();
+    release_tx.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while w.app.file_load.busy() && std::time::Instant::now() < deadline {
+        w.frame(vec![]);
+        std::thread::yield_now();
+    }
+    assert!(!w.app.file_load.busy());
+    assert_eq!(*w.app.session.doc, *before);
+    assert!(w.app.session.check_pdm_reopen().is_err());
+    assert!(w.app.status.as_ref().is_some_and(|(_, _, error)| *error));
+    let _ = std::fs::remove_dir_all(dir);
+}

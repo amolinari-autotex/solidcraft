@@ -140,7 +140,7 @@ fn cached(key: &str) -> Option<egui::ColorImage> {
     decode_thumbnail(bytes)
 }
 
-fn decode_thumbnail(bytes: Vec<u8>) -> Option<egui::ColorImage> {
+pub(crate) fn decode_thumbnail(bytes: Vec<u8>) -> Option<egui::ColorImage> {
     if bytes.len() > 512 * 1024 {
         return None;
     }
@@ -512,6 +512,7 @@ enum Section {
 }
 
 enum FileAction {
+    Pdm,
     Back,
     Section(Section),
     New(&'static str),
@@ -655,6 +656,7 @@ fn navigation(app: &SolveApp, ui: &mut egui::Ui, action: &mut Option<FileAction>
         ("home:start", app.tr_label("Start"), String::new(), Some(Section::Start), true, FileAction::Section(Section::Start)),
         ("home:new", app.tr_label("New"), format!("{primary}N"), None, true, FileAction::New("preferred")),
         ("home:open", app.tr("ui.open"), format!("{primary}O"), None, true, FileAction::Open),
+        ("home:pdm", app.tr("ui.pdm_title"), String::new(), None, true, FileAction::Pdm),
         ("home:recover", recover.as_str(), String::new(), Some(Section::Recovery), true, FileAction::Section(Section::Recovery)),
         ("home:save", app.tr("ui.save"), format!("{primary}S"), None, design, FileAction::Save),
         ("home:save_as", app.tr("ui.save_as"), format!("{primary}{shift}S"), None, design, FileAction::SaveAs),
@@ -665,8 +667,8 @@ fn navigation(app: &SolveApp, ui: &mut egui::Ui, action: &mut Option<FileAction>
         ("home:crashes", app.tr("home.crashes"), String::new(), None, true, FileAction::Crashes),
         ("home:about", app.tr_label("About SolidCraft"), String::new(), None, true, FileAction::About),
     ];
-    for (index, (id, label, key, section, enabled, picked)) in nav.into_iter().enumerate() {
-        if index == 4 || index == 8 {
+    for (id, label, key, section, enabled, picked) in nav {
+        if matches!(id, "home:save" | "home:settings") {
             FileView::separator(ui);
         }
         let response = FileView::nav_row(ui, id, label, &key, section == Some(app.home.section), enabled && !busy);
@@ -946,6 +948,11 @@ fn export_content(app: &SolveApp, ui: &mut egui::Ui, action: &mut Option<FileAct
 fn dispatch(app: &mut SolveApp, ctx: &egui::Context, action: FileAction) {
     match action {
         FileAction::Back => app.home.open = false,
+        FileAction::Pdm => {
+            if let Err(error) = crate::pdm_panel::enter(app) {
+                app.set_status(error, true);
+            }
+        },
         FileAction::Section(section) => {
             app.home.section = section;
             if section == Section::Recovery && app.recoverable.is_empty() {

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Check in to managed archive</title>
+  <path d="M17 8.5L32 8.5L38 14.5L38 39.5L13 39.5L13 12.5Q13 8.5 17 8.5Z" fill="#e2e8ef" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 8.5L32 12.5Q32 14.5 34 14.5L38 14.5Z" fill="#b8c3cf" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M13 37.5L51 37.5A3 3 0 0 1 54 40.5L54 52.5A3 3 0 0 1 51 55.5L13 55.5A3 3 0 0 1 10 52.5L10 40.5A3 3 0 0 1 13 37.5Z" fill="#b8c3cf" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M10.5 34.5L53.5 34.5A1.5 1.5 0 0 1 55 36L55 40A1.5 1.5 0 0 1 53.5 41.5L10.5 41.5A1.5 1.5 0 0 1 9 40L9 36A1.5 1.5 0 0 1 10.5 34.5Z" fill="#e2e8ef" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M23 48.5L34 48.5" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M47 12.5L47 37.5" fill="none" stroke="#ffffff" stroke-width="6.45" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M47 45.5L42 36.5L52 36.5Z" fill="#ffffff" stroke="#ffffff" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M47 12.5L47 37.5" fill="none" stroke="#236ead" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M47 45.5L42 36.5L52 36.5Z" fill="#236ead"/>
+</svg>

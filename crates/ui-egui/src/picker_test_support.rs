@@ -17,7 +17,7 @@ impl Future for Manual {
 }
 pub fn save(app: &mut SolveApp, slot: &Slot) {
     let slot = slot.clone();
-    app.services.pick_save = Some(Box::new(move |_, _| Box::pin(Manual(slot.clone())) as FilePickerFuture));
+    app.services.pick_save = Some(Box::new(move |_, _, _initial_directory| Box::pin(Manual(slot.clone())) as FilePickerFuture));
 }
 pub fn open(app: &mut SolveApp, slot: &Slot) {
     let slot = slot.clone();

@@ -109,6 +109,7 @@ fn export_script(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_(p, "path");
     if let Some(path) = path {
         let text = serde_json::to_string_pretty(&script).map_err(|e| EngineError::Other(e.to_string()))?;
+        s.check_output_path(path)?;
         solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     } else if p.get("path").is_some_and(|v| !v.is_null()) {
         return Err(bad(cmd, "`path` must be a file path"));

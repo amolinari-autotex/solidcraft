@@ -68,16 +68,24 @@ pub(super) fn export_with(s: &Session, p: &Value, renderer: Option<&Renderer>) -
     // At least 4 frames fit even at the largest size.
     let max = MAX_FRAMES.min(if gif { MAX_GIF_PIXELS } else { MAX_PNG_PIXELS } / (width as usize * height as usize));
     let n = sample_count(p, default.min(max), max, cmd).map_err(|_| bad(cmd, format!("`samples` must be 2…{max} for {width} × {height} frames")))?;
-    let renderer = renderer.ok_or_else(|| bad(cmd, "no renderer is installed to draw pictures in this process"))?;
     // A destination outside an agent's folders is refused before anything is drawn.
     let io = |e: std::io::Error| bad(cmd, format!("{path}: {e}"));
     solidcraft_io::vfs::check(path).map_err(io)?;
     let frame_path = |k: usize| std::path::Path::new(path).join(format!("frame-{k:04}.png")).to_string_lossy().to_string();
+    s.check_output_path(path)?;
+    let stale: Vec<_> = if gif { Vec::new() } else { (1..=MAX_FRAMES).map(frame_path).filter(|f| solidcraft_io::vfs::exists(f)).collect() };
+    if !gif {
+        for file in (1..=n).map(frame_path).chain(stale.iter().cloned()) {
+            s.check_output_path(&file)?;
+            solidcraft_io::vfs::check(&file).map_err(|e| bad(cmd, format!("{file}: {e}")))?;
+        }
+    }
+    let renderer = renderer.ok_or_else(|| bad(cmd, "no renderer is installed to draw pictures in this process"))?;
     if !gif {
         solidcraft_io::vfs::create_dir_all(path).map_err(io)?;
         // The frames of an earlier export here go first, so the folder never mixes two
         // animations: not after a shorter one, nor when this one fails part way.
-        for stale in (1..=MAX_FRAMES).map(frame_path).filter(|f| solidcraft_io::vfs::exists(f)) {
+        for stale in stale {
             solidcraft_io::vfs::remove(&stale).map_err(|e| bad(cmd, format!("{stale}: {e}")))?;
         }
     }

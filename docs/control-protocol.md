@@ -6,6 +6,17 @@ line `{"id": …, "ok": true, "result": …}` or `{"id": …, "ok": false, "erro
 handled on the UI thread between frames; pointer and keyboard input is injected as real egui
 events, one pointer event per frame.
 
+### Isolated native test profiles
+
+For automation against public-safe test designs, set `SOLIDCRAFT_SETTINGS_DIR` to
+an absolute private folder before starting the desktop app. Settings, graphics
+preferences and startup markers use that folder; legacy-settings adoption is
+skipped. Empty or relative overrides fail before normal-profile startup. Without
+the override, the usual platform settings location is unchanged. On Windows,
+eframe uses the OS roaming-folder API, so `APPDATA` alone does not isolate settings.
+Also set `SOLIDCRAFT_RECOVERY_DIR`, `SOLIDCRAFT_CRASH_DIR` and
+`SOLIDCRAFT_CONTROL_DIR` to private test folders to isolate those separate stores.
+
 ### Token
 
 Every connection must authenticate. At start the app makes a random 256-bit token for this
@@ -202,6 +213,7 @@ labels; `prefs:measure_axis_distances` identifies the checkbox.
 | `ui.messages` | `clear?`: `true` (empty the list), `open?`: bool (show or hide the Messages window) | every status message of this run, oldest first (the last 200; a message repeated in a row is one entry with a `count`): `messages` `[{text, error, at, count}]` (`at` in ms since the Unix epoch), and whether the window is `open` (#2763) |
 | `ui.documents` | `action?`: `new`, `switch`, `close`, `quit`; `index?`; `force?` (close without asking); `answer?`: `save`, `dont_save`, `cancel` (answers "save changes?") | the open designs (tabs): names, unsaved flags, the active one, a pending "save changes?" prompt, whether a quit is asking |
 | `ui.file` | `path`; `insert?`: bool | starts an interactive background Open or Insert; poll `ui.inspect.file_busy` for completion; the window stays responsive |
+| `ui.drop_path` | `path` | routes one file through the native drop handler; the PDM browser copies and archives it in the selected folder; inspect PDM status for completion or rejection |
 | `ui.home` | `open?`: bool; `sample?`: index | the start page: show or hide it, open a built-in sample (once built); returns `open` and the recent designs |
 | `ui.shortcut` | `command`, `key?`, `replace?` | a command's key, or rebinds it (`""` clears; a key another command uses is refused unless `replace`) |
 | `ui.help` | `item?`: `about`, `shortcuts` (read only), `report` (opens a report draft for review), `crashes` (the Crash Reports window) | the version, commit, build date and diagnostic text |

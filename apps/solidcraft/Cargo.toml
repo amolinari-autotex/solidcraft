@@ -24,10 +24,14 @@ neg_cmp_op_on_partial_ord = "allow"
 solidcraft-engine = { workspace = true }
 solidcraft-ui-egui = { workspace = true }
 solidcraft-space-mouse = { workspace = true }
+solidcraft-pdm = { path = "../solidcraft-pdm" }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links"] }
 egui = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
 log = { workspace = true }
+opener = "=0.9.0"
 rfd = { workspace = true }
 # Checks eframe's settings file (app.ron) before eframe reads it (src/startup.rs).
 ron = "0.12"
@@ -40,6 +44,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # API keys of the agent chat's API agents (docs/agent-chat.md) live in the system keychain:
 # Keychain on macOS, Credential Manager on Windows, the Secret Service (pure-Rust D-Bus) elsewhere.
 keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+# Original loopback-only setup certificates; private trust, never the OS trust store.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
 quick-xml = { workspace = true }

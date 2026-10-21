@@ -150,6 +150,9 @@ paste	false
 pattern_circ	false
 pattern_path	false
 pattern_rect	false
+pdm_connect	false
+pdm_details	false
+pdm_disconnect	false
 perforate	false
 perspective	false
 pipe	false
@@ -275,6 +278,7 @@ web	false
 ws_animate	false
 ws_design	false
 ws_drawing	false
+ws_pdm	false
 ws_render	false
 zebra	false
 zoom	false

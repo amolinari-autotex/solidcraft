@@ -18,6 +18,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 web-time = { workspace = true }
+# OS/browser local timezone and DST; already in the dependency graph.
+chrono = "0.4.45"
 # gif, webp, bmp, tiff: pictures attached to an agent chat message (GIF and WebP go as they are,
 # BMP and TIFF as PNG).
 image = { workspace = true, features = ["jpeg", "ico", "gif", "webp", "bmp", "tiff"] }

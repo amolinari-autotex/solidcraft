@@ -90,7 +90,7 @@ mod tests {
         h.step(&json!({"key":"Tab"})).unwrap();
         h.step(&json!({"click":{"handle":"dialog:dxf:dashed"}})).unwrap();
         let dir = h.dir.clone();
-        h.app.services.pick_save = Some(Box::new(move |name, extensions| {
+        h.app.services.pick_save = Some(Box::new(move |name, extensions, _initial_directory| {
             assert!(name.ends_with("-view.dxf"));
             assert_eq!(extensions, &["dxf"]);
             Box::pin(std::future::ready(Some(dir.join("view.dxf").to_string_lossy().into_owned())))

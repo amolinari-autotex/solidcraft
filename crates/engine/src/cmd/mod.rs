@@ -62,6 +62,8 @@ pub(crate) use measure_sel::measure_items;
 #[cfg(test)]
 mod kernel_heal_tests;
 mod parameters;
+mod pdm;
+pub use pdm::validate_params as validate_pdm_params;
 mod plastic;
 mod render;
 #[cfg(test)]
@@ -304,6 +306,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(view_navigation::COMMANDS.iter());
     v.extend(view_dxf::COMMANDS.iter());
     v.extend(diagnostics::COMMANDS.iter());
+    v.extend(pdm::COMMANDS.iter());
     v.extend(render::COMMANDS.iter());
     v
 }

@@ -191,6 +191,7 @@ fn export_dxf(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let text = solidcraft_io::write_dxf(&geom);
     if let Some(path) = str_(p, "path").filter(|x| !x.trim().is_empty()) {
+        s.check_output_path(path)?;
         solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
         return Ok(json!({"path": path, "entities": geom.len()}));
     }

@@ -456,3 +456,34 @@ fn hostile_animation_params_are_refused() {
     assert!(root.join("in.gif").exists() && !dir.join("out").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn pdm_animation_checks_planned_and_stale_targets_before_deletion_or_render() {
+    let mut s = rail();
+    let dir = out_dir("pdm-preflight");
+    let first = dir.join("frame-0001.png");
+    let second = dir.join("frame-0002.png");
+    let stale = dir.join("frame-0005.png");
+    for blocked in [&second, &stale] {
+        for path in [&first, &second, &stale] {
+            std::fs::write(path, b"existing bytes").unwrap();
+        }
+        s.path = Some(blocked.to_string_lossy().into_owned());
+        s.pdm_read_only = true;
+        let params = json!({"joint":"Rail","from":10,"to":0,"path":dir,"samples":2,"width":16,"height":16});
+        let error = super::animation::export_with(&s, &params, Some(&cpu)).unwrap_err().to_string();
+        assert!(error.contains("Historical"), "{error}");
+        for path in [&first, &second, &stale] {
+            assert_eq!(std::fs::read(path).unwrap(), b"existing bytes");
+        }
+    }
+    s.pdm_read_only = false;
+    super::animation::export_with(
+        &s,
+        &json!({"joint":"Rail","from":10,"to":0,"path":dir.join("separate.gif"),"samples":2,"width":16,"height":16}),
+        Some(&cpu),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

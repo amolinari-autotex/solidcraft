@@ -342,6 +342,13 @@ Editable drawing code, native projects and shipped exports are collected under `
 | assets/icons/ui/design/svg/flat/stop.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/flat/shield.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/model/status_recovery.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/model/pdm_checkout.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/model/pdm_checkin.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/small/pdm_checkin.svg | SolidCraft contributors | original optical icon variant (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/small/pdm_checkout.svg | SolidCraft contributors | original optical icon variant (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/workspace/ws_pdm.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/flat/pdm_disconnect.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/model/pdm_details.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/model/placeholder.svg | SolidCraft contributors | two-tone modelling icon master (64 grid), original SolidCraft artwork | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/model/plane.svg | SolidCraft contributors | two-tone modelling icon master (64 grid), original SolidCraft artwork | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/model/plane_angle.svg | SolidCraft contributors | two-tone modelling icon master (64 grid), original SolidCraft artwork | MIT OR Apache-2.0 |

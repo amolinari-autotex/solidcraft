@@ -304,6 +304,12 @@ impl SolveApp {
         {
             let Ok(scope) = crate::control::request_scope(self, &req.params) else { return Some(req) };
             let mut copy = self.session.scratch();
+            // This worker writes files for the same editor. Keep its shared
+            // destination ledger, historical flag and exact recovery receipt.
+            copy.path.clone_from(&self.session.path);
+            copy.pdm = self.pdm.runtime.clone();
+            copy.pdm_read_only = self.session.pdm_read_only;
+            copy.pdm_recovery_epoch = self.session.pdm_recovery_epoch;
             let rx = spawn(scope, move || {
                 Some(match copy.execute(id, &params) {
                     Ok(v) => json!({"ok": true, "result": v}),

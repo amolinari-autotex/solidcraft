@@ -88,6 +88,7 @@ struct Made {
 }
 type Job = Result<Made, String>;
 struct Running {
+    reload_epoch: Option<u64>,
     request: Request,
     base: Arc<Document>,
     base_revision: u64,
@@ -315,6 +316,19 @@ fn start(app: &mut SolveApp) {
         return;
     }
     let Some(request) = app.file_load.queued.pop_front() else { return };
+    let reload_epoch = if request.kind == Kind::Open {
+        match app.pdm.runtime.begin_pdm_reload() {
+            Ok(epoch) => Some(epoch),
+            Err(error) => {
+                request.answer(Err(error.clone()));
+                app.set_status(error, true);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     if matches!(request.kind, Kind::Open | Kind::Recover { .. })
         && app.docs.count() >= crate::documents::MAX_OPEN
         && !crate::documents::active_is_blank(app)
@@ -413,6 +427,7 @@ fn start(app: &mut SolveApp) {
     match spawned {
         Ok(_) => {
             app.file_load.running = Some(Running {
+                reload_epoch,
                 request,
                 base,
                 base_revision,
@@ -442,6 +457,19 @@ fn start_staged(app: &mut SolveApp) {
         return;
     }
     let Some(request) = app.file_load.queued.pop_front() else { return };
+    let reload_epoch = if request.kind == Kind::Open {
+        match app.pdm.runtime.begin_pdm_reload() {
+            Ok(epoch) => Some(epoch),
+            Err(error) => {
+                request.answer(Err(error.clone()));
+                app.set_status(error, true);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     let insert = request.insert();
     let before = if insert { app.session.world_state().bodies.iter().map(|b| b.name.clone()).collect() } else { Vec::new() };
     let mut session = if insert { app.session.scratch() } else { Session::default() };
@@ -456,6 +484,7 @@ fn start_staged(app: &mut SolveApp) {
         progress.hold_at(i);
     }
     app.file_load.running = Some(Running {
+        reload_epoch,
         base: app.session.doc.clone(),
         base_revision: app.session.revision,
         before,
@@ -796,8 +825,19 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
                 request.answer(Ok(made.result));
             }
             _ if running.cancelled() => request.answer(Err("file operation cancelled".into())),
-            Ok(made) if running.matches(&app.session) => {
-                // Not meshed yet: framing it while it goes in must not mesh it here.
+            Ok(mut made) if running.matches(&app.session) => {
+                if request.kind == Kind::Open {
+                    let fresh = running
+                        .reload_epoch
+                        .ok_or_else(|| "Missing file-load recovery receipt".to_string())
+                        .and_then(|epoch| crate::documents::bind_fresh_pdm_load(app, &mut made.session, epoch));
+                    if let Err(error) = fresh {
+                        request.answer(Err(error.clone()));
+                        app.set_status(error, true);
+                        return;
+                    }
+                }
+                // Preserve progressive display warmup from the current IO pipeline.
                 app.open_meshing_next = true;
                 crate::frame_watch::step(app, "before the open");
                 if request.insert() {
@@ -1016,6 +1056,7 @@ mod tests {
         });
         let (tx, rx) = std::sync::mpsc::channel();
         h.app.file_load.running = Some(Running {
+            reload_epoch: h.app.pdm.runtime.begin_pdm_reload().ok(),
             request: Request::new("drawing.dxf", Kind::ExportDxf),
             base: base.clone(),
             base_revision: h.app.session.revision,
@@ -1052,6 +1093,7 @@ mod tests {
         request.reply = Some(reply_tx);
         let (tx, rx) = std::sync::mpsc::channel();
         h.app.file_load.running = Some(Running {
+            reload_epoch: h.app.pdm.runtime.begin_pdm_reload().ok(),
             request,
             base: base.clone(),
             base_revision: h.app.session.revision,
@@ -1082,6 +1124,7 @@ mod tests {
             let (preview_tx, preview_rx) = std::sync::mpsc::channel();
             preview_tx.send(egui::ColorImage::new([2, 2], vec![egui::Color32::RED; 4])).unwrap();
             app.file_load.running = Some(Running {
+                reload_epoch: app.pdm.runtime.begin_pdm_reload().ok(),
                 request: Request::new("old.solidcraft", if insert { Kind::Insert } else { Kind::Open }),
                 base,
                 base_revision: app.session.revision,
@@ -1150,6 +1193,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Err("bad STEP".into())).unwrap();
         app.file_load.running = Some(Running {
+            reload_epoch: app.pdm.runtime.begin_pdm_reload().ok(),
             request: Request::new("bad.step", Kind::Insert),
             base: old.clone(),
             base_revision: app.session.revision,
@@ -1176,6 +1220,7 @@ mod tests {
         let progress = Arc::new(Progress::default());
         progress.cancel();
         app.file_load.running = Some(Running {
+            reload_epoch: app.pdm.runtime.begin_pdm_reload().ok(),
             request: Request::new("cancelled.step", Kind::Insert),
             base: old.clone(),
             base_revision: app.session.revision,

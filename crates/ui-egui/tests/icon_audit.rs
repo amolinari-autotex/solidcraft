@@ -59,7 +59,8 @@ fn menu(h: &mut Harness, target: Value, surface: &str, requested: &mut BTreeMap<
         let id = item["id"].as_str().unwrap();
         let blank = item["icon"].as_str().unwrap().is_empty();
         // Planned workspace rows deliberately have no artwork until their workspace exists.
-        let intentional = id == "-" || id.starts_with('#') || (id == "ui.workspace" && item["shortcut"] == "coming later");
+        let intentional =
+            id == "-" || id.starts_with('#') || id == "ui.workspace.pdm" || (id == "ui.workspace" && item["shortcut"] == "coming later");
         assert!(!blank || intentional, "{surface}: icon-less menu item {item}");
         assert_eq!(item["placeholder"], false, "{surface}: {item}");
         if let Some(children) = item["children"].as_array() {
@@ -82,6 +83,12 @@ fn menu(h: &mut Harness, target: Value, surface: &str, requested: &mut BTreeMap<
 fn ribbon(h: &mut Harness, requested: &mut BTreeMap<String, bool>) {
     for tab in workspace::visible_tabs(&h.app) {
         click(h, &format!("tab:{tab}"));
+        if tab == "PDM" {
+            // PDM paints its guarded action row directly, with no ordinary panel menus.
+            assert!(solidcraft_ui_egui::scenario::handle_at("pdm:connect_settings").is_some());
+            collect(h, "PDM guarded actions", requested);
+            continue;
+        }
         let panels = solidcraft_ui_egui::scenario::handles(&format!("panel:{tab}:"));
         assert!(!panels.is_empty(), "no panels on {tab}");
         for (handle, _) in panels {
