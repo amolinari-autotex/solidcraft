@@ -27,6 +27,8 @@ const KEY: &[u8] = include_bytes!("../../tests/fixtures/pdm-https/server-key.der
 
 #[derive(Clone, Copy)]
 enum Fault {
+    TruncateMetadata,
+    RejectMetadataTruncated(u16),
     TruncateFirst,
     TruncateAll,
     Reject(u16, &'static str),
@@ -184,6 +186,21 @@ fn serve(socket: TcpStream, config: Arc<rustls::ServerConfig>, state: &State) ->
         );
     }
     if path == format!("{content_path}/metadata") {
+        if let Fault::RejectMetadataTruncated(status) = state.fault {
+            write!(
+                tls,
+                "HTTP/1.1 {status} Fixture\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{{\"result\":\"error\""
+            )?;
+            tls.flush()?;
+            return Ok(());
+        }
+        if matches!(state.fault, Fault::TruncateMetadata) {
+            tls.write_all(
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"result\":\"metadata\"",
+            )?;
+            tls.flush()?;
+            return Ok(());
+        }
         return json(
             &mut tls,
             200,
@@ -316,6 +333,109 @@ fn network_retry_ladder_is_bounded_and_never_publishes_partial_bytes() -> TestRe
     assert!(matches!(session.download_stream(&fixture.version.reference, &mut output), Err(Error::Network(_))));
     assert!(output.is_empty());
     assert_eq!(fixture.requests()?, vec![(0, 8 * MIB), (0, 4 * MIB), (0, MIB), (0, 256 * 1024), (0, 64 * 1024)]);
+    fixture.finish()
+}
+
+#[test]
+fn small_file_network_retry_does_not_repeat_nominal_size_reductions() -> TestResult {
+    let fixture = Fixture::new(Fault::TruncateAll, 64 * 1024)?;
+    let session = fixture.client.transfer_session_with_chunk_bytes(8 * MIB)?;
+    let mut output = Vec::new();
+    assert!(matches!(session.download_stream(&fixture.version.reference, &mut output), Err(Error::Network(_))));
+    assert!(output.is_empty());
+    assert_eq!(fixture.requests()?, vec![(0, 64 * 1024); 2]);
+    fixture.finish()
+}
+
+#[test]
+fn metadata_body_failure_retains_safe_transport_phase_and_io_kind_without_range_attempts() -> TestResult {
+    let fixture = Fixture::new(Fault::TruncateMetadata, 64 * 1024)?;
+    let session = fixture.client.transfer_session_with_chunk_bytes(8 * MIB)?;
+    let mut output = Vec::new();
+    let error = session.download_stream(&fixture.version.reference, &mut output).unwrap_err();
+    let Error::Network(sanitized) = error else { return Err(io::Error::other("expected sanitized network error").into()) };
+    assert_eq!(sanitized.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(sanitized.to_string(), "PDM HTTPS transport failed");
+    assert!(std::error::Error::source(&sanitized).is_none());
+    let safe = sanitized
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<super::HttpsTransportFailure>())
+        .ok_or_else(|| io::Error::other("safe diagnostics missing"))?;
+    assert_eq!(safe.phase, super::HttpsPhase::MetadataBody);
+    assert_eq!(safe.class, super::HttpsErrorClass::Io);
+    assert_eq!(safe.io_kind, io::ErrorKind::UnexpectedEof);
+    assert_eq!(safe.http_status, Some(200));
+    assert_eq!(safe.timeout, None);
+    assert!(output.is_empty());
+    assert!(fixture.requests()?.is_empty());
+
+    // Observe the same deliberately malformed LOCAL fixture without the SDK's
+    // sanitizer. Emit enum classes only: no error Display/Debug, URL or headers.
+    let (origin, agent) = fixture.client.direct_extension_origin()?;
+    let caps = session.capabilities();
+    let request = ureq::http::Request::builder()
+        .method("GET")
+        .uri(format!("{origin}/pdm/v1/content/{}/1/metadata", fixture.version.reference.document))
+        .header("authorization", super::authorization_header(&fixture.client.token)?)
+        .header("x-pdm-server-id", &caps.server_id)
+        .header("x-pdm-recovery-epoch", caps.recovery_epoch.to_string())
+        .header("content-length", "0")
+        .body(&[] as &[u8])?;
+    let mut response = agent.run(request)?;
+    assert_eq!(response.status().as_u16(), 200);
+    let raw_error = response.body_mut().with_config().limit(transfers::CONTROL_BYTES as u64 + 1).read_to_vec().unwrap_err();
+    let class = match &raw_error {
+        ureq::Error::Io(error) => {
+            eprintln!("WAN_LOCAL_DIAGNOSTIC phase=metadata_body http_status=200 error_class=io io_kind={:?}", error.kind());
+            "io"
+        }
+        ureq::Error::Protocol(_) => "protocol",
+        ureq::Error::Rustls(_) => "tls",
+        ureq::Error::Timeout(_) => "timeout",
+        _ => "other",
+    };
+    eprintln!(
+        "WAN_LOCAL_DIAGNOSTIC phase=metadata_body raw_error_class={class} sdk_error_class=network sdk_io_kind=UnexpectedEof safe_phase_retained=true raw_source_retained=false output_bytes=0 injected=truncated_metadata"
+    );
+    assert!(matches!(class, "io" | "protocol" | "tls"));
+    fixture.finish()
+}
+
+#[test]
+fn metadata_status_rejection_survives_truncated_body_and_invalidates_only_authentication() -> TestResult {
+    for (status, code) in [(401, "unauthorized"), (403, "forbidden"), (503, "unavailable")] {
+        let fixture = Fixture::new(Fault::RejectMetadataTruncated(status), 64 * 1024)?;
+        let session = fixture.client.transfer_session_with_chunk_bytes(8 * MIB)?;
+        let mut output = Vec::new();
+        assert!(matches!(session.download_stream(&fixture.version.reference, &mut output), Err(Error::Server(actual)) if actual == code));
+        assert!(fixture.requests()?.is_empty());
+        assert!(output.is_empty(), "a rejected metadata response never authorizes content publication");
+        let expected = if status == 503 { "unavailable" } else { "transfer_session_invalidated" };
+        assert!(matches!(session.download_stream(&fixture.version.reference, &mut output), Err(Error::Server(actual)) if actual == expected));
+        fixture.finish()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn metadata_known_error_status_with_truncated_body_is_not_a_network_retry() -> TestResult {
+    let fixture = Fixture::new(Fault::RejectMetadataTruncated(409), 64 * 1024)?;
+    let session = fixture.client.transfer_session_with_chunk_bytes(8 * MIB)?;
+    let mut output = Vec::new();
+    assert!(matches!(session.download_stream(&fixture.version.reference, &mut output), Err(Error::Invalid("metadata error response"))));
+    assert!(fixture.requests()?.is_empty());
+    assert!(output.is_empty());
+    fixture.finish()
+}
+
+#[test]
+fn one_transient_small_range_failure_can_recover_without_publishing_the_failed_prefix() -> TestResult {
+    let fixture = Fixture::new(Fault::TruncateFirst, 64 * 1024)?;
+    let session = fixture.client.transfer_session_with_chunk_bytes(8 * MIB)?;
+    let mut output = Vec::new();
+    assert_eq!(session.download_stream(&fixture.version.reference, &mut output)?, fixture.version);
+    assert_eq!(output, *fixture.bytes);
+    assert_eq!(fixture.requests()?, vec![(0, 64 * 1024); 2]);
     fixture.finish()
 }
 

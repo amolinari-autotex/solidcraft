@@ -52,12 +52,20 @@ impl BinaryTransferSession {
         self.execute(|client| client.download_stream(reference, output))
     }
 }
-fn decode(mut response: ureq::http::Response<ureq::Body>) -> Result<WireResponse, Error> {
+fn decode(response: ureq::http::Response<ureq::Body>) -> Result<WireResponse, Error> {
+    decode_at(response, HttpsPhase::ControlBody)
+}
+fn decode_at(mut response: ureq::http::Response<ureq::Body>, phase: HttpsPhase) -> Result<WireResponse, Error> {
     if response.headers().get("content-type").and_then(|v| v.to_str().ok()) != Some("application/json") {
         return Err(Error::Invalid("transfer response content type"));
     }
     let status = response.status().as_u16();
-    let bytes = response.body_mut().with_config().limit(transfers::CONTROL_BYTES as u64 + 1).read_to_vec().map_err(|_| https_network_error())?;
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(transfers::CONTROL_BYTES as u64 + 1)
+        .read_to_vec()
+        .map_err(|error| https_transfer_error(phase, error, Some(status)))?;
     if bytes.len() > transfers::CONTROL_BYTES {
         return Err(Error::Invalid("transfer control response limit"));
     }
@@ -158,7 +166,12 @@ impl Client {
             builder = builder.header("content-type", "application/json");
         }
         let request = builder.body(body).map_err(|_| Error::Invalid("transfer request"))?;
-        agent.run(request).map_err(|_| https_network_error())
+        let phase = if path.starts_with("/pdm/v1/content/") {
+            if path.ends_with("/metadata") { HttpsPhase::MetadataRequest } else { HttpsPhase::RangeRequest }
+        } else {
+            HttpsPhase::Request
+        };
+        agent.run(request).map_err(|error| https_transfer_error(phase, error, None))
     }
     pub fn transfer_capabilities(&self) -> Result<Option<TransferCapabilities>, Error> {
         let (origin, agent) = match self.direct_extension_origin() {
@@ -279,7 +292,25 @@ impl Client {
         }
         let caps = self.transfer_ready()?;
         let path = format!("/pdm/v1/content/{}/{}", reference.document, reference.version);
-        let metadata = match decode(self.transfer_send("GET", &format!("{path}/metadata"), &[], &caps, None)?)? {
+        let response = self.transfer_send("GET", &format!("{path}/metadata"), &[], &caps, None)?;
+        // Authentication and service rejection are definitive before reading
+        // an explanatory body, which may itself be incomplete or unavailable.
+        let status = response.status().as_u16();
+        match status {
+            401 => return Err(Error::Server("unauthorized".into())),
+            403 => return Err(Error::Server("forbidden".into())),
+            503 => return Err(Error::Server("unavailable".into())),
+            _ => {}
+        }
+        let decoded = decode_at(response, HttpsPhase::MetadataBody);
+        if status != 200 {
+            return match decoded {
+                Err(Error::Network(_)) => Err(Error::Invalid("metadata error response")),
+                Err(error) => Err(error),
+                Ok(_) => Err(Error::Invalid("metadata status")),
+            };
+        }
+        let metadata = match decoded? {
             WireResponse::Metadata { metadata } => metadata,
             _ => return Err(Error::Invalid("content metadata")),
         };
@@ -327,7 +358,12 @@ impl Client {
                     // ureq's limiter errors when exactly exhausted, before probing EOF.
                     // One extra probe byte permits an exact-size chunk; equality below
                     // still rejects both a short body and any extra byte.
-                    let bytes = response.body_mut().with_config().limit(wanted + 1).read_to_vec().map_err(|_| https_network_error())?;
+                    let bytes = response
+                        .body_mut()
+                        .with_config()
+                        .limit(wanted + 1)
+                        .read_to_vec()
+                        .map_err(|error| https_transfer_error(HttpsPhase::RangeBody, error, Some(200)))?;
                     if bytes.len() as u64 != wanted || crate::digest(&bytes) != hash {
                         return Err(Error::Integrity);
                     }
@@ -338,8 +374,11 @@ impl Client {
                     Err(Error::Network(_)) if chunk_bytes > 64 * 1024 => {
                         chunk_bytes = [4 * transfers::CHUNK_BYTES, transfers::CHUNK_BYTES, 256 * 1024, 64 * 1024]
                             .into_iter()
-                            .find(|limit| *limit < chunk_bytes)
-                            .ok_or(Error::Invalid("download retry limit"))?;
+                            .find(|limit| *limit < chunk_bytes.min(total_bytes - offset))
+                            // At most one same-size transient retry for a file
+                            // already below the 64 KiB floor. Nominal cap steps
+                            // must not pretend to reduce its actual payload.
+                            .unwrap_or(64 * 1024);
                     }
                     Err(error) => return Err(error),
                 }

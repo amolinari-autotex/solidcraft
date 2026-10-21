@@ -87,6 +87,67 @@ fn https_network_error() -> Error {
     Error::Network(std::io::Error::other("PDM HTTPS transport failed"))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpsPhase {
+    Request,
+    ControlBody,
+    MetadataRequest,
+    MetadataBody,
+    RangeRequest,
+    RangeBody,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpsErrorClass {
+    Io,
+    Timeout,
+    Protocol,
+    Tls,
+    HttpStatus,
+    Other,
+}
+
+/// Safe diagnostics only. Never retain a transport error, request or response.
+struct HttpsTransportFailure {
+    phase: HttpsPhase,
+    class: HttpsErrorClass,
+    io_kind: std::io::ErrorKind,
+    http_status: Option<u16>,
+    timeout: Option<ureq::Timeout>,
+}
+
+impl std::fmt::Debug for HttpsTransportFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpsTransportFailure")
+            .field("phase", &self.phase)
+            .field("class", &self.class)
+            .field("io_kind", &self.io_kind)
+            .field("http_status", &self.http_status)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for HttpsTransportFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PDM HTTPS transport failed")
+    }
+}
+impl std::error::Error for HttpsTransportFailure {}
+
+fn https_transfer_error(phase: HttpsPhase, error: ureq::Error, http_status: Option<u16>) -> Error {
+    let (class, io_kind, timeout, http_status) = match error {
+        ureq::Error::Io(error) => (HttpsErrorClass::Io, error.kind(), None, http_status),
+        ureq::Error::Timeout(timeout) => (HttpsErrorClass::Timeout, std::io::ErrorKind::TimedOut, Some(timeout), http_status),
+        ureq::Error::Protocol(_) => (HttpsErrorClass::Protocol, std::io::ErrorKind::Other, None, http_status),
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) => (HttpsErrorClass::Tls, std::io::ErrorKind::Other, None, http_status),
+        ureq::Error::StatusCode(status) => (HttpsErrorClass::HttpStatus, std::io::ErrorKind::Other, None, Some(status)),
+        _ => (HttpsErrorClass::Other, std::io::ErrorKind::Other, None, http_status),
+    };
+    Error::Network(std::io::Error::new(io_kind, HttpsTransportFailure { phase, class, io_kind, http_status, timeout }))
+}
+
 fn authorization_header(token: &AuthToken) -> Result<ureq::http::HeaderValue, Error> {
     let mut authorization = ureq::http::HeaderValue::from_str(&format!("Bearer {}", token.0)).map_err(|_| Error::Invalid("HTTPS credential"))?;
     authorization.set_sensitive(true);
@@ -750,6 +811,36 @@ mod https_tests {
         for bytes in [Vec::new(), vec![0; 64 * 1024 + 1], b"invalid certificate".to_vec()] {
             let token = AuthToken::parse("00".repeat(32)).unwrap();
             assert!(Client::https_with_ca("https://localhost", token, &bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn transfer_failure_diagnostics_preserve_only_safe_typed_fields() {
+        let secret = "sensitive-credential-private-path-and-remote-response";
+        let cases = [
+            (ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, secret)), HttpsErrorClass::Io),
+            (ureq::Error::BadUri(format!("https://{secret}@example.test/{secret}")), HttpsErrorClass::Other),
+            (ureq::Error::Tls(secret), HttpsErrorClass::Tls),
+            (ureq::Error::Timeout(ureq::Timeout::RecvBody), HttpsErrorClass::Timeout),
+            (ureq::Error::StatusCode(503), HttpsErrorClass::HttpStatus),
+        ];
+        for (raw, class) in cases {
+            let error = https_transfer_error(HttpsPhase::RangeBody, raw, Some(200));
+            assert!(!format!("{error:?}: {error}").contains(secret));
+            let Error::Network(io) = error else { panic!("network error expected") };
+            let safe = io.get_ref().unwrap().downcast_ref::<HttpsTransportFailure>().unwrap();
+            assert_eq!(safe.phase, HttpsPhase::RangeBody);
+            assert_eq!(safe.class, class);
+            assert_eq!(safe.to_string(), "PDM HTTPS transport failed");
+            assert!(std::error::Error::source(safe).is_none());
+            if class == HttpsErrorClass::Io {
+                assert_eq!(io.kind(), std::io::ErrorKind::ConnectionReset);
+            }
+            if class == HttpsErrorClass::Timeout {
+                assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+                assert_eq!(safe.timeout, Some(ureq::Timeout::RecvBody));
+            }
+            assert_eq!(safe.http_status, Some(if class == HttpsErrorClass::HttpStatus { 503 } else { 200 }));
         }
     }
 
