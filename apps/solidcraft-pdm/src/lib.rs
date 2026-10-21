@@ -244,6 +244,25 @@ pub(crate) fn digest(content: &[u8]) -> String {
 }
 
 impl Store {
+    /// Explicit NEW-installation enrollment completion under the existing writer
+    /// lock. Call only from a persisted fresh-setup intent, never on ordinary
+    /// startup of a legacy installation. Identity and captured credentials stay
+    /// unchanged; a failed conversion retains its fail-closed recovery fence.
+    pub fn initialize_enrolled_streaming(&mut self, receipt: &bootstrap::EnrollmentReceipt, policy: stream_io::StreamPolicy) -> Result<(), Error> {
+        policy.validate()?;
+        if self.managed.server_id() != receipt.server_id {
+            return Err(Error::Conflict);
+        }
+        if let Some(current) = self.managed.stream_policy() {
+            return if *current == policy { Ok(()) } else { Err(Error::Conflict) };
+        }
+        for entry in fs::read_dir(&self.root)? {
+            if entry?.file_name().to_string_lossy().starts_with("d-") {
+                return Err(Error::Invalid("fresh enrollment requires empty archive"));
+            }
+        }
+        self.managed.initialize_enrolled_streaming(receipt, policy)
+    }
     /// Explicit operator action for an empty transactional filesystem archive.
     /// Failure leaves an on-disk fence: restore the prior backup to a NEW root.
     pub fn initialize_streaming(&mut self, policy: stream_io::StreamPolicy) -> Result<(), Error> {

@@ -14,6 +14,38 @@ impl Drop for Root {
 }
 
 #[test]
+fn explicit_fresh_enrollment_initializes_in_place_without_changing_identity() {
+    let root = Root(std::env::temp_dir().join(format!("enrolled-stream-{}", AuthToken::generate().unwrap())));
+    std::fs::create_dir(&root.0).unwrap();
+    let path = root.0.join("new");
+    let (receipt, _secret) = solidcraft_pdm::bootstrap::initialize(&path, "operator").unwrap();
+    let policy = StreamPolicy { version: 1, max_file_bytes: 8 * 1024 * 1024, max_store_bytes: 20 * 1024 * 1024 * 1024 };
+    let mut store = Store::open(&path).unwrap();
+    let bad = StreamPolicy { version: 1, max_file_bytes: 0, max_store_bytes: 20 * 1024 * 1024 * 1024 };
+    assert!(store.initialize_enrolled_streaming(&receipt, bad).is_err());
+    assert!(!path.join("managed/metadata.redb").exists());
+    store.initialize_enrolled_streaming(&receipt, policy.clone()).unwrap();
+    assert!(path.join("managed/metadata.redb").is_file());
+    assert!(path.join("managed/stream-policy.json").is_file());
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    store.initialize_enrolled_streaming(&receipt, policy.clone()).unwrap();
+    match store.execute(solidcraft_pdm::Request::Identity {}) {
+        solidcraft_pdm::Response::Identity { identity } => assert_eq!(identity.server_id, receipt.server_id),
+        _ => panic!("identity unavailable"),
+    }
+    drop(store);
+    let occupied = root.0.join("occupied");
+    let (other, _secret) = solidcraft_pdm::bootstrap::initialize(&occupied, "operator").unwrap();
+    let mut store = Store::open(&occupied).unwrap();
+    store.execute(solidcraft_pdm::Request::ManagedCreate { logical_path: "existing.bin".into() });
+    assert!(store.initialize_enrolled_streaming(&other, policy).is_err());
+    assert!(!occupied.join("managed/metadata.redb").exists());
+    assert!(!occupied.join("managed/metadata.pending").exists());
+    assert!(!occupied.join("managed/stream-policy.pending").exists());
+}
+
+#[test]
 fn large_blob_streams_through_policy_restart_backup_and_new_restore() {
     let root = Root(std::env::temp_dir().join(format!("stream-store-{}", AuthToken::generate().unwrap())));
     std::fs::create_dir(&root.0).unwrap();

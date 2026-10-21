@@ -330,6 +330,33 @@ impl ManagedStore {
     pub(crate) fn stream_policy(&self) -> Option<&crate::stream_io::StreamPolicy> {
         self.state.stream_policy.as_ref()
     }
+    pub(crate) fn initialize_enrolled_streaming(
+        &mut self,
+        receipt: &crate::bootstrap::EnrollmentReceipt,
+        policy: crate::stream_io::StreamPolicy,
+    ) -> Result<(), Error> {
+        if self.generation != 1
+            || self.portable_image.is_some()
+            || self.state.namespace.is_some()
+            || self.state.transfers.is_some()
+            || !self.state.documents.is_empty()
+            || !self.state.versions.is_empty()
+            || !self.state.receipts.is_empty()
+            || !self.state.checkout_tokens.is_empty()
+            || self.state.content_bytes != 0
+            || self.blobs.binding() != BlobBinding::Filesystem
+            || !self.blobs.inventory()?.is_empty()
+            || self.credentials.len() != 1
+            || self.credentials.first().is_none_or(|c| c.principal.id != receipt.administrator || c.principal.role != Role::Administrator)
+            || self.server_id() != receipt.server_id
+        {
+            return Err(Error::Invalid("fresh enrollment requires unchanged empty generation-one archive"));
+        }
+        // This is explicit creation completion, not an automatic legacy-store
+        // migration. The same lock, identity and credential registry are held.
+        self.convert_restored_to_database()?;
+        self.initialize_streaming(policy)
+    }
     pub(crate) fn initialize_streaming(&mut self, policy: crate::stream_io::StreamPolicy) -> Result<(), Error> {
         policy.validate()?;
         if self.metadata.is_none()
