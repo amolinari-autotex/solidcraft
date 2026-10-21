@@ -116,6 +116,8 @@ pub enum Error {
     Forbidden,
     #[error("version conflict")]
     Conflict,
+    #[error("document is referenced by retained versions")]
+    Referenced,
     #[error("version not found")]
     NotFound,
     #[error("storage integrity failure")]
@@ -158,6 +160,10 @@ pub enum Request {
     ManagedCatalog,
     ManagedCreate { logical_path: String },
     ManagedCreateNew { logical_path: String },
+    ManagedMetadata { document: String },
+    ManagedNamespaceCapabilities {},
+    ManagedNamespaceCatalog {},
+    ManagedNamespace { input: managed::NamespaceMutation },
     ManagedCheckout { document: String, workspace: String, machine: String },
     ManagedResumeCheckout { document: String, workspace: String, machine: String },
     ManagedCancelCheckout { document: String, workspace: String, machine: String, checkout_token: String },
@@ -176,6 +182,10 @@ impl std::fmt::Debug for Request {
             Self::ManagedCatalog => "ManagedCatalog",
             Self::ManagedCreate { .. } => "ManagedCreate",
             Self::ManagedCreateNew { .. } => "ManagedCreateNew",
+            Self::ManagedMetadata { .. } => "ManagedMetadata",
+            Self::ManagedNamespaceCapabilities {} => "ManagedNamespaceCapabilities",
+            Self::ManagedNamespaceCatalog {} => "ManagedNamespaceCatalog",
+            Self::ManagedNamespace { .. } => "ManagedNamespace",
             Self::ManagedCheckout { .. } => "ManagedCheckout",
             Self::ManagedResumeCheckout { .. } => "ManagedResumeCheckout",
             Self::ManagedCancelCheckout { .. } => "ManagedCancelCheckout",
@@ -196,6 +206,9 @@ pub enum Response {
     Identity { identity: AuthenticatedIdentity },
     ManagedCatalog { catalog: managed::ManagedCatalog },
     ManagedDocument { entry: managed::CatalogEntry },
+    ManagedMetadata { metadata: managed::NamespaceMetadata },
+    ManagedNamespaceCapabilities { capabilities: managed::NamespaceCapabilities },
+    ManagedNamespaceCatalog { entries: Vec<managed::NamespaceMetadata> },
     ManagedCheckout { grant: managed::CheckoutGrant },
     ManagedCheckedIn { version: managed::ManagedVersion },
     ManagedHistory { versions: Vec<managed::ManagedVersion> },
@@ -378,6 +391,9 @@ impl Store {
         self.check_quota(content.len())?;
         let mut unique = BTreeSet::new();
         for dep in &dependencies {
+            if self.managed.tombstoned(&dep.document) {
+                return Err(Error::Referenced);
+            }
             if dep.document == document || !unique.insert(dep) {
                 return Err(Error::Invalid("self or duplicate dependency"));
             }
@@ -466,6 +482,26 @@ impl Store {
             }),
             Request::ManagedCatalog => Ok(Response::ManagedCatalog { catalog: self.managed.catalog() }),
             Request::ManagedCreate { logical_path } => self.managed.create(principal, logical_path).map(|entry| Response::ManagedDocument { entry }),
+            Request::ManagedMetadata { document } => {
+                self.managed.namespace_metadata(&document).map(|metadata| Response::ManagedMetadata { metadata })
+            }
+            Request::ManagedNamespaceCapabilities {} => {
+                Ok(Response::ManagedNamespaceCapabilities { capabilities: self.managed.namespace_capabilities(principal) })
+            }
+            Request::ManagedNamespaceCatalog {} => self.managed.namespace_catalog().map(|entries| Response::ManagedNamespaceCatalog { entries }),
+            Request::ManagedNamespace { input } => (|| {
+                let mut referenced = false;
+                if matches!(input.action, managed::NamespaceAction::Tombstone) {
+                    for version in self.managed.history(&input.document)? {
+                        if !self.where_used(&version.version.reference)?.is_empty() {
+                            referenced = true;
+                            break;
+                        }
+                    }
+                }
+                self.managed.namespace_mutate(principal, input, referenced)
+            })()
+            .map(|metadata| Response::ManagedMetadata { metadata }),
             Request::ManagedCreateNew { logical_path } => {
                 self.managed.create_new(principal, logical_path).map(|entry| Response::ManagedDocument { entry })
             }
@@ -495,6 +531,7 @@ impl Store {
             code: match error {
                 Error::Forbidden => "forbidden",
                 Error::Conflict => "conflict",
+                Error::Referenced => "referenced",
                 Error::NotFound => "not_found",
                 Error::Invalid(_) => "invalid_request",
                 Error::Integrity => "integrity",

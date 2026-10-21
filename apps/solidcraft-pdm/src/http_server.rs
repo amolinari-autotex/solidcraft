@@ -119,6 +119,7 @@ async fn rpc(request: HttpRequest<Incoming>, send: mpsc::SyncSender<Job>) -> Res
         HTTP_RPC_PATH => 0,
         administration::CAPABILITIES_PATH => 1,
         administration::ADMIN_PATH => 2,
+        crate::managed::NAMESPACE_CAPABILITIES_PATH => 3,
         _ => return Ok(reply(StatusCode::NOT_FOUND, "{}")),
     };
     if request.uri().query().is_some() {
@@ -158,6 +159,15 @@ async fn rpc(request: HttpRequest<Incoming>, send: mpsc::SyncSender<Job>) -> Res
             return Ok(reply(StatusCode::BAD_REQUEST, "{}"));
         }
         (JobRequest::Rpc(envelope.request), envelope.server_id)
+    } else if route == 3 {
+        let envelope: CapabilityRequest = match serde_json::from_slice(&bytes) {
+            Ok(envelope) => envelope,
+            Err(_) => return Ok(extension_error("invalid_request")),
+        };
+        if envelope.protocol != crate::managed::NAMESPACE_PROTOCOL {
+            return Ok(extension_error("unsupported_protocol"));
+        }
+        (JobRequest::Rpc(Request::ManagedNamespaceCapabilities {}), Some(envelope.server_id))
     } else if route == 1 {
         let envelope: CapabilityRequest = match serde_json::from_slice(&bytes) {
             Ok(envelope) => envelope,

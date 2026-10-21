@@ -15,6 +15,10 @@ const MAX_GENERATIONS: u64 = 4096;
 const MAX_METADATA_STORAGE: u64 = 64 * 1024 * 1024;
 mod administration;
 mod metadata_db;
+mod namespace;
+pub use namespace::{NamespaceAction, NamespaceCapabilities, NamespaceMetadata, NamespaceMutation};
+pub const NAMESPACE_CAPABILITIES_PATH: &str = "/pdm/v1/namespace-capabilities";
+pub const NAMESPACE_PROTOCOL: &str = "solidcraft-pdm-namespace/1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +135,8 @@ struct Receipt {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace: Option<namespace::NamespaceState>,
     server_id: String,
     checkout_tokens: BTreeMap<String, String>,
     documents: BTreeMap<String, CatalogEntry>,
@@ -145,6 +151,9 @@ fn hash_id(value: &str) -> bool {
 
 impl State {
     fn validate(&self) -> Result<(), Error> {
+        if let Some(namespace) = &self.namespace {
+            namespace.validate(self)?;
+        }
         if !hash_id(&self.server_id)
             || self.documents.len() > MAX_VERSIONS
             || self.versions.len() > MAX_VERSIONS
@@ -570,7 +579,10 @@ impl ManagedStore {
     }
 
     pub(crate) fn catalog(&self) -> ManagedCatalog {
-        ManagedCatalog { server_id: self.state.server_id.clone(), entries: self.state.documents.values().cloned().collect() }
+        ManagedCatalog {
+            server_id: self.state.server_id.clone(),
+            entries: self.state.documents.values().filter(|e| !self.tombstoned(&e.document)).map(|entry| self.legacy_entry(entry)).collect(),
+        }
     }
 
     pub(crate) fn versions(&self) -> Vec<Version> {
@@ -590,8 +602,17 @@ impl ManagedStore {
         if self.state.documents.len() >= MAX_VERSIONS {
             return Err(Error::Invalid("document quota"));
         }
-        if let Some(entry) = self.state.documents.values().find(|e| e.logical_path.to_lowercase() == logical_path.to_lowercase()) {
-            return if entry.logical_path == logical_path { Ok(entry.clone()) } else { Err(Error::Conflict) };
+        if let Some(entry) = self.state.documents.values().find(|e| {
+            e.logical_path.to_lowercase() == logical_path.to_lowercase() || self.materialization_path(e).to_lowercase() == logical_path.to_lowercase()
+        }) {
+            return if (entry.logical_path == logical_path || self.materialization_path(entry) == logical_path) && !self.tombstoned(&entry.document) {
+                Ok(self.legacy_entry(entry))
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        if self.namespace_path_conflict(&logical_path, None) {
+            return Err(Error::Conflict);
         }
         let document = format!("m-{}", crate::AuthToken::generate()?.get(..32).ok_or(Error::Integrity)?);
         if self.contains(&document) {
@@ -610,7 +631,7 @@ impl ManagedStore {
     pub(crate) fn create_new(&mut self, principal: &Principal, logical_path: String) -> Result<CatalogEntry, Error> {
         Self::write_permission(principal)?;
         validate_logical_path(&logical_path)?;
-        if self.state.documents.values().any(|entry| entry.logical_path.to_lowercase() == logical_path.to_lowercase()) {
+        if self.namespace_path_conflict(&logical_path, None) {
             return Err(Error::Conflict);
         }
         self.create(principal, logical_path)
@@ -622,6 +643,9 @@ impl ManagedStore {
 
     pub(crate) fn checkout(&mut self, principal: &Principal, document: &str, workspace: String, machine: String) -> Result<CheckoutGrant, Error> {
         Self::write_permission(principal)?;
+        if self.tombstoned(document) {
+            return Err(Error::NotFound);
+        }
         if !label(&workspace) || !label(&machine) {
             return Err(Error::Invalid("workspace or machine"));
         }
@@ -638,7 +662,7 @@ impl ManagedStore {
         state.checkout_tokens.insert(document.into(), token.clone());
         state.documents.insert(document.into(), entry.clone());
         self.publish_as(state, &principal.id, "checkout")?;
-        Ok(CheckoutGrant { entry, token })
+        Ok(CheckoutGrant { entry: self.legacy_entry(&entry), token })
     }
 
     fn owns(&self, document: &str, checkout: &Checkout, principal: &Principal, workspace: &str, machine: &str, token: &str) -> bool {
@@ -667,7 +691,7 @@ impl ManagedStore {
         state.checkout_tokens.remove(document);
         state.documents.insert(document.into(), entry.clone());
         self.publish_as(state, &principal.id, "cancel_checkout")?;
-        Ok(entry)
+        Ok(self.legacy_entry(&entry))
     }
 
     pub(crate) fn download(&self, reference: &VersionRef) -> Result<(Version, Vec<u8>), Error> {
@@ -713,6 +737,9 @@ impl ManagedStore {
         }
         let mut unique = BTreeSet::new();
         for dependency in &input.dependencies {
+            if self.tombstoned(&dependency.document) {
+                return Err(Error::Referenced);
+            }
             if dependency.document == input.document || !unique.insert(dependency) {
                 return Err(Error::Invalid("self or duplicate dependency"));
             }
@@ -770,7 +797,7 @@ impl ManagedStore {
             return Err(Error::Forbidden);
         }
         let token = self.state.checkout_tokens.get(document).ok_or(Error::Integrity)?;
-        Ok(CheckoutGrant { entry: entry.clone(), token: token.clone() })
+        Ok(CheckoutGrant { entry: self.legacy_entry(entry), token: token.clone() })
     }
 }
 

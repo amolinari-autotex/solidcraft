@@ -374,6 +374,7 @@ impl Client {
                 "forbidden"
                 | "conflict"
                 | "not_found"
+                | "referenced"
                 | "invalid_request"
                 | "integrity"
                 | "storage_error"
@@ -424,6 +425,73 @@ impl Client {
         match self.request(Request::ManagedCreateNew { logical_path })? {
             Response::ManagedDocument { entry } => Ok(entry),
             _ => Err(Error::Invalid("unexpected exclusive managed create response")),
+        }
+    }
+
+    /// A separate authenticated route preserves the original strict capability
+    /// schema. Legacy route 404 is unsupported, never an authentication failure.
+    pub fn namespace_capabilities(&self) -> Result<Option<crate::managed::NamespaceCapabilities>, Error> {
+        let (origin, agent) = match self.direct_extension_origin() {
+            Ok(pair) => pair,
+            Err(Error::Server(code)) if code == "capability_unavailable" => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let identity = self.authenticated_identity()?;
+        let body = serde_json::to_vec(&crate::administration::CapabilityRequest {
+            protocol: crate::managed::NAMESPACE_PROTOCOL.into(),
+            server_id: identity.server_id.clone(),
+        })?;
+        let mut response = agent
+            .post(format!("{origin}{}", crate::managed::NAMESPACE_CAPABILITIES_PATH))
+            .header(ureq::http::header::AUTHORIZATION, authorization_header(&self.token)?)
+            .header(ureq::http::header::CONTENT_TYPE, "application/json")
+            .send(body.as_slice())
+            .map_err(|_| https_network_error())?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if response.status().as_u16() != 200 {
+            return Err(Error::Invalid("namespace capability response status"));
+        }
+        if !response
+            .headers()
+            .get(ureq::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(';').next().is_some_and(|v| v.trim() == "application/json"))
+        {
+            return Err(Error::Invalid("namespace capability content type"));
+        }
+        let bytes = response.body_mut().with_config().limit(16 * 1024).read_to_vec().map_err(|_| https_network_error())?;
+        match serde_json::from_slice::<Response>(&bytes).map_err(|_| Error::Invalid("namespace capability response JSON"))? {
+            Response::ManagedNamespaceCapabilities { capabilities }
+                if capabilities.protocol == crate::managed::NAMESPACE_PROTOCOL
+                    && capabilities.server_id == identity.server_id
+                    && capabilities.principal.id == identity.principal.id =>
+            {
+                Ok(Some(capabilities))
+            }
+            Response::Error { code } if matches!(code.as_str(), "unauthorized" | "forbidden" | "server_identity_mismatch") => {
+                Err(Error::Server(code))
+            }
+            _ => Err(Error::Invalid("namespace capability identity")),
+        }
+    }
+    pub fn managed_metadata(&self, document: String) -> Result<crate::managed::NamespaceMetadata, Error> {
+        match self.request(Request::ManagedMetadata { document })? {
+            Response::ManagedMetadata { metadata } => Ok(metadata),
+            _ => Err(Error::Invalid("unexpected namespace metadata response")),
+        }
+    }
+    pub fn namespace_catalog(&self) -> Result<Vec<crate::managed::NamespaceMetadata>, Error> {
+        match self.request(Request::ManagedNamespaceCatalog {})? {
+            Response::ManagedNamespaceCatalog { entries } => Ok(entries),
+            _ => Err(Error::Invalid("unexpected namespace catalog response")),
+        }
+    }
+    pub fn managed_namespace(&self, input: crate::managed::NamespaceMutation) -> Result<crate::managed::NamespaceMetadata, Error> {
+        match self.request(Request::ManagedNamespace { input })? {
+            Response::ManagedMetadata { metadata } => Ok(metadata),
+            _ => Err(Error::Invalid("unexpected namespace mutation response")),
         }
     }
 
@@ -519,6 +587,58 @@ impl Client {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod https_tests {
+    #[test]
+    fn legacy_namespace_probe_404_preserves_authenticated_identity() {
+        use crate::http_listener::{Handler, HttpListener, HttpsConfig};
+        use http_body_util::{BodyExt, Full, Limited};
+        use hyper::{Response as HttpResponse, body::Bytes};
+        use std::{sync::Arc, time::Duration};
+        let handler: Handler = Arc::new(|request| {
+            Box::pin(async move {
+                if request.uri().path() == crate::managed::NAMESPACE_CAPABILITIES_PATH {
+                    return HttpResponse::builder()
+                        .status(404)
+                        .header("content-type", "application/json")
+                        .body(Full::new(Bytes::from_static(b"{}")))
+                        .unwrap();
+                }
+                let body = Limited::new(request.into_body(), 64 * 1024).collect().await.unwrap().to_bytes();
+                let envelope: crate::RpcEnvelope = serde_json::from_slice(&body).unwrap();
+                let response = match envelope.request {
+                    crate::Request::ManagedCatalog => {
+                        crate::Response::ManagedCatalog { catalog: crate::managed::ManagedCatalog { server_id: "a".repeat(64), entries: vec![] } }
+                    }
+                    crate::Request::Identity {} => crate::Response::Identity {
+                        identity: crate::AuthenticatedIdentity {
+                            server_id: "a".repeat(64),
+                            principal: crate::managed::Principal { id: "alice".into(), role: crate::managed::Role::Contributor },
+                        },
+                    },
+                    _ => panic!("legacy peer received a new RPC operation"),
+                };
+                HttpResponse::builder()
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(serde_json::to_vec(&response).unwrap())))
+                    .unwrap()
+            })
+        });
+        let config = HttpsConfig::from_der(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![include_bytes!("../tests/fixtures/pdm-https/server.der").to_vec()],
+            include_bytes!("../tests/fixtures/pdm-https/server-key.der").to_vec(),
+        )
+        .unwrap();
+        let server = HttpListener::start(config, handler, 2, Duration::from_secs(5)).unwrap();
+        let client = super::Client::https_with_ca(
+            &format!("https://{}", server.address()),
+            crate::AuthToken::parse("a".repeat(64)).unwrap(),
+            include_bytes!("../tests/fixtures/pdm-https/ca.der"),
+        )
+        .unwrap();
+        assert!(client.namespace_capabilities().unwrap().is_none());
+        assert_eq!(client.authenticated_identity().unwrap().principal.id, "alice");
+        server.shutdown().unwrap();
+    }
     #[test]
     fn unsupported_resume_never_falls_back_to_a_checkout_request() {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

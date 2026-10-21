@@ -103,7 +103,7 @@ impl Image {
             operation: operation.into(),
             unix_ms: now()?,
             state_sha256: self.fingerprint()?,
-            subject: None,
+            subject: if operation.starts_with("document.") { self.state.namespace.as_ref().map(|state| state.last_document.clone()) } else { None },
             change: None,
         });
         Ok(())
@@ -149,7 +149,12 @@ impl Image {
         }
         let mut previous = None;
         for event in &self.audit {
-            if event.operation.starts_with("user.") != event.subject.is_some()
+            let document_event = matches!(event.operation.as_str(), "document.rename" | "document.tombstone");
+            if document_event {
+                if event.change.is_some() || event.subject.as_ref().is_none_or(|id| !self.state.documents.contains_key(id)) {
+                    return Err(Error::Integrity);
+                }
+            } else if event.operation.starts_with("user.") != event.subject.is_some()
                 || event.subject.is_some() != event.change.is_some()
                 || event.subject.as_ref().is_some_and(|subject| !label(subject) || subject == "owner")
             {
@@ -163,6 +168,8 @@ impl Image {
                         | "checkout"
                         | "cancel_checkout"
                         | "check_in"
+                        | "document.rename"
+                        | "document.tombstone"
                         | "user.create"
                         | "user.set_role"
                         | "user.set_enabled"
