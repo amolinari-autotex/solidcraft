@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use solidcraft_engine::Sel;
 use solidcraft_engine::Session;
 use solidcraft_engine::doc::expr::Kind as ValueKind;
-use solidcraft_engine::doc::{AxisRef, Direction, FeatureKind, FilletStyle, HoleKind, Operation, PatternKind, PlaneRef, ProfileSel, ThinSide};
+use solidcraft_engine::doc::{
+    AxisRef, Direction, FeatureKind, FilletStyle, HoleKind, Operation, PatternKind, PlaneRef, ProfileSel, ThinSide, ThreadHandedness,
+};
 use solidcraft_engine::geom::{Aabb3, Vec3};
 
 use crate::SolveApp;
@@ -234,6 +236,7 @@ crate::dialog_descriptor::dialog_descriptors! {
             Thread {
                 designation: String,
                 length: String,
+                handedness: ThreadHandedness,
                 /// The last automatic size; a different value is a manual override. Keep automatic
                 /// features automatic when applying, even though their resolved size is visible.
                 suggested: Option<String>,
@@ -404,6 +407,7 @@ pub struct HoleOpts {
     /// Use the full useful cylindrical wall, independently of the drill extents.
     pub thread_full_depth: bool,
     pub thread_depth: String,
+    pub handedness: ThreadHandedness,
 }
 
 impl Default for HoleOpts {
@@ -419,6 +423,7 @@ impl Default for HoleOpts {
             refs: Default::default(),
             thread_full_depth: true,
             thread_depth: "10 mm".into(),
+            handedness: ThreadHandedness::Right,
         }
     }
 }
@@ -722,7 +727,13 @@ impl Dialog {
                 vec![SelInput::new("Body to split", BODIES, false), SelInput::new("Splitting tool", PLANES | FACES | AXES, false)],
             ),
             "solid.thread" => Dialog::new(
-                Kind::Thread { designation: String::new(), length: String::new(), suggested: None, of: Vec::new() },
+                Kind::Thread {
+                    designation: String::new(),
+                    length: String::new(),
+                    handedness: ThreadHandedness::Right,
+                    suggested: None,
+                    of: Vec::new(),
+                },
                 vec![SelInput::new("Cylindrical face", FACES, false)],
             ),
             "material.assign" => Dialog::new(Kind::Material { index: 1 }, vec![SelInput::new("Bodies", BODIES, true)]),
@@ -3744,13 +3755,16 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             need(0, "planar faces")?;
             ("solid.offset_face", json!({"faces": face_points(0)}))
         }
-        Kind::Thread { designation, length, suggested, .. } => {
+        Kind::Thread { designation, length, suggested, handedness, .. } => {
             need(0, "a cylindrical face")?;
             let mut p = json!({"face": face_points(0).into_iter().next().unwrap_or(Value::Null)});
             if !designation.trim().is_empty() && suggested.as_deref() != Some(designation.as_str()) {
                 p["designation"] = json!(designation.trim());
             }
             put(&mut p, &[("length", length)]);
+            if !handedness.is_right() {
+                p["handedness"] = json!(handedness);
+            }
             ("solid.thread", p)
         }
         Kind::Material { index } => {
@@ -3868,6 +3882,9 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                     params["thread"] = json!(opts.thread.trim());
                     if !opts.thread_full_depth {
                         params["thread_depth"] = json!(opts.thread_depth.trim());
+                    }
+                    if !opts.handedness.is_right() {
+                        params["handedness"] = json!(opts.handedness);
                     }
                 }
                 match *kind {
@@ -4612,7 +4629,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             d.extra.insert("pull".into(), pt3(pull.0));
             d
         }
-        FeatureKind::Hole { position, at, direction, diameter, depth, hole, points, thread, thread_depth, to, references } => {
+        FeatureKind::Hole { position, at, direction, diameter, depth, hole, points, thread, thread_depth, handedness, to, references } => {
             let mut d = start("solid.hole")?;
             let mut k = hole_defaults();
             if let Kind::Hole { diameter: dia, depth: dep, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } = &mut k {
@@ -4620,6 +4637,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                 opts.all = depth.is_none();
                 opts.angled = matches!(hole, HoleKind::Drilled { .. });
                 opts.multiple = points.as_ref().is_some_and(|sp| !sp.single);
+                opts.handedness = *handedness;
                 if let Some(th) = thread {
                     opts.tapped = true;
                     opts.thread = th.clone();
@@ -5014,7 +5032,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             }
             d
         }
-        FeatureKind::Thread { face, designation, length, modeled } => {
+        FeatureKind::Thread { face, designation, length, modeled, handedness } => {
             let mut d = start("solid.thread")?;
             if *modeled {
                 d.extra.insert("modeled".into(), json!(true));
@@ -5022,6 +5040,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             d.kind = Kind::Thread {
                 designation: designation.clone().unwrap_or_default(),
                 length: length.as_deref().map(str::to_string).unwrap_or_default(),
+                handedness: *handedness,
                 suggested: None,
                 of: Vec::new(),
             };
