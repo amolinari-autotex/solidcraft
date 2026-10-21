@@ -44,6 +44,7 @@ pub mod naming;
 mod params;
 pub mod physical_material;
 mod piece_names;
+pub mod pipe_thread_catalog;
 mod points;
 mod profile_refs;
 pub mod progress;

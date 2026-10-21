@@ -70,7 +70,9 @@ pub(crate) fn hole_rows(ui: &mut egui::Ui, doc: &Document, designation: &mut Str
     if family != TappedThreadFamily::Metric {
         *custom = None;
     }
-    if profile != before_profile && let Some(size) = sizes.first() {
+    if profile != before_profile
+        && let Some(size) = sizes.first()
+    {
         *designation = size.designation.clone();
         *custom = None;
     }
@@ -119,8 +121,12 @@ pub(crate) fn hole_rows(ui: &mut egui::Ui, doc: &Document, designation: &mut Str
     }
     form_row(ui, "Tap drill diameter", |ui| {
         match parse_tapped_thread(designation).filter(|_| custom.as_ref().is_none_or(|draft| draft.error.is_none())) {
-            Some(size) => { ui.label(format!("{} mm", size.tap_drill)); }
-            None => { ui.label(tr("thread.select_size")); }
+            Some(size) => {
+                ui.label(format!("{} mm", size.tap_drill));
+            }
+            None => {
+                ui.label(tr("thread.select_size"));
+            }
         }
     });
     enter || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
