@@ -6,6 +6,8 @@ pub enum TappedThreadFamily {
     Metric,
     Unc,
     Unf,
+    G,
+    Rp,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -15,6 +17,29 @@ pub struct TappedThread {
     pub major_diameter: f64,
     pub pitch: f64,
     pub tap_drill: f64,
+}
+
+impl TappedThread {
+    pub fn profile_degrees(&self) -> f64 {
+        match self.family {
+            TappedThreadFamily::G | TappedThreadFamily::Rp => 55.0,
+            _ => 60.0,
+        }
+    }
+}
+
+fn pipe_size(size: crate::pipe_thread_catalog::PipeThread) -> TappedThread {
+    use crate::pipe_thread_catalog::PipeFamily;
+    TappedThread {
+        family: match size.family() {
+            PipeFamily::G => TappedThreadFamily::G,
+            PipeFamily::Rp => TappedThreadFamily::Rp,
+        },
+        designation: size.designation(),
+        major_diameter: size.size().major,
+        pitch: size.pitch(),
+        tap_drill: size.process_bore().0,
+    }
 }
 
 // Diameter/pitch pairs verified against Guhring, plus Yamawa for M12x1.25.
@@ -82,6 +107,10 @@ fn metric_size(major_diameter: f64, pitch: f64) -> TappedThread {
 
 /// Catalogue choices for tapped holes only. Automatic Thread sizing is unchanged.
 pub fn tapped_thread_sizes(family: TappedThreadFamily) -> Vec<TappedThread> {
+    if matches!(family, TappedThreadFamily::G | TappedThreadFamily::Rp) {
+        return crate::pipe_thread_catalog::pipe_thread_sizes().map(pipe_size).filter(|s| s.family == family).collect();
+    }
+
     if family == TappedThreadFamily::Metric {
         let mut sizes: Vec<_> = crate::metric_thread_sizes().iter().chain(METRIC_FINE).map(|&(d, p)| metric_size(d, p)).collect();
         sizes.sort_by(|a, b| a.major_diameter.total_cmp(&b.major_diameter).then(b.pitch.total_cmp(&a.pitch)));
@@ -102,13 +131,16 @@ pub fn tapped_thread_sizes(family: TappedThreadFamily) -> Vec<TappedThread> {
 }
 
 /// Explicit metric custom sizes remain supported. Unified sizes must be in the verified
-/// catalogue and include their UNC/UNF suffix; pipe and modelled threads are not implied.
+/// catalogue and include their UNC/UNF suffix. G/Rp use explicit process drills; modeled Thread stays metric-only.
 pub fn parse_tapped_thread(text: &str) -> Option<TappedThread> {
     if text.len() > 128 {
         return None;
     }
     if let Some((d, p)) = crate::parse_metric_thread(text) {
         return Some(metric_size(d, p));
+    }
+    if let Some(size) = crate::pipe_thread_catalog::parse_pipe_thread(text) {
+        return Some(pipe_size(size));
     }
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_uppercase();
     let &(name, family, major_diameter, tpi, tap_drill) = UNIFIED.iter().find(|row| row.0 == normalized)?;
@@ -121,12 +153,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parallel_pipe_catalogue_is_available_to_tapped_holes() {
+        for label in ["G 1/4", "Rp 1/4"] {
+            let s = parse_tapped_thread(label).unwrap();
+            assert_eq!(s.profile_degrees(), 55.0);
+            assert_eq!(s.major_diameter, 13.157);
+            assert_eq!(s.tap_drill, if s.family == TappedThreadFamily::G { 11.75 } else { 11.4 });
+            assert!((s.pitch - 25.4 / 19.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn tapped_catalogue_has_unique_valid_sizes_and_round_trips() {
         let mut names = std::collections::HashSet::new();
-        for family in [TappedThreadFamily::Metric, TappedThreadFamily::Unc, TappedThreadFamily::Unf] {
+        for family in [TappedThreadFamily::Metric, TappedThreadFamily::Unc, TappedThreadFamily::Unf, TappedThreadFamily::G, TappedThreadFamily::Rp] {
             let sizes = tapped_thread_sizes(family);
             if family != TappedThreadFamily::Metric {
-                assert_eq!(sizes.len(), 14);
+                assert_eq!(sizes.len(), if matches!(family, TappedThreadFamily::G | TappedThreadFamily::Rp) { 6 } else { 14 });
             }
             for size in sizes {
                 assert!(names.insert(size.designation.clone()));
@@ -157,7 +200,7 @@ mod tests {
             let size = parse_tapped_thread(name).unwrap();
             assert_eq!((size.major_diameter, size.pitch, size.tap_drill), (d, p, drill));
         }
-        for invalid in ["1/4-20 UNF", "#10-32 UNC", "1/4-19 BSP", "G1/4", "R1/4", "1/4-18 NPT", "1/4-20", "M8xNaN", "M8x8"] {
+        for invalid in ["1/4-20 UNF", "#10-32 UNC", "1/4-19 BSP", "Rc1/4", "R1/4", "1/4-18 NPT", "1/4-20", "M8xNaN", "M8x8"] {
             assert!(parse_tapped_thread(invalid).is_none(), "{invalid}");
         }
     }

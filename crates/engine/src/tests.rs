@@ -4223,3 +4223,23 @@ fn creating_a_component_recomputes_nothing() {
         run(&mut s, "component.activate", json!({"component": "root"}));
     }
 }
+
+#[test]
+fn parallel_pipe_large_nominals_support_shallow_and_thin_cylindrical_holes() {
+    for designation in ["G 1", "Rp 1"] {
+        for (height, depth) in [(15.0, Some(3.0)), (5.0, None)] {
+            let mut s = crate::Session::default();
+            s.execute("solid.box", &format!(r#"{{"length":80,"width":80,"height":{height},"body_name":"Plate"}}"#).parse().unwrap()).unwrap();
+            let depth_json = depth.map(|d| format!(r#", "depth":{d}"#)).unwrap_or_default();
+            let result =
+                s.execute("solid.hole", &format!(r#"{{"position":[40,40,{height}],"thread":"{designation}"{depth_json}}}"#).parse().unwrap());
+            assert!(result.is_ok(), "{designation}, height={height}, depth={depth:?}: {result:?}");
+            let reopened = crate::Session::new(crate::doc::Document::from_json(&s.doc.to_json()).unwrap());
+            assert!(reopened.model.results.iter().all(|r| r.error.is_none()));
+            let state = reopened.world_state();
+            assert_eq!(state.threads.len(), 1);
+            assert_eq!(state.threads[0].designation, designation);
+            assert!((state.threads[0].end - state.threads[0].start - depth.unwrap_or(height)).abs() < 1e-6);
+        }
+    }
+}
