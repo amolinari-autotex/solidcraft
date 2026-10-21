@@ -6299,14 +6299,14 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 apply_beside_sheet_cut(st, f, tools, Operation::Cut, &[], &handled)?;
             }
             if let Some(d) = thread {
-                // A point on each hole's wall, a little below the entry.
+                // Find the bore beyond any entry recess, including shallow and through holes.
                 let r = val(vals, diameter, Kind::Length)? / 2.0;
                 let parallel_pipe = crate::pipe_thread_catalog::parse_pipe_thread(d).is_some();
                 for p in spots {
                     let wall = if parallel_pipe {
                         parallel_tapped_wall(st, p, dir, r).ok_or_else(|| DocError::Invalid("no cylindrical pipe-thread wall remains".into()))?
                     } else {
-                        p + dir.any_perp() * r + dir * (r * 0.5)
+                        parallel_tapped_wall(st, p, dir, r).unwrap_or(p + dir.any_perp() * r + dir * (r * 0.5))
                     };
                     let mut t = thread_on_impl(st, f.id, wall, Some(d), None, true, false)?;
                     if let Some(depth) = thread_depth {
