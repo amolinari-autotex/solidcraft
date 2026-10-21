@@ -28,6 +28,7 @@ pub mod relay;
 pub mod relay_client;
 pub mod relay_http;
 pub mod s3_blob_store;
+pub mod transfer_staging;
 pub mod workspace;
 
 pub const PROTOCOL: &str = "solidcraft-pdm/2";
