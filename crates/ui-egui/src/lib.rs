@@ -179,9 +179,6 @@ pub(crate) mod frame_watch;
 #[cfg(test)]
 mod history_off_thread_tests;
 pub use file_picker::FilePickerFuture;
-pub mod pdm_panel;
-#[cfg(test)]
-mod pdm_panel_tests;
 #[cfg(test)]
 mod blend_arrow_tests;
 #[cfg(test)]
@@ -197,6 +194,9 @@ pub mod mouse_gesture;
 pub(crate) mod navigation;
 pub(crate) mod open_meshing;
 pub mod params_dialog;
+pub mod pdm_panel;
+#[cfg(test)]
+mod pdm_panel_tests;
 pub(crate) mod pick_index;
 pub(crate) mod plugins;
 pub mod prefs;

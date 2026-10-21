@@ -970,7 +970,13 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             painter.line_segment([ws.right_top(), ws.right_bottom()], Stroke::new(1.0, t.border));
         }
         let render = crate::render_workspace::active(app);
-        let workspace_icon = if app.pdm.workspace_active { "ws_pdm" } else if render { "ws_render" } else { "ws_design" };
+        let workspace_icon = if app.pdm.workspace_active {
+            "ws_pdm"
+        } else if render {
+            "ws_render"
+        } else {
+            "ws_design"
+        };
         icons::paint_icon(
             &painter,
             Rect::from_center_size(pos2(ws.center().x, ws.top() + if labels { 39.0 } else { 25.0 }), vec2(30.0, 30.0)),

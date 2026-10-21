@@ -1492,7 +1492,7 @@ fn file_table(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, compact: b
             } else if index % 2 == 0 {
                 t.panel
             } else {
-                t.subheading_bg
+                t.panel_header
             };
             ui.painter().rect_filled(row, 0.0, fill);
             handle(&format!("file:{document}"), &response);
@@ -1538,7 +1538,7 @@ fn file_table(app: &mut SolveApp, ui: &mut egui::Ui, status: &Status, compact: b
             if response.secondary_clicked() {
                 selected = Some(CatalogClick::File(document.clone(), false));
             }
-            response.clone().context_menu(|ui| file_context_menu(app, ui, status, entry));
+            crate::ui_kit::Menu::context(&response, |ui| file_context_menu(app, ui, status, entry));
             response.on_hover_text(&entry.logical_path);
         }
     });
@@ -2198,7 +2198,7 @@ fn show_namespace_dialog(app: &mut SolveApp, ctx: &egui::Context) {
     let Some(mut dialog) = app.pdm.namespace_dialog.clone() else { return };
     let mut close = false;
     let mut submit = false;
-    egui::Modal::new(egui::Id::new("pdm_namespace_confirmation")).show(ctx, |ui| {
+    crate::ui_kit::Container::new(ctx, crate::ui_kit::Surface::Window).modal(egui::Id::new("pdm_namespace_confirmation")).show(ctx, |ui| {
         ui.heading(app.tr(if dialog.delete { "ui.pdm_delete" } else { "ui.pdm_rename" }));
         ui.label(&dialog.target.label);
         ui.label(app.tr(if dialog.delete { "ui.pdm_delete_warning" } else { "ui.pdm_rename_warning" }));
@@ -2244,7 +2244,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     guided::connection_window(app, ctx);
     show_namespace_dialog(app, ctx);
     if let Some(reference) = app.pdm.restore_confirmation.clone() {
-        egui::Modal::new(egui::Id::new("pdm_restore_version_confirmation")).show(ctx, |ui| {
+        crate::ui_kit::Container::new(ctx, crate::ui_kit::Surface::Window).modal(egui::Id::new("pdm_restore_version_confirmation")).show(ctx, |ui| {
             ui.heading(app.tr("ui.pdm_restore_version"));
             ui.label(app.tr("ui.pdm_restore_version_warning"));
             let status = app.pdm.runtime.status().ok();
@@ -2268,7 +2268,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         });
     }
     if app.pdm.recovery_confirmation {
-        egui::Modal::new(egui::Id::new("pdm_recover_confirmation")).show(ctx, |ui| {
+        crate::ui_kit::Container::new(ctx, crate::ui_kit::Surface::Window).modal(egui::Id::new("pdm_recover_confirmation")).show(ctx, |ui| {
             ui.heading(app.tr("ui.pdm_recover_workspace"));
             ui.label(app.tr("ui.pdm_recover_warning"));
             ui.label(format!("127.0.0.1:{}", app.pdm.port));
@@ -2288,7 +2288,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         app.pdm.pending_edit = None;
     }
     if let Some(command) = app.pdm.pending_edit.clone() {
-        egui::Modal::new(egui::Id::new("pdm_readonly_confirmation")).show(ctx, |ui| {
+        crate::ui_kit::Container::new(ctx, crate::ui_kit::Surface::Window).modal(egui::Id::new("pdm_readonly_confirmation")).show(ctx, |ui| {
             ui.heading(app.tr("ui.pdm_readonly_title"));
             ui.label(app.tr("ui.pdm_readonly_hint"));
             let status = app.pdm.runtime.status().ok();
@@ -2320,7 +2320,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             .as_ref()
             .zip(target.as_ref())
             .is_some_and(|(status, target)| target.document.as_ref().is_some_and(|document| status.managed.recoverable_checkouts.contains(document)));
-        egui::Modal::new(egui::Id::new("pdm_undo_confirmation")).show(ctx, |ui| {
+        crate::ui_kit::Container::new(ctx, crate::ui_kit::Surface::Window).modal(egui::Id::new("pdm_undo_confirmation")).show(ctx, |ui| {
             ui.heading(app.tr("ui.pdm_cancel_checkout"));
             ui.label(app.tr(if incomplete { "ui.pdm_release_incomplete_warning" } else { "ui.pdm_discard_warning" }));
             if let Some(target) = &target {

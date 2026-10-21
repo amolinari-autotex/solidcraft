@@ -342,13 +342,6 @@ Editable drawing code, native projects and shipped exports are collected under `
 | assets/icons/ui/design/svg/flat/stop.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/flat/shield.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/model/status_recovery.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
-| assets/icons/ui/design/svg/model/pdm_checkout.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
-| assets/icons/ui/design/svg/model/pdm_checkin.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
-| assets/icons/ui/design/svg/small/pdm_checkin.svg | SolidCraft contributors | original optical icon variant (64 grid) | MIT OR Apache-2.0 |
-| assets/icons/ui/design/svg/small/pdm_checkout.svg | SolidCraft contributors | original optical icon variant (64 grid) | MIT OR Apache-2.0 |
-| assets/icons/ui/design/svg/workspace/ws_pdm.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
-| assets/icons/ui/design/svg/flat/pdm_disconnect.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
-| assets/icons/ui/design/svg/model/pdm_details.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/model/placeholder.svg | SolidCraft contributors | two-tone modelling icon master (64 grid), original SolidCraft artwork | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/model/plane.svg | SolidCraft contributors | two-tone modelling icon master (64 grid), original SolidCraft artwork | MIT OR Apache-2.0 |
 | assets/icons/ui/design/svg/model/plane_angle.svg | SolidCraft contributors | two-tone modelling icon master (64 grid), original SolidCraft artwork | MIT OR Apache-2.0 |
@@ -575,3 +568,15 @@ surface frame cannot strand cached meshes without their GPU initialization.
 | apps/solidcraft-pdm/tests/fixtures/pdm-https/ca.der | Original disposable test CA generated for SolidCraft | MIT OR Apache-2.0 | Trust anchor for isolated loopback HTTPS tests only |
 | apps/solidcraft-pdm/tests/fixtures/pdm-https/server.der | Original disposable localhost certificate generated for SolidCraft | MIT OR Apache-2.0 | TLS identity for isolated loopback HTTPS tests only |
 | apps/solidcraft-pdm/tests/fixtures/pdm-https/server-key.der | Original deliberately public test private key generated for SolidCraft | MIT OR Apache-2.0 | Never use outside isolated tests; no production credential |
+
+## Managed PDM workspace icons
+
+| File | Creator | Description | Licence |
+| --- | --- | --- | --- |
+| assets/icons/ui/design/svg/model/pdm_checkout.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/model/pdm_checkin.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/small/pdm_checkin.svg | SolidCraft contributors | original optical icon variant (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/small/pdm_checkout.svg | SolidCraft contributors | original optical icon variant (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/workspace/ws_pdm.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/flat/pdm_disconnect.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |
+| assets/icons/ui/design/svg/model/pdm_details.svg | SolidCraft contributors | original icon master (64 grid) | MIT OR Apache-2.0 |

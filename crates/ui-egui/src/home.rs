@@ -952,7 +952,7 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, action: FileAction) {
             if let Err(error) = crate::pdm_panel::enter(app) {
                 app.set_status(error, true);
             }
-        },
+        }
         FileAction::Section(section) => {
             app.home.section = section;
             if section == Section::Recovery && app.recoverable.is_empty() {

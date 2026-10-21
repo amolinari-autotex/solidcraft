@@ -5,6 +5,133 @@
 use serde_json::{Value, json};
 use solidcraft_ui_egui::scenario::{Harness, check, rect_of};
 
+#[path = "support/raster.rs"]
+mod pdm_layout_raster;
+
+fn capture_pdm_history_layout(h: &mut Harness, layout: solidcraft_ui_egui::shell::LayoutMode) {
+    let Ok(phase) = std::env::var("SOLIDCRAFT_PDM_LAYOUT_PROOF_PHASE") else { return };
+    assert!(matches!(phase.as_str(), "before" | "after"));
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdm-6c60-layout-proof");
+    std::fs::create_dir_all(&dir).unwrap();
+    h.ctx = egui::Context::default();
+    solidcraft_ui_egui::fonts::setup_fonts(&h.ctx);
+    solidcraft_ui_egui::theme::apply(&h.ctx);
+    let mut textures = std::collections::HashMap::new();
+    for _ in 0..8 {
+        pdm_layout_raster::paint(h, &mut textures, vec![]);
+    }
+    let output = pdm_layout_raster::paint(h, &mut textures, vec![]);
+    pdm_layout_raster::raster(h, &textures, output)
+        .save(dir.join(format!("{phase}-{layout:?}-labels-{}.png", h.app.preferences.ribbon_labels)))
+        .unwrap();
+}
+
+#[test]
+fn pdm_archive_ignores_editor_history_columns_in_both_layouts() {
+    use solidcraft_ui_egui::{shell::LayoutMode, toolbar};
+
+    for layout in [LayoutMode::Docked, LayoutMode::Floating] {
+        for labels in [false, true] {
+            let mut h = Harness::new();
+            h.app.ui.layout = layout;
+            h.app.preferences.ribbon_labels = labels;
+            h.app.ui.show_browser = true;
+            h.app.ui.show_timeline = true;
+            h.app.preferences.timeline_left = false;
+            h.app.preferences.timeline_under_browser = false;
+            h.frames(4);
+            let before = h.app.session.doc.clone();
+            solidcraft_ui_egui::pdm_panel::enter(&mut h.app).unwrap();
+            h.frames(4);
+            let full = rect_of("pdm_footer").expect("the archive browser is visible");
+            let ribbon = rect_of("toolbar").unwrap();
+            assert_eq!(ribbon.height(), if labels { toolbar::RIBBON_HEIGHT } else { 93.0 });
+            for action in ["pdm.connect", "pdm.checkout", "pdm.archive", "pdm.refresh"] {
+                let button = rect_of(&format!("pdm_action_button:{action}")).expect("the archive action is present");
+                assert!(
+                    ribbon.contains_rect(button),
+                    "archive action is outside the compact ribbon: {layout:?}, labels={labels}, {action}: {button:?} vs {ribbon:?}"
+                );
+            }
+            assert!(rect_of("browser:card").is_none(), "the editor browser is hidden in PDM");
+            assert!(rect_of("history:strip").is_none() && rect_of("history:card").is_none(), "the editor history is hidden in PDM");
+
+            h.app.preferences.timeline_left = true;
+            h.app.preferences.timeline_under_browser = true;
+            for floating_browser in [false, true] {
+                h.app.preferences.browser_float = floating_browser;
+                h.frames(6);
+                let actual = rect_of("pdm_footer").expect("the archive browser remains visible");
+                if (actual.left() - full.left()).abs() > 1.0 {
+                    capture_pdm_history_layout(&mut h, layout);
+                }
+                assert!((actual.left() - full.left()).abs() <= 1.0, "editor history reserved an archive column: {layout:?}, {actual:?} vs {full:?}");
+                assert!((actual.right() - full.right()).abs() <= 1.0, "archive width changed with editor preferences: {layout:?}");
+                assert!(h.app.pdm.workspace_active);
+                assert_eq!(*h.app.session.doc, *before);
+            }
+            capture_pdm_history_layout(&mut h, layout);
+        }
+    }
+}
+
+#[test]
+fn pdm_confirmation_hosts_preserve_cancel_and_connection_close_in_both_layouts() {
+    use solidcraft_engine::pdm::Reference;
+    use solidcraft_ui_egui::shell::LayoutMode;
+
+    for layout in [LayoutMode::Docked, LayoutMode::Floating] {
+        let mut h = Harness::new();
+        h.app.ui.layout = layout;
+        let before = h.app.session.doc.clone();
+        h.app.pdm.open = true;
+        h.frames(5);
+        assert!(h.app.pdm.open);
+        h.step(&json!({"click":{"handle":"pdm:connection_close"}})).unwrap();
+        assert!(!h.app.pdm.open);
+        h.app.pdm.open = true;
+        h.frames(5);
+        h.step(&json!({"click":{"handle":"dialog:close"}})).unwrap();
+        assert!(!h.app.pdm.open, "the shared window close button retains the connection close behavior");
+        h.app.pdm.restore_confirmation = Some(Reference { document: "part".into(), version: 1 });
+        h.frames(5);
+        assert!(h.app.pdm.restore_confirmation.is_some());
+        h.step(&json!({"widget":h.app.tr("ui.cancel")})).unwrap();
+        assert!(h.app.pdm.restore_confirmation.is_none(), "Cancel retains the restore confirmation behavior");
+        assert!(h.app.pdm.runtime.status().unwrap().busy.is_none(), "closing a disconnected dialog issued no native operation");
+        assert_eq!(*h.app.session.doc, *before);
+    }
+}
+
+#[test]
+fn pdm_start_page_entry_preserves_file_view_and_the_editor() {
+    for (width, busy) in [(1400, false), (420, false), (1400, true)] {
+        let mut h = Harness::new();
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        let before = h.app.session.doc.clone();
+        let undo = h.app.session.undo.len();
+        h.call("ui.resize", json!({"width":width,"height":900}));
+        h.app.home.show(0);
+        h.frames(5);
+        assert!(rect_of("home:new_mm").is_some(), "the upstream File view remains available");
+        if width < 500 {
+            h.step(&json!({"widget":h.app.tr("ui.start_page")})).unwrap();
+            h.frames(2);
+        }
+        if busy {
+            h.app.services.pick_open = Some(Box::new(|_| Box::pin(std::future::pending())));
+            h.step(&json!({"key":"O","cmd":true})).unwrap();
+            h.frames(2);
+            assert!(h.app.file_picker_busy());
+        }
+        h.step(&json!({"click":{"handle":"home:pdm"}})).unwrap();
+        assert_eq!(h.app.pdm.workspace_active, !busy, "File view PDM entry follows the file-operation guard");
+        assert_eq!(h.app.home.open, busy);
+        assert_eq!(*h.app.session.doc, *before);
+        assert_eq!(h.app.session.undo.len(), undo);
+    }
+}
+
 /// A box body (its sketch finished) to give feature dialogs something to work on.
 fn harness() -> Harness {
     let mut h = Harness::new();

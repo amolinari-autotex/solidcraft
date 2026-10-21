@@ -141,7 +141,7 @@ pub fn connection_window(app: &mut SolveApp, ctx: &egui::Context) {
             Intent::Diagnostics => "ui.pdm_diagnostics",
         }
     };
-    crate::frame::window(ctx, app.tr(title), crate::frame::Width::Normal).id(egui::Id::new("pdm_connection")).open(&mut open).show(ctx, |ui| {
+    let header_closed = crate::ui_kit::Window::new(egui::Id::new("pdm_connection"), "pdm_connect", app.tr(title)).show_body(ctx, |ui| {
         if status.busy.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -269,7 +269,7 @@ pub fn connection_window(app: &mut SolveApp, ctx: &egui::Context) {
         super::handle("connection_close", &response);
         close = response.clicked();
     });
-    open &= !close;
+    open &= !close && !header_closed;
     app.pdm.open = open;
     if !open {
         app.pdm.guided.listing_requested = false;
@@ -283,12 +283,8 @@ pub fn connection_window(app: &mut SolveApp, ctx: &egui::Context) {
         }
     }
     if open && let Some((connection_id, label)) = app.pdm.guided.pending_recovery.clone() {
-        let mut confirm_open = true;
-        crate::frame::window(ctx, app.tr("ui.pdm_recover_workspace"), crate::frame::Width::Normal)
-            .id(egui::Id::new("pdm_guided_recovery"))
-            .open(&mut confirm_open)
-            .collapsible(false)
-            .show(ctx, |ui| {
+        let confirmation_closed = crate::ui_kit::Window::new(egui::Id::new("pdm_guided_recovery"), "pdm_connect", app.tr("ui.pdm_recover_workspace"))
+            .show_body(ctx, |ui| {
                 ui.strong(label);
                 ui.add(egui::Label::new(app.tr("ui.pdm_recover_warning")).wrap());
                 let dirty = crate::documents::any_dirty(app);
@@ -308,7 +304,7 @@ pub fn connection_window(app: &mut SolveApp, ctx: &egui::Context) {
                     app.pdm.guided.pending_recovery = None;
                 }
             });
-        if !confirm_open {
+        if confirmation_closed {
             app.pdm.guided.pending_recovery = None;
         }
     }
