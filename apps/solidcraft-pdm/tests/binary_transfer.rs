@@ -32,9 +32,43 @@ fn setup() -> (Root, std::path::PathBuf, String) {
     backup_restore::restore_backup_to_redb(&root.0.join("initial"), &db).unwrap();
     Store::open(&db)
         .unwrap()
-        .initialize_streaming(StreamPolicy { version: 1, max_file_bytes: 4 * 1024 * 1024, max_store_bytes: 12 * 1024 * 1024 })
+        .initialize_streaming(StreamPolicy { version: 1, max_file_bytes: 16 * 1024 * 1024, max_store_bytes: 64 * 1024 * 1024 })
         .unwrap();
     (root, db, token)
+}
+
+#[test]
+fn negotiated_four_and_eight_mib_chunks_keep_legacy_schema_and_verified_download() {
+    let (_root, db, token) = setup();
+    let (server, client) = start(&db, &token);
+    assert_eq!(client.transfer_capabilities().unwrap().unwrap().chunk_bytes, 1024 * 1024);
+    let bytes = vec![37; 12 * 1024 * 1024 + 19];
+    for selected in [4 * 1024 * 1024, 8 * 1024 * 1024] {
+        let session = client.transfer_session_with_chunk_bytes(selected).unwrap();
+        assert_eq!(session.chunk_bytes(), selected);
+        let caps = session.capabilities();
+        let request = format!("negotiated-{selected}");
+        let input = TransferInput {
+            server_id: caps.server_id.clone(),
+            recovery_epoch: caps.recovery_epoch,
+            request_id: request.clone(),
+            target: TransferTarget::NewOnly { logical_path: format!("chunk-{selected}.bin") },
+            total_bytes: bytes.len() as u64,
+            sha256: digest(&bytes),
+            dependencies: vec![],
+            comment: String::new(),
+        };
+        let progress = session.begin_transfer(input).unwrap();
+        for (n, chunk) in bytes.chunks(selected as usize).enumerate() {
+            session.upload_chunk(&progress.transfer_id, n as u64 * selected, chunk, &digest(chunk)).unwrap();
+        }
+        let version = session.commit_transfer(&progress.transfer_id, &request).unwrap();
+        let mut result = Vec::new();
+        session.download_stream(&version.version.reference, &mut result).unwrap();
+        assert_eq!(result, bytes);
+        assert!(client.upload_chunk(&progress.transfer_id, 0, &bytes[..2 * 1024 * 1024], &digest(&bytes[..2 * 1024 * 1024])).is_err());
+    }
+    server.shutdown().unwrap();
 }
 fn start(db: &std::path::Path, token: &str) -> (HttpsServer, Client) {
     let config = HttpsConfig::from_der(
@@ -98,6 +132,44 @@ fn pinned_https_restart_commit_retry_and_streamed_restore_preserve_large_bytes()
     let (server, client) = start(&root.0.join("restored"), &token);
     let mut output = Vec::new();
     client.download_stream(&committed.version.reference, &mut output).unwrap();
+    assert_eq!(output, bytes);
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn eight_mib_durable_chunk_reopens_and_resumes_with_one_mib_default() {
+    let (_root, db, token) = setup();
+    let (server, client) = start(&db, &token);
+    for invalid in [0, 2 * 1024 * 1024, 8 * 1024 * 1024 + 1] {
+        assert!(client.transfer_session_with_chunk_bytes(invalid).is_err());
+    }
+    assert_eq!(server.metrics().http_requests, 0);
+    let bytes = vec![61; 9 * 1024 * 1024 + 7];
+    let session = client.transfer_session_with_chunk_bytes(8 * 1024 * 1024).unwrap();
+    let caps = session.capabilities();
+    let input = TransferInput {
+        server_id: caps.server_id.clone(),
+        recovery_epoch: caps.recovery_epoch,
+        request_id: "mixed-resume".into(),
+        target: TransferTarget::NewOnly { logical_path: "mixed-resume.bin".into() },
+        total_bytes: bytes.len() as u64,
+        sha256: digest(&bytes),
+        dependencies: vec![],
+        comment: String::new(),
+    };
+    let begun = session.begin_transfer(input).unwrap();
+    let first = &bytes[..8 * 1024 * 1024];
+    session.upload_chunk(&begun.transfer_id, 0, first, &digest(first)).unwrap();
+    server.shutdown().unwrap();
+    let (server, client) = start(&db, &token);
+    let session = client.transfer_session().unwrap();
+    assert_eq!(session.transfer_status(&begun.transfer_id).unwrap().offset, 8 * 1024 * 1024);
+    for (n, chunk) in bytes[8 * 1024 * 1024..].chunks(1024 * 1024).enumerate() {
+        session.upload_chunk(&begun.transfer_id, (8 + n) as u64 * 1024 * 1024, chunk, &digest(chunk)).unwrap();
+    }
+    let version = session.commit_transfer(&begun.transfer_id, "mixed-resume").unwrap();
+    let mut output = Vec::new();
+    session.download_stream(&version.version.reference, &mut output).unwrap();
     assert_eq!(output, bytes);
     server.shutdown().unwrap();
 }

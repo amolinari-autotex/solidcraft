@@ -99,17 +99,18 @@ pub(crate) async fn serve(request: Request<Incoming>, send: mpsc::SyncSender<Job
     let method = request.method().clone();
     let parts: Vec<_> = path.split('/').collect();
     let is_caps = path == transfers::CAPABILITIES_PATH;
+    let is_limits = path == transfers::LIMITS_PATH;
     let is_begin = path == "/pdm/v1/transfers" && method == Method::POST;
     let is_commit = matches!(parts.as_slice(),["","pdm","v1","transfers",id,"commit"] if hex(id)) && method == Method::POST;
     let is_chunk =
         matches!(parts.as_slice(),["","pdm","v1","transfers",id,"chunks",offset] if hex(id)&&number(offset).is_some()) && method == Method::PUT;
-    if is_caps && method != Method::POST {
+    if (is_caps || is_limits) && method != Method::POST {
         return error("invalid_request");
     }
     if !is_caps && epoch.is_none() {
         return error("recovery_epoch_mismatch");
     }
-    let has_control = is_caps || is_begin || is_commit;
+    let has_control = is_caps || is_limits || is_begin || is_commit;
     if !is_chunk && !has_control && length.is_some_and(|n| n != 0) {
         return error("invalid_request");
     }
@@ -120,7 +121,7 @@ pub(crate) async fn serve(request: Request<Incoming>, send: mpsc::SyncSender<Job
         return error("invalid_request");
     }
     let preflight = if is_chunk {
-        if header(&request, "content-type") != Some("application/octet-stream") || length.is_none_or(|n| n == 0 || n > transfers::CHUNK_BYTES) {
+        if header(&request, "content-type") != Some("application/octet-stream") || length.is_none_or(|n| n == 0 || n > transfers::HARD_CHUNK_BYTES) {
             return error("invalid_request");
         }
         let Some(hash) = header(&request, "x-chunk-sha256").filter(|v| hex(v)) else {
@@ -165,14 +166,15 @@ pub(crate) async fn serve(request: Request<Incoming>, send: mpsc::SyncSender<Job
         if bytes.len() as u64 != length.unwrap_or(0) {
             return error("invalid_request");
         }
-        if is_caps {
+        if is_caps || is_limits {
             let Ok(body) = serde_json::from_slice::<crate::administration::CapabilityRequest>(&bytes) else {
                 return error("invalid_request");
             };
-            if body.protocol != transfers::PROTOCOL || body.server_id != server {
+            let protocol = if is_limits { transfers::LIMITS_PROTOCOL } else { transfers::PROTOCOL };
+            if body.protocol != protocol || body.server_id != server {
                 return error("unsupported_protocol");
             }
-            Call::Capabilities
+            if is_limits { Call::Limits } else { Call::Capabilities }
         } else if is_begin {
             let Ok(body) = serde_json::from_slice::<TransferInput>(&bytes) else {
                 return error("invalid_request");
@@ -187,7 +189,9 @@ pub(crate) async fn serve(request: Request<Incoming>, send: mpsc::SyncSender<Job
     } else if is_chunk {
         let hash = header(&request, "x-chunk-sha256").unwrap_or("").to_owned();
         let bytes =
-            match tokio::time::timeout(Duration::from_secs(5), Limited::new(request.into_body(), transfers::CHUNK_BYTES as usize).collect()).await {
+            match tokio::time::timeout(Duration::from_secs(5), Limited::new(request.into_body(), transfers::HARD_CHUNK_BYTES as usize).collect())
+                .await
+            {
                 Ok(Ok(body)) => body.to_bytes(),
                 _ => return error("invalid_request"),
             };

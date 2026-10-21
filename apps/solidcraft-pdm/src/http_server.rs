@@ -10,7 +10,11 @@ use hyper::{
 };
 use std::{
     net::{SocketAddr, TcpListener},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -23,10 +27,17 @@ pub(crate) enum JobRequest {
     Transfer { call: crate::transfers::Call, epoch: Option<u64> },
 }
 pub(crate) type Job = (JobRequest, String, Option<String>, oneshot::Sender<crate::transfers::HttpReply>);
+/// Observed counters only: no credentials, identities or request contents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServerMetrics {
+    pub http_requests: u64,
+    pub tls_connections: u64,
+}
 pub struct HttpsServer {
     address: SocketAddr,
     listener: Option<HttpListener>,
     writer: Option<thread::JoinHandle<()>>,
+    http_requests: Arc<AtomicU64>,
 }
 impl HttpsServer {
     pub fn start(store: Store, config: HttpsConfig) -> Result<Self, Error> {
@@ -40,10 +51,13 @@ impl HttpsServer {
         }
         Self::start_impl(store, config, Some(listener))
     }
-    fn start_impl(mut store: Store, config: HttpsConfig, reserved: Option<TcpListener>) -> Result<Self, Error> {
+    fn start_impl(mut store: Store, mut config: HttpsConfig, reserved: Option<TcpListener>) -> Result<Self, Error> {
         if !store.has_configured_principals() {
             return Err(Error::Invalid("HTTPS requires configured principals"));
         }
+        // PDM opts into bounded persistence; shared relay listeners retain the
+        // configuration constructor's single-request default.
+        config.keep_alive = true;
         let (send, receive) = mpsc::sync_channel::<Job>(16);
         let writer = thread::Builder::new().name("pdm-writer".into()).spawn(move || {
             while let Ok((request, credential, expected, reply)) = receive.recv() {
@@ -70,11 +84,15 @@ impl HttpsServer {
             }
         })?;
         let transfer_permits = Arc::new(crate::http_transfer::Admission::new());
+        let http_requests = Arc::new(AtomicU64::new(0));
+        let observed_requests = http_requests.clone();
         let handler: Handler = Arc::new(move |request| {
+            observed_requests.fetch_add(1, Ordering::Relaxed);
             let send = send.clone();
             let permits = transfer_permits.clone();
             Box::pin(async move {
                 if request.uri().path() == crate::transfers::CAPABILITIES_PATH
+                    || request.uri().path() == crate::transfers::LIMITS_PATH
                     || request.uri().path().starts_with("/pdm/v1/transfers")
                     || request.uri().path().starts_with("/pdm/v1/content/")
                 {
@@ -91,7 +109,7 @@ impl HttpsServer {
             None => HttpListener::start(config, handler, 16, Duration::from_secs(15)),
         };
         match listener {
-            Ok(listener) => Ok(Self { address: listener.address(), listener: Some(listener), writer: Some(writer) }),
+            Ok(listener) => Ok(Self { address: listener.address(), listener: Some(listener), writer: Some(writer), http_requests }),
             Err(error) => {
                 let _ = writer.join();
                 Err(error)
@@ -100,6 +118,12 @@ impl HttpsServer {
     }
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+    pub fn metrics(&self) -> ServerMetrics {
+        ServerMetrics {
+            http_requests: self.http_requests.load(Ordering::Relaxed),
+            tls_connections: self.listener.as_ref().map_or(0, HttpListener::tls_connections),
+        }
     }
     pub fn shutdown(mut self) -> Result<(), Error> {
         self.close()

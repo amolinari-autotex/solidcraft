@@ -12,6 +12,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 pub const CHUNK_BYTES: u64 = 1024 * 1024;
+const HARD_CHUNK_BYTES: u64 = crate::transfers::HARD_CHUNK_BYTES;
 const BUFFER: usize = 64 * 1024;
 const TTL: u64 = 1_800_000;
 #[derive(Debug, thiserror::Error)]
@@ -295,7 +296,7 @@ fn validate_ledger(ledger: &Ledger, limits: Limits) -> Result<u64> {
             return Err(TransferError::Invalid);
         }
         if let Some((offset, length, digest)) = &session.last {
-            if *length == 0 || *length > CHUNK_BYTES || !hex(digest) || offset.checked_add(*length) != Some(session.offset) {
+            if *length == 0 || *length > HARD_CHUNK_BYTES || !hex(digest) || offset.checked_add(*length) != Some(session.offset) {
                 return Err(TransferError::Invalid);
             }
         } else if session.offset != 0 {
@@ -641,7 +642,7 @@ impl Stager {
         if session.phase != Phase::Uploading
             || !hex(digest)
             || length == 0
-            || length > CHUNK_BYTES
+            || length > HARD_CHUNK_BYTES
             || offset.checked_add(length).is_none_or(|end| end > session.total)
         {
             return Err(TransferError::Invalid);

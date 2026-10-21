@@ -276,6 +276,8 @@ fn label(value: &str) -> bool {
 }
 
 /// Portable relative catalog paths; these are never joined onto server disk paths.
+/// Workspace metadata components are reserved. Existing state containing them
+/// fails validation on open; this does not rename or migrate stored paths.
 pub fn validate_logical_path(path: &str) -> Result<(), Error> {
     if path.is_empty() || path.len() > 240 || path.contains('\\') || path.contains(':') || path.chars().any(char::is_control) {
         return Err(Error::Invalid("logical path"));
@@ -289,6 +291,9 @@ pub fn validate_logical_path(path: &str) -> Result<(), Error> {
         {
             return Err(Error::Invalid("logical path component"));
         }
+        if component.eq_ignore_ascii_case(".solidcraft-pdm") {
+            return Err(Error::Invalid("reserved logical path"));
+        }
         let stem = component.split('.').next().unwrap_or_default().to_ascii_uppercase();
         if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
             || (stem.len() == 4
@@ -299,6 +304,35 @@ pub fn validate_logical_path(path: &str) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod logical_path_tests {
+    use super::validate_logical_path;
+
+    #[test]
+    fn workspace_metadata_component_is_reserved_at_every_depth_and_case() {
+        for path in [".solidcraft-pdm", ".SoLiDcRaFt-PdM/part.solidcraft", "parts/.solidcraft-pdm", "parts/.SoLiDcRaFt-PdM/part.solidcraft"] {
+            assert!(validate_logical_path(path).is_err(), "accepted reserved path: {path}");
+        }
+    }
+
+    #[test]
+    fn logical_paths_keep_portable_slash_rules_and_normal_names() {
+        for path in ["part.solidcraft", "parts/Part.solidcraft", "parts/.solidcraft-pdm-backup/part.solidcraft"] {
+            assert!(validate_logical_path(path).is_ok(), "rejected normal path: {path}");
+        }
+        for path in [
+            "/parts/part.solidcraft",
+            "parts//part.solidcraft",
+            "parts/",
+            "parts\\part.solidcraft",
+            "parts/./part.solidcraft",
+            "parts/../part.solidcraft",
+        ] {
+            assert!(validate_logical_path(path).is_err(), "accepted nonportable path: {path}");
+        }
+    }
 }
 
 fn validate_inventory(inventory: &[BlobReceipt], policy: Option<&crate::stream_io::StreamPolicy>) -> Result<(), Error> {

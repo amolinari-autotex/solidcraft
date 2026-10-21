@@ -8,13 +8,19 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+#[cfg(test)]
+mod download_retry_tests;
+#[cfg(test)]
+mod transfer_negotiation_tests;
 mod transfers;
 
 #[derive(Clone)]
 pub struct Client {
     transport: Transport,
     token: AuthToken,
+    transfer_context: Option<Arc<transfers::TransferContext>>,
 }
+pub use transfers::BinaryTransferSession;
 
 #[derive(Clone)]
 enum Transport {
@@ -238,7 +244,7 @@ impl Client {
     }
 
     pub fn new(port: u16, token: AuthToken) -> Self {
-        Self { transport: Transport::Loopback(port), token }
+        Self { transport: Transport::Loopback(port), token, transfer_context: None }
     }
 
     /// Verify the peer through the platform certificate verifier. HTTPS only;
@@ -297,7 +303,7 @@ impl Client {
             .user_agent("SolidCraft PDM")
             .build()
             .into();
-        Ok(Self { transport: Transport::Https { endpoint, agent, server_id: Arc::new(Mutex::new(None)) }, token })
+        Ok(Self { transport: Transport::Https { endpoint, agent, server_id: Arc::new(Mutex::new(None)) }, token, transfer_context: None })
     }
 
     pub fn request(&self, request: Request) -> Result<Response, Error> {

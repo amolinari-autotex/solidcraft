@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 pub const CAPABILITIES_PATH: &str = "/pdm/v2/capabilities";
 pub const PROTOCOL: &str = "solidcraft-pdm-capabilities/2";
 pub const CHUNK_BYTES: u64 = 1024 * 1024;
+pub const HARD_CHUNK_BYTES: u64 = 8 * CHUNK_BYTES;
+pub const LIMITS_PATH: &str = "/pdm/v1/transfer-limits";
+pub const LIMITS_PROTOCOL: &str = "solidcraft-pdm-transfer-limits/1";
 pub const CONTROL_BYTES: usize = 64 * 1024;
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
@@ -41,6 +44,15 @@ pub struct TransferCapabilities {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct TransferLimits {
+    pub protocol: String,
+    pub server_id: String,
+    pub recovery_epoch: u64,
+    pub principal: Principal,
+    pub max_chunk_bytes: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransferProgress {
     pub transfer_id: String,
     pub offset: u64,
@@ -59,6 +71,7 @@ pub struct ContentMetadata {
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WireResponse {
     Capabilities { capabilities: TransferCapabilities },
+    Limits { limits: TransferLimits },
     Progress { progress: TransferProgress },
     Committed { version: ManagedVersion },
     Metadata { metadata: ContentMetadata },
@@ -128,6 +141,15 @@ impl crate::Store {
         let result = (|| {
             Ok(json_reply(match call {
                 Call::Capabilities => return Err(crate::Error::Invalid("capability dispatch")),
+                Call::Limits => WireResponse::Limits {
+                    limits: TransferLimits {
+                        protocol: LIMITS_PROTOCOL.into(),
+                        server_id: caps.server_id,
+                        recovery_epoch: caps.recovery_epoch,
+                        principal: principal.clone(),
+                        max_chunk_bytes: HARD_CHUNK_BYTES,
+                    },
+                },
                 Call::PrepareMutation => {
                     if principal.role == crate::managed::Role::Viewer {
                         return Err(crate::Error::Forbidden);
@@ -193,6 +215,7 @@ impl crate::Store {
 }
 pub(crate) enum Call {
     Capabilities,
+    Limits,
     PrepareMutation,
     PrepareCommit(String),
     Begin(TransferInput),

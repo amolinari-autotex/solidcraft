@@ -294,9 +294,8 @@ impl ManagedStore {
         if record.completed.is_some()
             || !hash_id(sha256)
             || bytes == 0
-            || bytes > crate::transfers::CHUNK_BYTES
+            || bytes > crate::transfers::HARD_CHUNK_BYTES
             || offset.checked_add(bytes).is_none_or(|n| n > record.input.total_bytes)
-            || bytes != crate::transfers::CHUNK_BYTES.min(record.input.total_bytes.saturating_sub(offset))
         {
             return Err(Error::Invalid("chunk limits"));
         }
@@ -453,7 +452,7 @@ impl ManagedStore {
         Ok(ContentMetadata { version, total_bytes: metadata.len() })
     }
     pub(crate) fn content_range(&self, reference: &VersionRef, offset: u64, bytes: u64) -> Result<(ContentMetadata, Vec<u8>), Error> {
-        if bytes > crate::transfers::CHUNK_BYTES {
+        if bytes > crate::transfers::HARD_CHUNK_BYTES {
             return Err(Error::Invalid("range length"));
         }
         let metadata = self.content_metadata(reference)?;

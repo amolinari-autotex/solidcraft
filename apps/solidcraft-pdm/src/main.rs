@@ -1,4 +1,5 @@
-//! Local experimental service. No remote listener or production security is provided.
+//! Experimental PDM service. Remote HTTPS is an explicit deployment command;
+//! ordinary serve/rehearsal commands retain their existing loopback boundaries.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use solidcraft_pdm::{
@@ -15,6 +16,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let argument = |index| args.get(index).map(String::as_str).ok_or(Error::Invalid("missing argument"));
     match args.get(1).map(String::as_str) {
+        Some("serve-https-remote") if args.len() == 3 => serve_https_remote(Path::new(argument(2)?))?,
         Some("rehearse-https") if args.len() == 3 => {
             let config = solidcraft_pdm::deployment::DeploymentConfig::load(Path::new(argument(2)?))?;
             let server = solidcraft_pdm::deployment::start_loopback_rehearsal(config)?;
@@ -101,9 +103,68 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::to_writer_pretty(io::stdout().lock(), &snapshot)?;
             println!();
         }
-        _ => return Err("usage: solidcraft-pdm token | serve STORE PORT | rehearse-https CONFIG | backup STORE NEW_BACKUP | restore BACKUP NEW_STORE | restore-redb BACKUP NEW_STORE | verify-backup BACKUP | request PORT | list PORT [DOCUMENT] | check-in PORT DOCUMENT PARENT_OR_- FILE [DEPENDENCIES_JSON] | retrieve PORT DOCUMENT VERSION NEW_DIRECTORY".into()),
+        _ => return Err("usage: solidcraft-pdm token | serve STORE PORT | rehearse-https CONFIG | serve-https-remote CONFIG | backup STORE NEW_BACKUP | restore BACKUP NEW_STORE | restore-redb BACKUP NEW_STORE | verify-backup BACKUP | request PORT | list PORT [DOCUMENT] | check-in PORT DOCUMENT PARENT_OR_- FILE [DEPENDENCIES_JSON] | retrieve PORT DOCUMENT VERSION NEW_DIRECTORY".into()),
     }
     Ok(())
+}
+
+struct ShutdownSignals {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    interrupt: tokio::signal::windows::CtrlC,
+}
+impl ShutdownSignals {
+    fn register() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self { terminate: signal(SignalKind::terminate())?, interrupt: signal(SignalKind::interrupt())? })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self { interrupt: tokio::signal::windows::ctrl_c()? })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "remote service signal handling is unsupported on this platform"))
+        }
+    }
+    async fn wait(&mut self) -> io::Result<()> {
+        std::future::poll_fn(|cx| {
+            #[cfg(unix)]
+            if self.terminate.poll_recv(cx).is_ready() {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            #[cfg(any(unix, windows))]
+            if self.interrupt.poll_recv(cx).is_ready() {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+}
+fn serve_https_remote(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    runtime.block_on(async {
+        // Install both Unix handlers before binding or reporting readiness.
+        // stdin is deliberately unused: systemd commonly supplies /dev/null.
+        let mut shutdown = ShutdownSignals::register()?;
+        let config = solidcraft_pdm::deployment::DeploymentConfig::load_explicit_remote(path)?;
+        let server = solidcraft_pdm::deployment::start_explicit_remote(config)?;
+        {
+            let mut output = io::stdout().lock();
+            serde_json::to_writer(&mut output, server.receipt())?;
+            writeln!(output)?;
+            output.flush()?;
+        }
+        shutdown.wait().await?;
+        server.shutdown()?;
+        Ok(())
+    })
 }
 
 fn main() {

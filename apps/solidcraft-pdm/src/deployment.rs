@@ -1,6 +1,6 @@
-//! Private loopback rehearsal of the hosted service packaging, not cloud setup.
-//! Configuration contains paths and an address only. No credentials, public
-//! exposure, environment fallback, provisioning or automatic enrollment exist.
+//! Explicit HTTPS deployment of an existing enrolled archive. The default
+//! loader/start path remains loopback-only; remote binding requires the named
+//! opt-in API. Configuration contains no credentials or enrollment instructions.
 use crate::{
     Error, Request, Response, Store,
     client::read_file,
@@ -25,9 +25,21 @@ pub struct DeploymentConfig {
 }
 impl DeploymentConfig {
     pub fn load(path: &Path) -> Result<Self, Error> {
+        Self::load_inner(path, false)
+    }
+    /// Operator-selected remote deployment. Clients must trust the configured
+    /// certificate chain through their normal CA/pinning boundary.
+    pub fn load_explicit_remote(path: &Path) -> Result<Self, Error> {
+        Self::load_inner(path, true)
+    }
+    fn load_inner(path: &Path, remote: bool) -> Result<Self, Error> {
         validate_path(path)?;
         let config: Self = serde_json::from_slice(&read_file(path, MAX_CONFIG)?)?;
-        config.validate()?;
+        if remote {
+            config.validate_explicit_remote()?;
+        } else {
+            config.validate()?;
+        }
         Ok(config)
     }
     fn validate(&self) -> Result<(), Error> {
@@ -35,6 +47,15 @@ impl DeploymentConfig {
         if !self.bind.ip().is_loopback() {
             return Err(Error::Invalid("deployment rehearsal requires loopback"));
         }
+        self.validate_paths()
+    }
+    fn validate_explicit_remote(&self) -> Result<(), Error> {
+        if self.bind.port() == 0 {
+            return Err(Error::Invalid("explicit remote deployment requires a nonzero port"));
+        }
+        self.validate_paths()
+    }
+    fn validate_paths(&self) -> Result<(), Error> {
         if self.certificate_chain.is_empty() || self.certificate_chain.len() > 8 {
             return Err(Error::Invalid("deployment certificate count"));
         }
@@ -89,6 +110,15 @@ impl RehearsalServer {
 }
 pub fn start_loopback_rehearsal(config: DeploymentConfig) -> Result<RehearsalServer, Error> {
     config.validate()?;
+    start_validated(config)
+}
+/// Start only an explicitly configured HTTPS listener. This never initializes,
+/// enrolls or migrates a store, and never falls back to a local owner credential.
+pub fn start_explicit_remote(config: DeploymentConfig) -> Result<RehearsalServer, Error> {
+    config.validate_explicit_remote()?;
+    start_validated(config)
+}
+fn start_validated(config: DeploymentConfig) -> Result<RehearsalServer, Error> {
     let mut certificates = Vec::new();
     for path in &config.certificate_chain {
         certificates.push(read_file(path, MAX_TLS)?);

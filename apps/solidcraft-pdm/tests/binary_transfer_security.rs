@@ -31,6 +31,36 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[test]
+fn cached_protocol_session_reuses_context_but_revocation_invalidates_it() {
+    let f = Fixture::new();
+    let session = f.bob.transfer_session().unwrap();
+    let caps = session.capabilities();
+    let bytes = b"one retained chunk";
+    let input = TransferInput {
+        server_id: caps.server_id.clone(),
+        recovery_epoch: caps.recovery_epoch,
+        request_id: "cached-session".into(),
+        target: TransferTarget::NewOnly { logical_path: "session.bin".into() },
+        total_bytes: bytes.len() as u64,
+        sha256: digest(bytes),
+        dependencies: vec![],
+        comment: String::new(),
+    };
+    let before = f.server.as_ref().unwrap().metrics();
+    let begun = session.begin_transfer(input).unwrap();
+    session.upload_chunk(&begun.transfer_id, 0, bytes, &digest(bytes)).unwrap();
+    let after = f.server.as_ref().unwrap().metrics();
+    assert_eq!(after.http_requests - before.http_requests, 2, "one begin and one chunk, no repeated identity/capability probes");
+    assert_eq!(after.tls_connections, before.tls_connections, "SDK must reuse verified TLS connection");
+    f.alice
+        .admin(AdminRequest::SetRole { request_id: "session-demote".into(), expected_revision: f.revision(), id: "bob".into(), role: Role::Viewer })
+        .unwrap();
+    denied(session.transfer_status(&begun.transfer_id), "forbidden");
+    denied(session.commit_transfer(&begun.transfer_id, "cached-session"), "transfer_session_invalidated");
+    assert!(f.alice.managed_catalog().unwrap().entries.is_empty());
+}
+
 struct Fixture {
     server: Option<HttpsServer>,
     root: PathBuf,
