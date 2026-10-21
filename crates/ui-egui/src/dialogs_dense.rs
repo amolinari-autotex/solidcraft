@@ -529,7 +529,6 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
             if opts.tapped {
                 enter |= crate::dialogs_thread::hole_rows(ui, &app.session.doc, &mut opts.thread, &mut opts.custom_thread);
                 ui_kit::checkbox_grid(ui, &mut [("Full thread depth", &mut opts.thread_full_depth)], 1);
-                enter |= ui.add_enabled_ui(!opts.thread_full_depth, |ui| expr_row(ui, "Thread depth", &mut opts.thread_depth)).inner;
             }
             // Through all, the tip lies past the part.
             if *kind == 0 && !opts.all {

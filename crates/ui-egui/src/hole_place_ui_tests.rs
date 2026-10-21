@@ -293,3 +293,30 @@ fn the_dialog_shows_the_sizes_beside_a_section_of_the_hole() {
     h.frames(2);
     assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Hole { depth, .. } if depth == "7 mm"));
 }
+
+#[test]
+fn tapped_thread_depth_field_keeps_focus_and_typing_separate_from_acceptance() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length":40,"width":30,"height":20})).unwrap();
+    let hole = h.app.run("solid.hole", json!({"position":[20,15,20],"thread":"M6","depth":12})).unwrap()["feature"].as_u64().unwrap();
+    let original = h.app.session.doc.to_json();
+    h.step(&json!({"call":"ui.editFeature","params":{"feature":hole}})).unwrap();
+    h.frames(3);
+    // Opening Edit Feature intentionally rolls the marker back; focusing a field must
+    // preserve that editing state, and Cancel must restore the original marker too.
+    let editing = h.app.session.doc.to_json();
+    assert!(handle_at("dialog:Thread depth").is_none(), "full tapping needs no partial-depth field");
+    h.step(&json!({"click":{"handle":"dialog:Full thread depth"}})).unwrap();
+    h.frames(3);
+    assert!(handle_at("dialog:Thread depth").is_some(), "partial depth belongs beside the section");
+    h.step(&json!({"click":{"handle":"dialog:Thread depth"}})).unwrap();
+    h.step(&json!({"key":"A","cmd":true})).unwrap();
+    h.step(&json!({"text":"1 cm / 2"})).unwrap();
+    h.frames(3);
+    assert_eq!(h.app.session.doc.to_json(), editing, "selecting and typing a dimension must not apply the model");
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Hole { opts, .. } if !opts.thread_full_depth && opts.thread_depth == "1 cm / 2"));
+    h.step(&json!({"key":"Escape"})).unwrap();
+    h.frames(3);
+    assert!(h.app.dialog.is_none());
+    assert_eq!(h.app.session.doc.to_json(), original, "Cancel preserves the accepted design");
+}
