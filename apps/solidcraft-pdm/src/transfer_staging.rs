@@ -187,6 +187,20 @@ pub struct Stager {
     state: Mutex<State>,
     _writer_lock: fs::File,
 }
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_COMPLETE_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn fail_next_persist_for_test() {
+    FAIL_NEXT_PERSIST.with(|flag| flag.set(true));
+}
+#[cfg(test)]
+pub(crate) fn fail_next_complete_delete_for_test() {
+    FAIL_NEXT_COMPLETE_DELETE.with(|flag| flag.set(true));
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransferStatus {
@@ -416,6 +430,12 @@ impl Stager {
             regular(&path)?;
             let mut file = fs::OpenOptions::new().write(true).open(path)?;
             file.set_len(0)?;
+            #[cfg(test)]
+            if FAIL_NEXT_PERSIST.with(|flag| flag.replace(false)) {
+                file.write_all(b"{")?;
+                file.sync_all()?;
+                return Err(TransferError::Io(std::io::Error::other("injected torn ledger persistence")));
+            }
             file.write_all(&bytes)?;
             file.sync_all()?;
             Ok::<(), TransferError>(())
@@ -808,6 +828,10 @@ impl Stager {
     /// commits ownership of the bytes. Unknown IDs are an authenticated no-op;
     /// they never cause arbitrary paths to be removed.
     pub fn complete(&self, who: &Binding, id: &str, authorize: impl FnOnce(&Binding) -> Result<()>) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_COMPLETE_DELETE.with(|flag| flag.replace(false)) {
+            return self.complete_with_cleanup(who, id, authorize, |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        }
         self.complete_with_cleanup(who, id, authorize, |path| fs::remove_file(path))
     }
     /// Trusted-local cross-domain cancellation only. The caller must ALREADY

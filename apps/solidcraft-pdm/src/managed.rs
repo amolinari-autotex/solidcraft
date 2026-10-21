@@ -253,6 +253,7 @@ pub(crate) struct ManagedStore {
     credentials: Vec<PrincipalCredential>,
     metadata: Option<metadata_db::MetadataDb>,
     portable_image: Option<metadata_db::Image>,
+    staging: std::sync::Mutex<Option<transfers::CachedStager>>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -392,6 +393,7 @@ impl ManagedStore {
         self.initialize_streaming(policy)
     }
     pub(crate) fn initialize_streaming(&mut self, policy: crate::stream_io::StreamPolicy) -> Result<(), Error> {
+        self.invalidate_stager();
         policy.validate()?;
         if self.metadata.is_none()
             || self.blobs.binding() != BlobBinding::Filesystem
@@ -535,6 +537,7 @@ impl ManagedStore {
                 credentials: image.credentials.clone(),
                 metadata: Some(metadata),
                 portable_image: None,
+                staging: Default::default(),
             });
         }
         // A missing database in a converted store must never fall back to JSON.
@@ -552,6 +555,7 @@ impl ManagedStore {
                 credentials: image.credentials.clone(),
                 metadata: None,
                 portable_image: Some(image),
+                staging: Default::default(),
             };
             if initialize {
                 let image = store.portable_image.take().ok_or(Error::Integrity)?;
@@ -607,7 +611,7 @@ impl ManagedStore {
                 return Err(Error::Invalid("principal configuration"));
             }
         }
-        let mut store = Self { root, blobs, generation, state, credentials, metadata: None, portable_image: None };
+        let mut store = Self { root, blobs, generation, state, credentials, metadata: None, portable_image: None, staging: Default::default() };
         if generation == 0 {
             store.publish(store.state.clone())?;
         }
@@ -642,6 +646,11 @@ impl ManagedStore {
     }
 
     fn publish_as(&mut self, state: State, actor: &str, operation: &str) -> Result<(), Error> {
+        let result = self.publish_as_inner(state, actor, operation);
+        self.finish_stager_operation(result)
+    }
+
+    fn publish_as_inner(&mut self, state: State, actor: &str, operation: &str) -> Result<(), Error> {
         state.validate()?;
         if self.portable_image.is_some() {
             return Err(Error::Invalid("immutable portable metadata snapshot"));
@@ -835,6 +844,11 @@ impl ManagedStore {
     }
 
     pub(crate) fn check_in(&mut self, principal: &Principal, input: ManagedCheckIn) -> Result<ManagedVersion, Error> {
+        let result = self.check_in_inner(principal, input);
+        self.finish_stager_operation(result)
+    }
+
+    fn check_in_inner(&mut self, principal: &Principal, input: ManagedCheckIn) -> Result<ManagedVersion, Error> {
         Self::write_permission(principal)?;
         if !crate::valid_id(&input.request_id)
             || input.comment.len() > 1024

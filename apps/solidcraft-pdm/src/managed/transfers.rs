@@ -5,7 +5,26 @@ use crate::{
     transfer_staging::{Binding, Limits, Stager, TransferError},
     transfers::{ContentMetadata, TransferCapabilities, TransferInput, TransferProgress, TransferTarget},
 };
-use std::io::{Read, Seek, SeekFrom};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    sync::Arc,
+};
+
+#[derive(PartialEq, Eq)]
+struct StagerContext {
+    root: std::path::PathBuf,
+    server_id: String,
+    epoch: u64,
+    limits: Limits,
+}
+
+/// Valid only under the archive's exclusive writer and trusted private-directory
+/// ownership. Out-of-band file changes are checked on reopen, not each request.
+/// This cache is never serialized or included in a portable snapshot.
+pub(super) struct CachedStager {
+    context: StagerContext,
+    stage: Arc<Stager>,
+}
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Ledger {
@@ -109,7 +128,25 @@ impl ManagedStore {
             epoch: self.state.transfers.as_ref().ok_or(Error::Invalid("streaming not enabled"))?.epoch,
         })
     }
-    fn stager(&self) -> Result<Stager, Error> {
+    pub(super) fn invalidate_stager(&self) {
+        if let Ok(mut cached) = self.staging.lock() {
+            *cached = None;
+        }
+    }
+
+    pub(super) fn finish_stager_operation<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        if result.is_err() {
+            self.invalidate_stager();
+        }
+        result
+    }
+
+    fn stager(&self) -> Result<Arc<Stager>, Error> {
+        let result = self.stager_inner();
+        self.finish_stager_operation(result)
+    }
+
+    fn stager_inner(&self) -> Result<Arc<Stager>, Error> {
         let policy = self.state.stream_policy.as_ref().ok_or(Error::Invalid("streaming not enabled"))?;
         let limits = Limits {
             max_file_bytes: policy.max_file_bytes,
@@ -118,7 +155,23 @@ impl ManagedStore {
             max_sessions: 2,
         };
         let path = std::path::absolute(&self.root)?.join("uploads");
-        if path.try_exists()? { Stager::open(&path, limits) } else { Stager::create(&path, limits) }.map_err(stage_error)
+        let context = StagerContext {
+            root: path.clone(),
+            server_id: self.server_id().into(),
+            epoch: self.state.transfers.as_ref().ok_or(Error::Invalid("streaming not enabled"))?.epoch,
+            limits,
+        };
+        let mut cached = self.staging.lock().map_err(|_| Error::Integrity)?;
+        if let Some(cached) = cached.as_ref()
+            && cached.context == context
+        {
+            return Ok(cached.stage.clone());
+        }
+        // Release the old writer lock before opening a different context.
+        *cached = None;
+        let stage = Arc::new(if path.try_exists()? { Stager::open(&path, limits) } else { Stager::create(&path, limits) }.map_err(stage_error)?);
+        *cached = Some(CachedStager { context, stage: stage.clone() });
+        Ok(stage)
     }
     fn reconcile_staging(&self, stage: &Stager) -> Result<(), Error> {
         let ledger = self.state.transfers.as_ref().ok_or(Error::Integrity)?;
@@ -141,6 +194,11 @@ impl ManagedStore {
         Ok(())
     }
     pub(super) fn reserved_transfer_bytes(&self) -> Result<u64, Error> {
+        let result = self.reserved_transfer_bytes_inner();
+        self.finish_stager_operation(result)
+    }
+
+    fn reserved_transfer_bytes_inner(&self) -> Result<u64, Error> {
         let stage = self.stager()?;
         self.reconcile_staging(&stage)?;
         self.state
@@ -201,6 +259,11 @@ impl ManagedStore {
         Ok(())
     }
     pub(crate) fn begin_transfer(&mut self, principal: &Principal, input: TransferInput) -> Result<TransferProgress, Error> {
+        let result = self.begin_transfer_inner(principal, input);
+        self.finish_stager_operation(result)
+    }
+
+    fn begin_transfer_inner(&mut self, principal: &Principal, input: TransferInput) -> Result<TransferProgress, Error> {
         let input = normalized(input);
         if !crate::valid_id(&input.request_id)
             || !hash_id(&input.sha256)
@@ -255,13 +318,20 @@ impl ManagedStore {
             .records
             .insert(id.clone(), Record { owner: principal.id.clone(), input, document, expires: status.expires, completed: None, cancelled: false });
         if let Err(error) = self.publish_as(state, &principal.id, "transfer.begin") {
-            let _ = stage.abort(&who, &id, |_| Ok(()));
+            if stage.abort(&who, &id, |_| Ok(())).is_err() {
+                self.invalidate_stager();
+            }
             return Err(error);
         }
         drop(stage);
         self.transfer_status(principal, &id)
     }
     pub(crate) fn transfer_status(&self, principal: &Principal, id: &str) -> Result<TransferProgress, Error> {
+        let result = self.transfer_status_inner(principal, id);
+        self.finish_stager_operation(result)
+    }
+
+    fn transfer_status_inner(&self, principal: &Principal, id: &str) -> Result<TransferProgress, Error> {
         let record = self.transfer_record(principal, id)?;
         if record.cancelled {
             return Err(Error::Server("transfer_cancelled".into()));
@@ -289,6 +359,11 @@ impl ManagedStore {
         })
     }
     pub(crate) fn prepare_chunk(&self, principal: &Principal, id: &str, offset: u64, bytes: u64, sha256: &str) -> Result<(), Error> {
+        let result = self.prepare_chunk_inner(principal, id, offset, bytes, sha256);
+        self.finish_stager_operation(result)
+    }
+
+    fn prepare_chunk_inner(&self, principal: &Principal, id: &str, offset: u64, bytes: u64, sha256: &str) -> Result<(), Error> {
         let record = self.transfer_record(principal, id)?;
         self.transfer_fence(principal, &record.input)?;
         if record.completed.is_some()
@@ -313,6 +388,11 @@ impl ManagedStore {
         content: &[u8],
         hash: &str,
     ) -> Result<TransferProgress, Error> {
+        let result = self.transfer_chunk_inner(principal, id, offset, content, hash);
+        self.finish_stager_operation(result)
+    }
+
+    fn transfer_chunk_inner(&mut self, principal: &Principal, id: &str, offset: u64, content: &[u8], hash: &str) -> Result<TransferProgress, Error> {
         self.prepare_chunk(principal, id, offset, content.len() as u64, hash)?;
         let stage = self.stager()?;
         stage
@@ -322,6 +402,11 @@ impl ManagedStore {
         self.transfer_status(principal, id)
     }
     pub(crate) fn cancel_transfer(&mut self, principal: &Principal, id: &str) -> Result<(), Error> {
+        let result = self.cancel_transfer_inner(principal, id);
+        self.finish_stager_operation(result)
+    }
+
+    fn cancel_transfer_inner(&mut self, principal: &Principal, id: &str) -> Result<(), Error> {
         Self::write_permission(principal)?;
         let record = match self.transfer_record(principal, id) {
             Ok(record) => record,
@@ -349,6 +434,11 @@ impl ManagedStore {
         self.publish_as(state, actor, "transfer.cancel")
     }
     pub(crate) fn commit_transfer(&mut self, principal: &Principal, id: &str, request_id: &str) -> Result<ManagedVersion, Error> {
+        let result = self.commit_transfer_inner(principal, id, request_id);
+        self.finish_stager_operation(result)
+    }
+
+    fn commit_transfer_inner(&mut self, principal: &Principal, id: &str, request_id: &str) -> Result<ManagedVersion, Error> {
         let record = self.transfer_record(principal, id)?;
         if record.cancelled {
             return Err(Error::Server("transfer_cancelled".into()));
@@ -359,7 +449,9 @@ impl ManagedStore {
         }
         if let Some(version) = record.completed {
             let stage = self.stager()?;
-            let _ = stage.complete(&self.binding(&principal.id)?, id, |_| Ok(()));
+            if stage.complete(&self.binding(&principal.id)?, id, |_| Ok(())).is_err() {
+                self.invalidate_stager();
+            }
             return Ok(version);
         }
         self.transfer_fence(principal, &record.input)?;
@@ -425,10 +517,17 @@ impl ManagedStore {
             .insert(request_id.into(), Receipt { owner: principal.id.clone(), fingerprint: fingerprint(&record.input)?, version: version.clone() });
         state.transfers.as_mut().and_then(|l| l.records.get_mut(id)).ok_or(Error::Integrity)?.completed = Some(version.clone());
         self.publish_as(state, &principal.id, "check_in")?;
-        let _ = stage.complete(&who, id, |_| Ok(()));
+        if stage.complete(&who, id, |_| Ok(())).is_err() {
+            self.invalidate_stager();
+        }
         Ok(version)
     }
     pub(crate) fn prepare_transfer_commit(&self, principal: &Principal, id: &str) -> Result<(), Error> {
+        let result = self.prepare_transfer_commit_inner(principal, id);
+        self.finish_stager_operation(result)
+    }
+
+    fn prepare_transfer_commit_inner(&self, principal: &Principal, id: &str) -> Result<(), Error> {
         Self::write_permission(principal)?;
         let record = self.transfer_record(principal, id)?;
         if record.cancelled {
@@ -470,6 +569,7 @@ impl ManagedStore {
         Ok((metadata, content))
     }
     pub(crate) fn reset_transfers_after_restore(&mut self) -> Result<(), Error> {
+        self.invalidate_stager();
         if self.state.transfers.is_none() {
             return Ok(());
         }
@@ -483,6 +583,157 @@ impl ManagedStore {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn cache_fixture() -> (std::path::PathBuf, crate::Store, Principal, TransferInput, Limits) {
+        let root = std::env::temp_dir().join(format!("pdm-stager-cache-{}", crate::AuthToken::generate().unwrap()));
+        let principal = Principal { id: "alice".into(), role: Role::Contributor };
+        let mut store = crate::Store::open(&root).unwrap();
+        store.managed.convert_restored_to_database().unwrap();
+        store.initialize_streaming(crate::stream_io::StreamPolicy { version: 1, max_file_bytes: 1024, max_store_bytes: 2048 }).unwrap();
+        let caps = store.managed.transfer_capabilities(&principal);
+        let input = TransferInput {
+            server_id: caps.server_id,
+            recovery_epoch: caps.recovery_epoch,
+            request_id: "cache-transfer".into(),
+            target: TransferTarget::NewOnly { logical_path: "cached.bin".into() },
+            total_bytes: 6,
+            sha256: digest(b"abcdef"),
+            dependencies: vec![],
+            comment: String::new(),
+        };
+        let limits = Limits { max_file_bytes: 1024, max_store_bytes: 2048, max_temporary_bytes: 2048, max_sessions: 2 };
+        (root, store, principal, input, limits)
+    }
+
+    #[test]
+    fn cached_stager_keeps_exclusive_lock_until_store_drop() {
+        let (root, mut store, principal, input, limits) = cache_fixture();
+        let uploads = root.join("managed/uploads");
+        let progress = store.managed.begin_transfer(&principal, input).unwrap();
+        assert!(Stager::open(&uploads, limits).is_err(), "successful begin released the store-owned staging lock");
+        store.managed.transfer_chunk(&principal, &progress.transfer_id, 0, b"abcdef", &digest(b"abcdef")).unwrap();
+        store.managed.transfer_status(&principal, &progress.transfer_id).unwrap();
+        store.managed.commit_transfer(&principal, &progress.transfer_id, "cache-transfer").unwrap();
+        assert!(Stager::open(&uploads, limits).is_err(), "healthy operations released the store-owned staging lock");
+        drop(store);
+        drop(Stager::open(&uploads, limits).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_stager_ignored_completion_error_releases_lock_and_recovers_once() {
+        let (root, mut store, principal, input, limits) = cache_fixture();
+        let progress = store.managed.begin_transfer(&principal, input).unwrap();
+        store.managed.transfer_chunk(&principal, &progress.transfer_id, 0, b"abcdef", &digest(b"abcdef")).unwrap();
+        crate::transfer_staging::fail_next_complete_delete_for_test();
+        let version = store.managed.commit_transfer(&principal, &progress.transfer_id, "cache-transfer").unwrap();
+        let uploads = root.join("managed/uploads");
+        assert!(uploads.join("sealed").join(&progress.transfer_id).exists(), "cleanup failure was not exercised");
+        let recovered = Stager::open(&uploads, limits).unwrap();
+        assert!(recovered.inventory().unwrap().is_empty());
+        drop(recovered);
+        assert_eq!(store.managed.commit_transfer(&principal, &progress.transfer_id, "cache-transfer").unwrap(), version);
+        assert_eq!(store.managed.state.versions.len(), 1);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_stager_persist_failure_discards_unacknowledged_tail_before_exact_retry() {
+        let (root, mut store, principal, input, limits) = cache_fixture();
+        let progress = store.managed.begin_transfer(&principal, input).unwrap();
+        store.managed.transfer_chunk(&principal, &progress.transfer_id, 0, b"ab", &digest(b"ab")).unwrap();
+        crate::transfer_staging::fail_next_persist_for_test();
+        assert!(store.managed.transfer_chunk(&principal, &progress.transfer_id, 2, b"cd", &digest(b"cd")).is_err());
+        let uploads = root.join("managed/uploads");
+        let raw = uploads.join(&progress.transfer_id);
+        assert_eq!(fs::metadata(&raw).unwrap().len(), 4, "fault did not leave an unacknowledged durable tail");
+        let recovered = Stager::open(&uploads, limits).unwrap();
+        assert_eq!(fs::metadata(&raw).unwrap().len(), 2);
+        drop(recovered);
+        assert_eq!(store.managed.transfer_status(&principal, &progress.transfer_id).unwrap().offset, 2);
+        store.managed.transfer_chunk(&principal, &progress.transfer_id, 2, b"cd", &digest(b"cd")).unwrap();
+        store.managed.transfer_chunk(&principal, &progress.transfer_id, 4, b"ef", &digest(b"ef")).unwrap();
+        let version = store.managed.commit_transfer(&principal, &progress.transfer_id, "cache-transfer").unwrap();
+        assert_eq!(store.managed.download(&version.version.reference).unwrap().1, b"abcdef");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_stager_direct_preflight_errors_evict_without_http_wrapper() {
+        let (root, mut store, principal, input, limits) = cache_fixture();
+        let progress = store.managed.begin_transfer(&principal, input).unwrap();
+        let viewer = Principal { id: principal.id.clone(), role: Role::Viewer };
+        assert!(matches!(store.managed.prepare_chunk(&viewer, &progress.transfer_id, 0, 2, &digest(b"ab")), Err(Error::Forbidden)));
+        drop(Stager::open(&root.join("managed/uploads"), limits).unwrap());
+        assert_eq!(store.managed.transfer_status(&principal, &progress.transfer_id).unwrap().offset, 0);
+        assert!(store.managed.commit_transfer(&principal, &progress.transfer_id, "wrong-request").is_err());
+        drop(Stager::open(&root.join("managed/uploads"), limits).unwrap());
+        store.managed.cancel_transfer(&principal, &progress.transfer_id).unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_stager_outer_metadata_error_after_seal_evicts_and_retries_one_version() {
+        let (root, mut store, principal, input, limits) = cache_fixture();
+        let progress = store.managed.begin_transfer(&principal, input).unwrap();
+        store.managed.transfer_chunk(&principal, &progress.transfer_id, 0, b"abcdef", &digest(b"abcdef")).unwrap();
+        let image = store.managed.metadata.as_ref().unwrap().image.clone();
+        // Fail image.next deterministically after seal/blob publication without
+        // changing the durable database or adding a production failure API.
+        store.managed.metadata.as_mut().unwrap().image.generation = u64::MAX;
+        assert!(store.managed.commit_transfer(&principal, &progress.transfer_id, "cache-transfer").is_err());
+        assert!(store.managed.state.versions.is_empty());
+        let uploads = root.join("managed/uploads");
+        assert!(uploads.join("sealed").join(&progress.transfer_id).exists());
+        drop(Stager::open(&uploads, limits).unwrap());
+        store.managed.metadata.as_mut().unwrap().image = image;
+        let version = store.managed.commit_transfer(&principal, &progress.transfer_id, "cache-transfer").unwrap();
+        assert_eq!(store.managed.download(&version.version.reference).unwrap().1, b"abcdef");
+        assert_eq!(store.managed.state.versions.len(), 1);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_stager_restore_epoch_boundary_releases_writer_and_rejects_old_controls() {
+        let (root, mut store, principal, input, limits) = cache_fixture();
+        let progress = store.managed.begin_transfer(&principal, input.clone()).unwrap();
+        store.managed.transfer_chunk(&principal, &progress.transfer_id, 0, b"abcdef", &digest(b"abcdef")).unwrap();
+        store.managed.commit_transfer(&principal, &progress.transfer_id, "cache-transfer").unwrap();
+        store.managed.reset_transfers_after_restore().unwrap();
+        drop(Stager::open(&root.join("managed/uploads"), limits).unwrap());
+        let mut stale = input.clone();
+        stale.request_id = "stale-epoch".into();
+        stale.target = TransferTarget::NewOnly { logical_path: "stale-epoch.bin".into() };
+        assert!(matches!(store.managed.begin_transfer(&principal, stale), Err(Error::Server(code)) if code == "recovery_epoch_mismatch"));
+        let mut next = input;
+        next.recovery_epoch = store.managed.transfer_capabilities(&principal).recovery_epoch;
+        next.request_id = "after-restore".into();
+        next.target = TransferTarget::NewOnly { logical_path: "after-restore.bin".into() };
+        let progress = store.managed.begin_transfer(&principal, next).unwrap();
+        store.managed.cancel_transfer(&principal, &progress.transfer_id).unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_stager_policy_context_change_fails_closed_and_releases_old_writer() {
+        let (root, mut store, principal, input, limits) = cache_fixture();
+        let progress = store.managed.begin_transfer(&principal, input).unwrap();
+        // No live edit API is added: model an unexpected internal policy change.
+        store.managed.state.stream_policy.as_mut().unwrap().max_file_bytes = 512;
+        assert!(store.managed.transfer_status(&principal, &progress.transfer_id).is_err());
+        drop(Stager::open(&root.join("managed/uploads"), limits).unwrap());
+        store.managed.state.stream_policy.as_mut().unwrap().max_file_bytes = 1024;
+        assert_eq!(store.managed.transfer_status(&principal, &progress.transfer_id).unwrap().offset, 0);
+        store.managed.cancel_transfer(&principal, &progress.transfer_id).unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn retained_content_read_and_backup_use_hard_read_bound_not_new_write_policy() {
         let root = std::env::temp_dir().join(format!("pdm-read-policy-{}", crate::AuthToken::generate().unwrap()));
