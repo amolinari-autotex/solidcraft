@@ -7,8 +7,8 @@ use crate::{
 use serde_json::{Value, json};
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec::new("pdm.rename", "Rename Archived File", rename).noundo().doc_only().params("document,logical_path,expected_head,expected_revision,expected_epoch; change the display path while preserving the immutable working-file locator"),
-    CommandSpec::new("pdm.delete", "Delete Archived File", delete).noundo().doc_only().params("document,expected_head,expected_revision,expected_epoch,confirm:true; tombstone an unreferenced file without removing bytes or history"),
+    CommandSpec::new("pdm.rename", "Rename Archived File", rename).icon("rename").noundo().doc_only().params("document,logical_path,expected_head,expected_revision,expected_epoch; change the display path while preserving the immutable working-file locator"),
+    CommandSpec::new("pdm.delete", "Delete Archived File", delete).icon("delete").noundo().doc_only().params("document,expected_head,expected_revision,expected_epoch,confirm:true; tombstone an unreferenced file without removing bytes or history"),
     CommandSpec::new("pdm.admin", "PDM Administration", status).icon("settings").noundo().doc_only().params("none; explicit read-only administration page, programmatic calls return public status"),
     CommandSpec::new("pdm.admin.read", "Refresh Administration", admin_read).icon("update").noundo().doc_only().params("none; negotiate authenticated server capabilities and read only permitted public users/audit metadata"),
     CommandSpec::new("pdm.import_new", "Import New File", import_new).icon("import").noundo().doc_only().params("source_path,folder,expected_workspace; copy a new file into the selected working folder and publish without replacing existing local or archived content"),
