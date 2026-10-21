@@ -1,0 +1,32 @@
+[package]
+name = "solidcraft-pdm"
+description = "Experimental loopback PDM server and client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+# Native single-node metadata transactions; explicit backup-to-new-store import only.
+redb = "=4.4.0"
+# Already present in the workspace lockfile: OS entropy and constant-time token comparison.
+getrandom = "0.3"
+subtle = "2.6"
+# Explicit S3 request signing and bounded XML parsing for the optional adapter.
+hmac = "0.12"
+quick-xml.workspace = true
+# Standards-based HTTPS transport; all use permissive licences. Ring is selected
+# explicitly to reuse the existing native crypto provider on Windows.
+hyper = { version = "1.12", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
+tokio = { version = "1.53", features = ["rt", "net", "time", "sync", "signal"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }

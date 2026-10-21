@@ -560,3 +560,11 @@ A frame whose meshes the GPU refuses to stage (device lost or out of memory) is
 skipped with a warning instead of panicking (#1469).
 Paint callbacks are prepared only after a drawable is acquired, so a skipped
 surface frame cannot strand cached meshes without their GPU initialization.
+
+## Original HTTPS test certificates
+
+| File | Origin | Licence | Purpose |
+| --- | --- | --- | --- |
+| apps/solidcraft-pdm/tests/fixtures/pdm-https/ca.der | Original disposable test CA generated for SolidCraft | MIT OR Apache-2.0 | Trust anchor for isolated loopback HTTPS tests only |
+| apps/solidcraft-pdm/tests/fixtures/pdm-https/server.der | Original disposable localhost certificate generated for SolidCraft | MIT OR Apache-2.0 | TLS identity for isolated loopback HTTPS tests only |
+| apps/solidcraft-pdm/tests/fixtures/pdm-https/server-key.der | Original deliberately public test private key generated for SolidCraft | MIT OR Apache-2.0 | Never use outside isolated tests; no production credential |
