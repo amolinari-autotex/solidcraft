@@ -64,6 +64,19 @@ pub(crate) fn dims(kind: usize, opts: &HoleOpts, to_object: bool) -> Vec<Dim> {
     v
 }
 
+/// Tapped bores follow the engine's rounded nominal-minus-pitch sizing policy.
+/// A custom draft with an error must not illustrate its stale, last valid designation.
+fn bore_diameter(diameter: &str, opts: &HoleOpts, eval: &dyn Fn(&str, ValueKind) -> Option<f64>) -> Option<f64> {
+    if opts.tapped {
+        if opts.custom_thread.as_ref().is_some_and(|draft| draft.error.is_some()) {
+            return None;
+        }
+        solidcraft_engine::doc::parse_metric_thread(&opts.thread).map(|(major, pitch)| ((major - pitch) * 1000.0).round() / 1000.0)
+    } else {
+        eval(diameter, ValueKind::Length).filter(|v| v.is_finite() && *v > 0.0)
+    }
+}
+
 /// What the picture is drawn from.
 struct Section {
     kind: usize,
@@ -90,7 +103,8 @@ pub(crate) fn rows(ui: &mut egui::Ui, k: &mut Kind, to_object: bool, eval: &dyn 
     let len = |e: &str| eval(e, ValueKind::Length).filter(|v| v.is_finite() && *v > 0.0);
     let angle = |e: &str, lo: f64, hi: f64, or: f64| eval(e, ValueKind::Angle).filter(|v| v.is_finite()).map_or(or, |v| (v / 2.0).clamp(lo, hi));
     let top = if kind == 2 { cs_diameter.as_str() } else { cb_diameter.as_str() };
-    let ratio = match (len(diameter.as_str()), len(top)) {
+    let bore = bore_diameter(diameter, opts, eval);
+    let ratio = match (bore, len(top)) {
         (Some(d), Some(t)) if kind != 0 => (d / t).clamp(0.3, 0.8) as f32,
         _ if kind != 0 => 0.55,
         _ => 1.0,
@@ -106,7 +120,7 @@ pub(crate) fn rows(ui: &mut egui::Ui, k: &mut Kind, to_object: bool, eval: &dyn 
         } else if !opts.all && !to_object {
             let recess = match kind {
                 1 => len(cb_depth.as_str()).unwrap_or(0.0),
-                2 => match (len(diameter.as_str()), len(cs_diameter.as_str())) {
+                2 => match (bore, len(cs_diameter.as_str())) {
                     (Some(d), Some(top)) => (top - d).max(0.0) / (2.0 * angle(cs_angle.as_str(), 0.35, 1.3, std::f64::consts::FRAC_PI_4).tan()),
                     _ => 0.0,
                 },
@@ -242,7 +256,7 @@ fn paint(p: &egui::Painter, pic: Rect, s: &Section, slots: &[(Dim, Rect, bool)])
         bottom + 1.0
     } else {
         let mut y = step + 18.0;
-        for d in [Dim::Depth, Dim::Diameter] {
+        for d in [Dim::Depth, Dim::ThreadDepth, Dim::Diameter] {
             if let Some(v) = y_of(d) {
                 y = y.max(v + 10.0);
             }
@@ -382,6 +396,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tapped_section_uses_the_current_nominal_size_and_pitch() {
+        let mut opts = HoleOpts { tapped: true, thread: "M8".into(), ..HoleOpts::default() };
+        let stale_diameter = |_: &str, _: ValueKind| Some(4.0);
+        assert_eq!(bore_diameter("4 mm", &opts, &stale_diameter), Some(6.75));
+        opts.thread = "M8x1.2".into();
+        assert_eq!(bore_diameter("4 mm", &opts, &stale_diameter), Some(6.8));
+        opts.thread = "invalid".into();
+        assert_eq!(bore_diameter("4 mm", &opts, &stale_diameter), None);
+        opts.tapped = false;
+        assert_eq!(bore_diameter("4 mm", &opts, &stale_diameter), Some(4.0));
+    }
+
+    #[test]
     fn partial_tapping_has_an_independent_dimension_for_every_extent() {
         for kind in 0..=2 {
             for through in [false, true] {
@@ -423,7 +450,8 @@ mod tests {
             let figure = crate::scenario::rect_of("dialog:figure:hole section").unwrap();
             let picture = crate::scenario::rect_of("dialog:figure_picture:hole section").unwrap();
             let mut previous_bottom = figure.top();
-            for label in ["Counterbore Ø", "Counterbore depth", "Depth", "Thread depth", "Diameter"] {
+            assert!(!dims(1, &HoleOpts { tapped: true, ..HoleOpts::default() }, false).contains(&Dim::Diameter));
+            for label in ["Counterbore Ø", "Counterbore depth", "Depth", "Thread depth"] {
                 let field = crate::scenario::rect_of(&format!("dialog:widget:{label}")).unwrap();
                 assert!(figure.contains_rect(field), "{label} is outside the {width} pt form: {field:?}");
                 assert!(field.left() > picture.right() && field.top() >= previous_bottom, "{label} overlaps another element: {field:?}");
