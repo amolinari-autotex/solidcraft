@@ -6281,7 +6281,14 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             }
             apply_traced(st, f, tools, *operation, &crate::plain(targets))
         }
-        FeatureKind::Hole { thread, diameter, .. } => {
+        FeatureKind::Hole { thread, thread_depth, diameter, .. } => {
+            let thread_depth = thread_depth.as_ref().map(|d| val(vals, d, Kind::Length)).transpose()?;
+            if thread_depth.is_some() && thread.is_none() {
+                return Err(DocError::Invalid("thread depth requires a tapped hole".into()));
+            }
+            if thread_depth.is_some_and(|d| !d.is_finite() || d <= 0.0) {
+                return Err(DocError::Invalid("thread depth must be finite and positive".into()));
+            }
             let (spots, dir) = hole_spots(vals, st, f)?;
             let tools = hole_feature_tools(vals, st, f)?;
             let handled = sheet_hole_cut(st, f, &tools, warning)?;
@@ -6301,7 +6308,24 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                     } else {
                         p + dir.any_perp() * r + dir * (r * 0.5)
                     };
-                    let t = thread_on_impl(st, f.id, wall, Some(d), None, true, false)?;
+                    let mut t = thread_on_impl(st, f.id, wall, Some(d), None, true, false)?;
+                    if let Some(depth) = thread_depth {
+                        let available = t.end - t.start;
+                        if depth > available {
+                            return Err(DocError::Invalid(format!(
+                                "thread depth {} mm exceeds the cylindrical wall's useful length of {} mm; reduce the thread depth or use full thread depth",
+                                show_mm(depth),
+                                show_mm(available)
+                            )));
+                        }
+                        // Start at the entry in the drilling direction, independently of the
+                        // wall probe's position and the cylinder surface's axis orientation.
+                        if dir.dot(t.axis) > 0.0 {
+                            t.end = t.start + depth;
+                        } else {
+                            t.start = t.end - depth;
+                        }
+                    }
                     st.threads.push(t);
                 }
             }
