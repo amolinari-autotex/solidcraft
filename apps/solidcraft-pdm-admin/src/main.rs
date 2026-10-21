@@ -144,6 +144,8 @@ struct Console {
     root: String,
     administrator: String,
     port: u16,
+    max_file_mib: u64,
+    archive_gib: u64,
     user: String,
     role: Role,
     backup: String,
@@ -167,6 +169,8 @@ impl Console {
             root: String::new(),
             administrator: "local-admin".into(),
             port: 0,
+            max_file_mib: 512,
+            archive_gib: 20,
             user: String::new(),
             role: Role::Viewer,
             backup: String::new(),
@@ -185,6 +189,7 @@ impl Console {
             && matches!(
                 action,
                 Action::Create { .. }
+                    | Action::CreateConfigured { .. }
                     | Action::Open(_)
                     | Action::CreateUser { .. }
                     | Action::Role { .. }
@@ -250,9 +255,27 @@ impl Console {
             ui.label("Loopback port (0 = choose free port for NEW installation)");
             ui.add(egui::DragValue::new(&mut self.port).range(0..=65535));
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Maximum file size (MiB)");
+            ui.add(egui::DragValue::new(&mut self.max_file_mib).range(1..=8192));
+            ui.label("Archive content capacity (GiB)");
+            ui.add(egui::DragValue::new(&mut self.archive_gib).range(1..=16384));
+        });
+        ui.label("NEW archives: up to 8 GiB per file and 16 TiB per archive; file limit must fit inside archive capacity. Existing installations use their saved policy.");
+        let selected_policy = service::stream_policy_from_units(self.max_file_mib, self.archive_gib).ok();
+        if selected_policy.is_none() {
+            ui.colored_label(egui::Color32::from_rgb(220, 95, 80), "Invalid capacity: the maximum file size must fit inside the archive capacity.");
+        }
         ui.horizontal(|ui| {
-            if ui.button("Create NEW archive and start").clicked() {
-                self.dispatch(Action::Create { root: PathBuf::from(&self.root), administrator: self.administrator.clone(), port: self.port });
+            if ui.add_enabled(selected_policy.is_some(), egui::Button::new("Create NEW archive and start")).clicked()
+                && let Some(stream_policy) = selected_policy
+            {
+                self.dispatch(Action::CreateConfigured {
+                    root: PathBuf::from(&self.root),
+                    administrator: self.administrator.clone(),
+                    port: self.port,
+                    stream_policy,
+                });
             }
             if ui.button("Open existing console installation").clicked() {
                 self.dispatch(Action::Open(PathBuf::from(&self.root)));

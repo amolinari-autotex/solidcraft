@@ -1,8 +1,7 @@
-//! Experimental bounded raw-byte staging, deliberately not advertised by HTTP.
-//! The trusted adapter must supply current authorization and a deadline-bound
-//! reader. No remote authentication, durable session resume or catalog commit is
-//! implemented here. Sealed bytes retain their staging reservation until a
-//! future transactional handoff; reopening existing staging roots is refused.
+//! Bounded durable raw-byte staging. The trusted caller supplies authorization,
+//! deadline-bound readers and the durable catalog-commit boundary for completion.
+//! Two precreated fsynced ledger slots avoid Windows replace/rename semantics.
+//! A sealed publication stays reserved and non-abortable until explicit completion.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -37,7 +36,7 @@ pub enum TransferError {
     Io(#[from] std::io::Error),
 }
 type Result<T> = std::result::Result<T, TransferError>;
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     pub max_file_bytes: u64,
@@ -60,7 +59,8 @@ impl Limits {
         Ok(())
     }
 }
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Binding {
     pub server_id: String,
     pub principal: String,
@@ -136,6 +136,21 @@ fn private_directory(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+const MAX_LEDGER: usize = 64 * 1024;
+const FORMAT: &str = "solidcraft-pdm-staging/1";
+const FIXED: [&str; 4] = ["policy.json", "writer.lock", "state-0.json", "state-1.json"];
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Phase {
+    Allocating,
+    Uploading,
+    Sealing,
+    Sealed,
+    Aborting,
+    Completing,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Session {
     who: Binding,
     total: u64,
@@ -143,16 +158,54 @@ struct Session {
     offset: u64,
     expires: u64,
     last: Option<(u64, u64, String)>,
-    poisoned: bool,
+    phase: Phase,
+    staging_link_retained: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Ledger {
+    limits: Limits,
+    sessions: BTreeMap<String, Session>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Slot {
+    format: String,
+    generation: u64,
+    ledger: Ledger,
+    sha256: String,
 }
 struct State {
-    sessions: BTreeMap<String, Session>,
-    reserved: u64,
+    generation: u64,
+    ledger: Ledger,
+    poisoned: bool,
 }
 pub struct Stager {
     root: PathBuf,
     limits: Limits,
     state: Mutex<State>,
+    _writer_lock: fs::File,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferStatus {
+    pub offset: u64,
+    pub total: u64,
+    pub sha256: String,
+    pub expires: u64,
+    pub sealed: bool,
+    pub staging_link_retained: bool,
+}
+/// Trusted-local reconciliation metadata. This inventory has no per-user
+/// filtering and must never be exposed directly by an authenticated HTTP route.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedSession {
+    pub id: String,
+    pub binding: Binding,
+    pub expires: u64,
+    /// Includes an ambiguous Sealing publication; ordinary abort is unsafe.
+    pub sealed: bool,
 }
 pub struct Sealed {
     pub path: PathBuf,
@@ -160,18 +213,371 @@ pub struct Sealed {
     pub sha256: String,
     pub staging_link_retained: bool,
 }
+
+fn regular(path: &Path) -> Result<fs::Metadata> {
+    no_links(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(TransferError::Invalid);
+    }
+    Ok(metadata)
+}
+fn exists(path: &Path) -> Result<bool> {
+    no_links(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(TransferError::Invalid),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    // Windows acknowledgements flush existing regular-file handles. In
+    // particular the ledger slots never rely on replacing a directory entry.
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+fn private_file(path: &Path) -> Result<fs::File> {
+    no_links(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+fn bounded_read(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    if regular(path)?.len() > limit as u64 {
+        return Err(TransferError::Invalid);
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(TransferError::Invalid);
+    }
+    Ok(bytes)
+}
+fn ledger_hash(generation: u64, ledger: &Ledger) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(FORMAT.as_bytes());
+    hash.update(generation.to_be_bytes());
+    hash.update(serde_json::to_vec(ledger).map_err(|_| TransferError::Invalid)?);
+    Ok(format!("{:x}", hash.finalize()))
+}
+fn validate_ledger(ledger: &Ledger, limits: Limits) -> Result<u64> {
+    if ledger.limits != limits || ledger.sessions.len() > limits.max_sessions {
+        return Err(TransferError::Invalid);
+    }
+    let mut reserved = 0u64;
+    let mut owners = std::collections::BTreeSet::new();
+    for (id, session) in &ledger.sessions {
+        if !hex(id)
+            || !binding_valid(&session.who)
+            || !hex(&session.digest)
+            || session.total > limits.max_file_bytes
+            || session.offset > session.total
+            || session.expires < TTL
+            || !owners.insert((&session.who.server_id, &session.who.principal))
+        {
+            return Err(TransferError::Invalid);
+        }
+        if matches!(session.phase, Phase::Sealing | Phase::Sealed | Phase::Completing) && session.offset != session.total {
+            return Err(TransferError::Invalid);
+        }
+        if (session.phase == Phase::Allocating && (session.offset != 0 || session.last.is_some()))
+            || (session.staging_link_retained && !matches!(session.phase, Phase::Sealed | Phase::Completing))
+        {
+            return Err(TransferError::Invalid);
+        }
+        if let Some((offset, length, digest)) = &session.last {
+            if *length == 0 || *length > CHUNK_BYTES || !hex(digest) || offset.checked_add(*length) != Some(session.offset) {
+                return Err(TransferError::Invalid);
+            }
+        } else if session.offset != 0 {
+            return Err(TransferError::Invalid);
+        }
+        reserved = reserved.checked_add(session.total).ok_or(TransferError::Invalid)?;
+    }
+    if reserved > limits.max_temporary_bytes {
+        return Err(TransferError::Invalid);
+    }
+    Ok(reserved)
+}
+fn read_slot(path: &Path, limits: Limits) -> Result<Option<Slot>> {
+    let bytes = bounded_read(path, MAX_LEDGER)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let slot: Slot = match serde_json::from_slice(&bytes) {
+        Ok(slot) => slot,
+        // Only an incomplete write is recoverable. Complete but corrupt or
+        // unknown JSON is not permission to downgrade to an older generation.
+        Err(error) if error.is_eof() => return Ok(None),
+        Err(_) => return Err(TransferError::Invalid),
+    };
+    if slot.format != FORMAT || !hex(&slot.sha256) || slot.sha256 != ledger_hash(slot.generation, &slot.ledger)? {
+        return Err(TransferError::Invalid);
+    }
+    validate_ledger(&slot.ledger, limits)?;
+    Ok(Some(slot))
+}
 impl Stager {
     pub fn create(root: &Path, limits: Limits) -> Result<Self> {
         limits.validate()?;
         private_directory(root)?;
-        let mut policy = fs::OpenOptions::new().write(true).create_new(true).open(root.join("policy.json"))?;
+        let writer = private_file(&root.join("writer.lock"))?;
+        writer.try_lock().map_err(|_| TransferError::Busy)?;
+        writer.sync_all()?;
+        let mut policy = private_file(&root.join("policy.json"))?;
         policy.write_all(&serde_json::to_vec(&limits).map_err(|_| TransferError::Invalid)?)?;
         policy.sync_all()?;
         fs::create_dir(root.join("sealed"))?;
-        Ok(Self { root: root.into(), limits, state: Mutex::new(State { sessions: BTreeMap::new(), reserved: 0 }) })
+        let ledger = Ledger { limits, sessions: BTreeMap::new() };
+        let slot = Slot { format: FORMAT.into(), generation: 0, sha256: ledger_hash(0, &ledger)?, ledger: ledger.clone() };
+        let mut first = private_file(&root.join("state-0.json"))?;
+        first.write_all(&serde_json::to_vec(&slot).map_err(|_| TransferError::Invalid)?)?;
+        first.sync_all()?;
+        private_file(&root.join("state-1.json"))?.sync_all()?;
+        sync_directory(root)?;
+        Ok(Self { root: root.into(), limits, state: Mutex::new(State { generation: 0, ledger, poisoned: false }), _writer_lock: writer })
+    }
+    /// Open only this format's existing private root. Metadata inventory and
+    /// acknowledged sizes are bounded; full content hashes are checked at seal.
+    pub fn open(root: &Path, limits: Limits) -> Result<Self> {
+        limits.validate()?;
+        no_links(root)?;
+        if !fs::symlink_metadata(root)?.is_dir() {
+            return Err(TransferError::Invalid);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(root)?.permissions().mode() & 0o077 != 0 {
+                return Err(TransferError::Invalid);
+            }
+        }
+        for name in FIXED {
+            regular(&root.join(name))?;
+        }
+        let writer = fs::OpenOptions::new().read(true).write(true).open(root.join("writer.lock"))?;
+        writer.try_lock().map_err(|_| TransferError::Busy)?;
+        let policy: Limits = serde_json::from_slice(&bounded_read(&root.join("policy.json"), 4096)?).map_err(|_| TransferError::Invalid)?;
+        if policy != limits {
+            return Err(TransferError::Invalid);
+        }
+        let first = read_slot(&root.join("state-0.json"), limits)?;
+        let second = read_slot(&root.join("state-1.json"), limits)?;
+        let slot = match (first, second) {
+            (Some(a), Some(b)) => {
+                if a.generation.abs_diff(b.generation) > 1 || (a.generation == b.generation && a.sha256 != b.sha256) {
+                    return Err(TransferError::Invalid);
+                }
+                if a.generation >= b.generation { a } else { b }
+            }
+            (Some(slot), None) | (None, Some(slot)) => slot,
+            _ => return Err(TransferError::Invalid),
+        };
+        let stager = Self {
+            root: root.into(),
+            limits,
+            state: Mutex::new(State { generation: slot.generation, ledger: slot.ledger, poisoned: false }),
+            _writer_lock: writer,
+        };
+        {
+            let mut state = stager.lock()?;
+            stager.validate_inventory(&state.ledger)?;
+            stager.recover(&mut state)?;
+        }
+        Ok(stager)
     }
     fn lock(&self) -> Result<MutexGuard<'_, State>> {
-        self.state.try_lock().map_err(|_| TransferError::Busy)
+        let state = self.state.try_lock().map_err(|_| TransferError::Busy)?;
+        if state.poisoned {
+            return Err(TransferError::Invalid);
+        }
+        Ok(state)
+    }
+    fn persist(&self, state: &mut State, ledger: Ledger) -> Result<()> {
+        validate_ledger(&ledger, self.limits)?;
+        let generation = state.generation.checked_add(1).ok_or(TransferError::Invalid)?;
+        let slot = Slot { format: FORMAT.into(), generation, sha256: ledger_hash(generation, &ledger)?, ledger: ledger.clone() };
+        let bytes = serde_json::to_vec(&slot).map_err(|_| TransferError::Invalid)?;
+        if bytes.len() > MAX_LEDGER {
+            return Err(TransferError::Invalid);
+        }
+        let path = self.root.join(if generation.is_multiple_of(2) { "state-0.json" } else { "state-1.json" });
+        let result = (|| {
+            regular(&path)?;
+            let mut file = fs::OpenOptions::new().write(true).open(path)?;
+            file.set_len(0)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok::<(), TransferError>(())
+        })();
+        if let Err(error) = result {
+            state.poisoned = true;
+            return Err(error);
+        }
+        state.generation = generation;
+        state.ledger = ledger;
+        Ok(())
+    }
+    fn validate_inventory(&self, ledger: &Ledger) -> Result<()> {
+        let sealed = self.root.join("sealed");
+        no_links(&sealed)?;
+        if !fs::symlink_metadata(&sealed)?.is_dir() {
+            return Err(TransferError::Invalid);
+        }
+        for (count, entry) in fs::read_dir(&self.root)?.enumerate() {
+            if count >= FIXED.len() + 1 + self.limits.max_sessions {
+                return Err(TransferError::Invalid);
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or(TransferError::Invalid)?;
+            no_links(&entry.path())?;
+            if name == "sealed" {
+                continue;
+            }
+            if FIXED.contains(&name) {
+                regular(&entry.path())?;
+                continue;
+            }
+            if !hex(name) || !ledger.sessions.contains_key(name) {
+                return Err(TransferError::Invalid);
+            }
+            regular(&entry.path())?;
+        }
+        for (count, entry) in fs::read_dir(&sealed)?.enumerate() {
+            if count >= self.limits.max_sessions {
+                return Err(TransferError::Invalid);
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or(TransferError::Invalid)?;
+            let session = ledger.sessions.get(name).ok_or(TransferError::Invalid)?;
+            if !hex(name) || !matches!(session.phase, Phase::Sealing | Phase::Sealed | Phase::Completing) {
+                return Err(TransferError::Invalid);
+            }
+            regular(&entry.path())?;
+        }
+        Ok(())
+    }
+    fn recover(&self, state: &mut State) -> Result<()> {
+        let ids: Vec<_> = state.ledger.sessions.keys().cloned().collect();
+        for id in ids {
+            let session = state.ledger.sessions.get(&id).cloned().ok_or(TransferError::Invalid)?;
+            let raw = self.root.join(&id);
+            let sealed = self.root.join("sealed").join(&id);
+            match session.phase {
+                Phase::Allocating => {
+                    if !exists(&raw)? {
+                        private_file(&raw)?.sync_all()?;
+                        sync_directory(&self.root)?;
+                    }
+                    if regular(&raw)?.len() != 0 {
+                        return Err(TransferError::Invalid);
+                    }
+                    let mut ledger = state.ledger.clone();
+                    ledger.sessions.get_mut(&id).ok_or(TransferError::Invalid)?.phase = Phase::Uploading;
+                    self.persist(state, ledger)?;
+                }
+                Phase::Uploading => {
+                    let length = regular(&raw)?.len();
+                    if length < session.offset || length > self.limits.max_file_bytes {
+                        return Err(TransferError::Invalid);
+                    }
+                    if length > session.offset {
+                        let file = fs::OpenOptions::new().write(true).open(&raw)?;
+                        file.set_len(session.offset)?;
+                        file.sync_all()?;
+                    }
+                }
+                Phase::Sealing | Phase::Sealed => {
+                    let raw_exists = exists(&raw)?;
+                    let sealed_exists = exists(&sealed)?;
+                    if !raw_exists && !sealed_exists {
+                        return Err(TransferError::Invalid);
+                    }
+                    if raw_exists && regular(&raw)?.len() != session.total {
+                        return Err(TransferError::Invalid);
+                    }
+                    if sealed_exists && regular(&sealed)?.len() != session.total {
+                        return Err(TransferError::Invalid);
+                    }
+                    if session.phase == Phase::Sealed && !sealed_exists {
+                        return Err(TransferError::Invalid);
+                    }
+                    if sealed_exists && (session.phase != Phase::Sealed || session.staging_link_retained != raw_exists) {
+                        let mut ledger = state.ledger.clone();
+                        let entry = ledger.sessions.get_mut(&id).ok_or(TransferError::Invalid)?;
+                        entry.phase = Phase::Sealed;
+                        entry.staging_link_retained = raw_exists;
+                        self.persist(state, ledger)?;
+                    }
+                }
+                Phase::Aborting | Phase::Completing => {
+                    // A failed deletion keeps its reservation, including across
+                    // restart. Other owners may still query their own sessions.
+                    if let Err(error) = self.finish_delete(state, &id, |path| fs::remove_file(path))
+                        && state.poisoned
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn checked<'a>(state: &'a State, who: &Binding, id: &str, now: Option<u64>) -> Result<&'a Session> {
+        if !binding_valid(who) || !hex(id) {
+            return Err(TransferError::Forbidden);
+        }
+        let session = state.ledger.sessions.get(id).ok_or(TransferError::Forbidden)?;
+        if session.who != *who {
+            return Err(TransferError::Forbidden);
+        }
+        if now.is_some_and(|now| now >= session.expires) && matches!(session.phase, Phase::Allocating | Phase::Uploading) {
+            return Err(TransferError::Expired);
+        }
+        Ok(session)
+    }
+    pub fn status(&self, who: &Binding, id: &str, now: u64, authorize: impl FnOnce(&Binding) -> Result<()>) -> Result<TransferStatus> {
+        let state = self.lock()?;
+        authorize(who)?;
+        let session = Self::checked(&state, who, id, Some(now))?;
+        if matches!(session.phase, Phase::Aborting | Phase::Completing) {
+            return Err(TransferError::Invalid);
+        }
+        Ok(TransferStatus {
+            offset: session.offset,
+            total: session.total,
+            sha256: session.digest.clone(),
+            expires: session.expires,
+            sealed: session.phase == Phase::Sealed,
+            staging_link_retained: session.staging_link_retained,
+        })
+    }
+    /// Only the trusted serialized catalog writer may compare this bounded
+    /// inventory with its authoritative durable transfer records.
+    pub fn inventory(&self) -> Result<Vec<StagedSession>> {
+        let state = self.lock()?;
+        Ok(state
+            .ledger
+            .sessions
+            .iter()
+            .map(|(id, session)| StagedSession {
+                id: id.clone(),
+                binding: session.who.clone(),
+                expires: session.expires,
+                sealed: matches!(session.phase, Phase::Sealing | Phase::Sealed | Phase::Completing),
+            })
+            .collect())
     }
     pub fn begin(
         &self,
@@ -190,12 +596,12 @@ impl Stager {
         if total > self.limits.max_file_bytes {
             return Err(TransferError::FileTooLarge { actual: total, max: self.limits.max_file_bytes });
         }
-        if state.sessions.len() >= self.limits.max_sessions
-            || state.sessions.values().any(|s| s.who.server_id == who.server_id && s.who.principal == who.principal)
+        if state.ledger.sessions.len() >= self.limits.max_sessions
+            || state.ledger.sessions.values().any(|s| s.who.server_id == who.server_id && s.who.principal == who.principal)
         {
             return Err(TransferError::Busy);
         }
-        let reserved = state.reserved.checked_add(total).ok_or(TransferError::TemporaryQuota)?;
+        let reserved = validate_ledger(&state.ledger, self.limits)?.checked_add(total).ok_or(TransferError::TemporaryQuota)?;
         if reserved > self.limits.max_temporary_bytes {
             return Err(TransferError::TemporaryQuota);
         }
@@ -203,25 +609,19 @@ impl Stager {
             return Err(TransferError::StorageQuota);
         }
         let expires = now.checked_add(TTL).ok_or(TransferError::Invalid)?;
-        let id = crate::AuthToken::generate().map_err(|_| TransferError::Invalid)?.to_string();
-        let file = fs::OpenOptions::new().write(true).create_new(true).open(self.root.join(&id))?;
-        file.sync_all()?;
-        state.sessions.insert(id.clone(), Session { who: who.clone(), total, digest, offset: 0, expires, last: None, poisoned: false });
-        state.reserved = reserved;
+        let id = crate::AuthToken::generate().map_err(|_| TransferError::Invalid)?;
+        let mut ledger = state.ledger.clone();
+        ledger.sessions.insert(
+            id.clone(),
+            Session { who: who.clone(), total, digest, offset: 0, expires, last: None, phase: Phase::Allocating, staging_link_retained: false },
+        );
+        self.persist(&mut state, ledger)?;
+        private_file(&self.root.join(&id))?.sync_all()?;
+        sync_directory(&self.root)?;
+        let mut ledger = state.ledger.clone();
+        ledger.sessions.get_mut(&id).ok_or(TransferError::Invalid)?.phase = Phase::Uploading;
+        self.persist(&mut state, ledger)?;
         Ok(id)
-    }
-    fn checked<'a>(state: &'a mut State, who: &Binding, id: &str, now: u64) -> Result<&'a mut Session> {
-        let session = state.sessions.get_mut(id).ok_or(TransferError::Forbidden)?;
-        if session.who != *who {
-            return Err(TransferError::Forbidden);
-        }
-        if now >= session.expires {
-            return Err(TransferError::Expired);
-        }
-        if session.poisoned {
-            return Err(TransferError::Invalid);
-        }
-        Ok(session)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn chunk(
@@ -237,8 +637,13 @@ impl Stager {
     ) -> Result<u64> {
         let mut state = self.lock()?;
         authorize(who)?;
-        let session = Self::checked(&mut state, who, id, now)?;
-        if !hex(digest) || length == 0 || length > CHUNK_BYTES || offset.checked_add(length).is_none_or(|end| end > session.total) {
+        let session = Self::checked(&state, who, id, Some(now))?.clone();
+        if session.phase != Phase::Uploading
+            || !hex(digest)
+            || length == 0
+            || length > CHUNK_BYTES
+            || offset.checked_add(length).is_none_or(|end| end > session.total)
+        {
             return Err(TransferError::Invalid);
         }
         if session.last.as_ref().is_some_and(|(o, n, h)| *o == offset && *n == length && h == digest) {
@@ -248,13 +653,10 @@ impl Stager {
             return Err(TransferError::Invalid);
         }
         let path = self.root.join(id);
-        no_links(&path)?;
-        // A Windows append-only handle cannot reliably truncate a rejected tail.
-        let mut file = fs::OpenOptions::new().write(true).open(path)?;
-        if file.metadata()?.len() != offset {
-            session.poisoned = true;
+        if regular(&path)?.len() != offset {
             return Err(TransferError::Invalid);
         }
+        let mut file = fs::OpenOptions::new().write(true).open(path)?;
         file.seek(SeekFrom::Start(offset))?;
         let result = (|| {
             let mut remaining = length;
@@ -263,7 +665,7 @@ impl Stager {
             while remaining > 0 {
                 let wanted = usize::try_from(remaining.min(BUFFER as u64)).map_err(|_| TransferError::Invalid)?;
                 let count = body.read(buffer.get_mut(..wanted).ok_or(TransferError::Invalid)?)?;
-                if count == 0 {
+                if count == 0 || count > wanted {
                     return Err(TransferError::Invalid);
                 }
                 let bytes = buffer.get(..count).ok_or(TransferError::Invalid)?;
@@ -278,17 +680,21 @@ impl Stager {
                 return Err(TransferError::Checksum);
             }
             file.sync_all()?;
-            Ok(())
+            Ok::<(), TransferError>(())
         })();
         if let Err(error) = result {
             if file.set_len(offset).and_then(|_| file.sync_all()).is_err() {
-                session.poisoned = true;
+                state.poisoned = true;
             }
             return Err(error);
         }
-        session.offset += length;
-        session.last = Some((offset, length, digest.into()));
-        Ok(session.offset)
+        let mut ledger = state.ledger.clone();
+        let entry = ledger.sessions.get_mut(id).ok_or(TransferError::Invalid)?;
+        entry.offset = offset.checked_add(length).ok_or(TransferError::Invalid)?;
+        entry.last = Some((offset, length, digest.into()));
+        let acknowledged = entry.offset;
+        self.persist(&mut state, ledger)?;
+        Ok(acknowledged)
     }
     pub fn seal(&self, who: &Binding, id: &str, now: u64, authorize: impl FnOnce(&Binding) -> Result<()>) -> Result<Sealed> {
         self.seal_with_cleanup(who, id, now, authorize, |path| fs::remove_file(path))
@@ -303,13 +709,22 @@ impl Stager {
     ) -> Result<Sealed> {
         let mut state = self.lock()?;
         authorize(who)?;
-        let session = Self::checked(&mut state, who, id, now)?;
-        if session.offset != session.total {
+        let session = Self::checked(&state, who, id, Some(now))?.clone();
+        let raw = self.root.join(id);
+        let sealed = self.root.join("sealed").join(id);
+        if session.phase == Phase::Sealed {
+            if regular(&sealed)?.len() != session.total {
+                return Err(TransferError::Invalid);
+            }
+            return Ok(Sealed { path: sealed, bytes: session.total, sha256: session.digest, staging_link_retained: session.staging_link_retained });
+        }
+        if !matches!(session.phase, Phase::Uploading | Phase::Sealing) || session.offset != session.total {
             return Err(TransferError::Invalid);
         }
-        let path = self.root.join(id);
-        no_links(&path)?;
-        let mut file = fs::File::open(&path)?;
+        if regular(&raw)?.len() != session.total {
+            return Err(TransferError::Checksum);
+        }
+        let mut file = fs::File::open(&raw)?;
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; BUFFER];
         let mut bytes = 0u64;
@@ -318,48 +733,277 @@ impl Stager {
             if count == 0 {
                 break;
             }
-            hasher.update(buffer.get(..count).ok_or(TransferError::Invalid)?);
             bytes = bytes.checked_add(count as u64).ok_or(TransferError::Invalid)?;
             if bytes > session.total {
                 return Err(TransferError::Checksum);
             }
+            hasher.update(buffer.get(..count).ok_or(TransferError::Invalid)?);
         }
-        let sha256 = format!("{:x}", hasher.finalize());
-        if bytes != session.total || sha256 != session.digest {
+        if bytes != session.total || format!("{:x}", hasher.finalize()) != session.digest {
             return Err(TransferError::Checksum);
         }
         drop(file);
+        if session.phase != Phase::Sealing {
+            let mut ledger = state.ledger.clone();
+            ledger.sessions.get_mut(id).ok_or(TransferError::Invalid)?.phase = Phase::Sealing;
+            self.persist(&mut state, ledger)?;
+        }
+        if !exists(&sealed)? {
+            fs::hard_link(&raw, &sealed)?;
+        }
+        if regular(&sealed)?.len() != session.total {
+            return Err(TransferError::Invalid);
+        }
+        fs::OpenOptions::new().write(true).open(&sealed)?.sync_all()?;
+        sync_directory(&self.root.join("sealed"))?;
+        let staging_link_retained = cleanup(&raw).is_err();
+        if !staging_link_retained {
+            sync_directory(&self.root)?;
+        }
+        let mut ledger = state.ledger.clone();
+        let entry = ledger.sessions.get_mut(id).ok_or(TransferError::Invalid)?;
+        entry.phase = Phase::Sealed;
+        entry.staging_link_retained = staging_link_retained;
+        self.persist(&mut state, ledger)?;
+        Ok(Sealed { path: sealed, bytes: session.total, sha256: session.digest, staging_link_retained })
+    }
+    fn finish_delete(&self, state: &mut State, id: &str, mut remove: impl FnMut(&Path) -> std::io::Result<()>) -> Result<()> {
+        let session = state.ledger.sessions.get(id).ok_or(TransferError::Forbidden)?;
+        if !matches!(session.phase, Phase::Aborting | Phase::Completing) {
+            return Err(TransferError::Invalid);
+        }
+        let raw = self.root.join(id);
         let sealed = self.root.join("sealed").join(id);
-        no_links(&sealed)?;
-        fs::hard_link(&path, &sealed)?;
-        // The new-only sealed publication succeeded. A redundant private link
-        // must not turn it into an abortable session and release its quota.
-        let staging_link_retained = cleanup(&path).is_err();
-        state.sessions.remove(id);
-        // Keep reserved bytes charged: no transactional catalog handoff exists yet.
-        Ok(Sealed { path: sealed, bytes, sha256, staging_link_retained })
+        if session.phase == Phase::Aborting && exists(&sealed)? {
+            return Err(TransferError::Invalid);
+        }
+        if exists(&raw)? {
+            remove(&raw)?;
+            sync_directory(&self.root)?;
+        }
+        if session.phase == Phase::Completing && exists(&sealed)? {
+            remove(&sealed)?;
+            sync_directory(&self.root.join("sealed"))?;
+        }
+        let mut ledger = state.ledger.clone();
+        ledger.sessions.remove(id);
+        self.persist(state, ledger)
     }
     pub fn abort(&self, who: &Binding, id: &str, authorize: impl FnOnce(&Binding) -> Result<()>) -> Result<()> {
         let mut state = self.lock()?;
         authorize(who)?;
-        let session = state.sessions.get(id).ok_or(TransferError::Forbidden)?;
-        if session.who != *who {
+        let session = Self::checked(&state, who, id, None)?;
+        if !matches!(session.phase, Phase::Allocating | Phase::Uploading | Phase::Aborting) {
             return Err(TransferError::Forbidden);
         }
-        let total = session.total;
-        let path = self.root.join(id);
-        no_links(&path)?;
-        fs::remove_file(path)?;
-        state.sessions.remove(id);
-        state.reserved = state.reserved.checked_sub(total).ok_or(TransferError::Invalid)?;
-        Ok(())
+        if session.phase != Phase::Aborting {
+            let mut ledger = state.ledger.clone();
+            ledger.sessions.get_mut(id).ok_or(TransferError::Invalid)?.phase = Phase::Aborting;
+            self.persist(&mut state, ledger)?;
+        }
+        self.finish_delete(&mut state, id, |path| fs::remove_file(path))
+    }
+    /// The caller must invoke this only AFTER its catalog transaction durably
+    /// commits ownership of the bytes. Unknown IDs are an authenticated no-op;
+    /// they never cause arbitrary paths to be removed.
+    pub fn complete(&self, who: &Binding, id: &str, authorize: impl FnOnce(&Binding) -> Result<()>) -> Result<()> {
+        self.complete_with_cleanup(who, id, authorize, |path| fs::remove_file(path))
+    }
+    /// Trusted-local cross-domain cancellation only. The caller must ALREADY
+    /// hold a durable catalog cancellation intent, or prove that this ID is not
+    /// tracked by the authoritative catalog. Unlike ordinary abort, this may
+    /// delete Sealing/Sealed bytes. Never expose it as a generic HTTP operation.
+    pub fn discard(&self, who: &Binding, id: &str, authorize: impl FnOnce(&Binding) -> Result<()>) -> Result<()> {
+        let mut state = self.lock()?;
+        authorize(who)?;
+        if !binding_valid(who) || !hex(id) {
+            return Err(TransferError::Forbidden);
+        }
+        if !state.ledger.sessions.contains_key(id) {
+            return Ok(());
+        }
+        let session = Self::checked(&state, who, id, None)?;
+        let phase = if matches!(session.phase, Phase::Sealing | Phase::Sealed | Phase::Completing) { Phase::Completing } else { Phase::Aborting };
+        if session.phase != phase {
+            let mut ledger = state.ledger.clone();
+            ledger.sessions.get_mut(id).ok_or(TransferError::Invalid)?.phase = phase;
+            self.persist(&mut state, ledger)?;
+        }
+        self.finish_delete(&mut state, id, |path| fs::remove_file(path))
+    }
+    fn complete_with_cleanup(
+        &self,
+        who: &Binding,
+        id: &str,
+        authorize: impl FnOnce(&Binding) -> Result<()>,
+        remove: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let mut state = self.lock()?;
+        authorize(who)?;
+        if !binding_valid(who) || !hex(id) {
+            return Err(TransferError::Forbidden);
+        }
+        if !state.ledger.sessions.contains_key(id) {
+            return Ok(());
+        }
+        let session = Self::checked(&state, who, id, None)?;
+        if !matches!(session.phase, Phase::Sealed | Phase::Completing) {
+            return Err(TransferError::Invalid);
+        }
+        if session.phase != Phase::Completing {
+            let mut ledger = state.ledger.clone();
+            ledger.sessions.get_mut(id).ok_or(TransferError::Invalid)?.phase = Phase::Completing;
+            self.persist(&mut state, ledger)?;
+        }
+        self.finish_delete(&mut state, id, remove)
+    }
+    /// Expiry cannot release published or ambiguous-publication reservations.
+    /// Cleanup is restricted to the exact authorized binding, including epoch.
+    pub fn cleanup_expired(&self, who: &Binding, now: u64, authorize: impl FnOnce(&Binding) -> Result<()>) -> Result<usize> {
+        let mut state = self.lock()?;
+        authorize(who)?;
+        if !binding_valid(who) {
+            return Err(TransferError::Forbidden);
+        }
+        let ids: Vec<_> = state
+            .ledger
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.who == *who && now >= s.expires && matches!(s.phase, Phase::Allocating | Phase::Uploading | Phase::Aborting))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut removed = 0;
+        for id in ids {
+            let mut ledger = state.ledger.clone();
+            ledger.sessions.get_mut(&id).ok_or(TransferError::Invalid)?.phase = Phase::Aborting;
+            self.persist(&mut state, ledger)?;
+            self.finish_delete(&mut state, &id, |path| fs::remove_file(path))?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 }
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    fn fixture() -> (PathBuf, Limits, Binding) {
+        (
+            std::env::temp_dir().join(format!("transfer-durable-{}", crate::AuthToken::generate().unwrap())),
+            Limits { max_file_bytes: 1, max_store_bytes: 2, max_temporary_bytes: 1, max_sessions: 2 },
+            Binding { server_id: "a".repeat(64), principal: "alice".into(), epoch: 1 },
+        )
+    }
+    fn filled(stage: &Stager, who: &Binding) -> String {
+        let hash = format!("{:x}", Sha256::digest(b"x"));
+        let id = stage.begin(who, 1, hash.clone(), 0, 0, |_| Ok(())).unwrap();
+        stage.chunk(who, &id, 0, 1, &hash, &mut &b"x"[..], 1, |_| Ok(())).unwrap();
+        id
+    }
+    #[test]
+    fn trusted_discard_cleans_raw_only_publication_intent_and_recovers_cancel_journal() {
+        let (root, limits, who) = fixture();
+        let stage = Stager::create(&root, limits).unwrap();
+        let id = filled(&stage, &who);
+        {
+            let mut state = stage.lock().unwrap();
+            let mut ledger = state.ledger.clone();
+            ledger.sessions.get_mut(&id).unwrap().phase = Phase::Sealing;
+            stage.persist(&mut state, ledger).unwrap();
+        }
+        drop(stage);
+        let stage = Stager::open(&root, limits).unwrap();
+        assert!(stage.inventory().unwrap().first().unwrap().sealed);
+        assert!(!root.join("sealed").join(&id).exists());
+        stage.discard(&who, &id, |_| Ok(())).unwrap();
+        assert!(!root.join(&id).exists());
+        let next = filled(&stage, &who);
+        // Crash after the trusted cancellation is durably journaled, before
+        // unlinking a raw-only Sealing session.
+        {
+            let mut state = stage.lock().unwrap();
+            let mut ledger = state.ledger.clone();
+            ledger.sessions.get_mut(&next).unwrap().phase = Phase::Sealing;
+            stage.persist(&mut state, ledger.clone()).unwrap();
+            ledger.sessions.get_mut(&next).unwrap().phase = Phase::Completing;
+            stage.persist(&mut state, ledger).unwrap();
+        }
+        drop(stage);
+        let stage = Stager::open(&root, limits).unwrap();
+        assert!(stage.inventory().unwrap().is_empty());
+        assert!(!root.join(&next).exists());
+        stage.discard(&who, &next, |_| Ok(())).unwrap();
+        drop(stage);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn durable_publication_intent_recovers_hardlink_and_never_becomes_abortable() {
+        let (root, limits, who) = fixture();
+        let stage = Stager::create(&root, limits).unwrap();
+        let id = filled(&stage, &who);
+        {
+            let mut state = stage.lock().unwrap();
+            let mut ledger = state.ledger.clone();
+            ledger.sessions.get_mut(&id).unwrap().phase = Phase::Sealing;
+            stage.persist(&mut state, ledger).unwrap();
+        }
+        // Crash after the new-only publication, before its success ledger/ACK.
+        fs::hard_link(root.join(&id), root.join("sealed").join(&id)).unwrap();
+        drop(stage);
+        let stage = Stager::open(&root, limits).unwrap();
+        let status = stage.status(&who, &id, 2_000_000, |_| Ok(())).unwrap();
+        assert!(status.sealed);
+        assert!(status.staging_link_retained);
+        assert!(matches!(stage.abort(&who, &id, |_| Ok(())), Err(TransferError::Forbidden)));
+        assert_eq!(stage.cleanup_expired(&who, 2_000_000, |_| Ok(())).unwrap(), 0);
+        let sealed = stage.seal(&who, &id, 2_000_000, |_| Ok(())).unwrap();
+        assert!(sealed.path.is_file());
+        stage.complete(&who, &id, |_| Ok(())).unwrap();
+        assert!(!root.join(&id).exists());
+        assert!(!sealed.path.exists());
+        drop(stage);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn failed_completion_delete_keeps_durable_reservation_until_real_cleanup() {
+        let (root, limits, who) = fixture();
+        let stage = Stager::create(&root, limits).unwrap();
+        let id = filled(&stage, &who);
+        let sealed = stage.seal(&who, &id, 2, |_| Ok(())).unwrap();
+        assert!(stage.complete_with_cleanup(&who, &id, |_| Ok(()), |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))).is_err());
+        assert!(sealed.path.is_file());
+        {
+            let state = stage.lock().unwrap();
+            assert_eq!(validate_ledger(&state.ledger, limits).unwrap(), 1);
+            assert!(state.ledger.sessions.get(&id).unwrap().phase == Phase::Completing);
+        }
+        let bob = Binding { principal: "bob".into(), ..who.clone() };
+        assert!(matches!(stage.begin(&bob, 1, format!("{:x}", Sha256::digest(b"x")), 0, 3, |_| Ok(())), Err(TransferError::TemporaryQuota)));
+        drop(stage);
+        let stage = Stager::open(&root, limits).unwrap();
+        assert!(!sealed.path.exists());
+        assert!(stage.complete(&who, &id, |_| Ok(())).is_ok());
+        let next = stage.begin(&bob, 1, format!("{:x}", Sha256::digest(b"x")), 1, 4, |_| Ok(())).unwrap();
+        stage.abort(&bob, &next, |_| Ok(())).unwrap();
+        drop(stage);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn torn_inactive_slot_recovers_but_complete_corruption_fails_closed() {
+        let (root, limits, who) = fixture();
+        let stage = Stager::create(&root, limits).unwrap();
+        let id = filled(&stage, &who);
+        let generation = stage.lock().unwrap().generation;
+        let inactive = root.join(if generation.is_multiple_of(2) { "state-1.json" } else { "state-0.json" });
+        drop(stage);
+        fs::write(&inactive, b"{\"format\":").unwrap();
+        let stage = Stager::open(&root, limits).unwrap();
+        assert_eq!(stage.status(&who, &id, 2, |_| Ok(())).unwrap().offset, 1);
+        drop(stage);
+        fs::write(&inactive, b"{\"format\":\"unexpected\"}").unwrap();
+        assert!(Stager::open(&root, limits).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn failed_seal_unlink_retains_charge_and_cannot_abort_published_bytes() {
         let root = std::env::temp_dir().join(format!("transfer-unlink-{}", crate::AuthToken::generate().unwrap()));

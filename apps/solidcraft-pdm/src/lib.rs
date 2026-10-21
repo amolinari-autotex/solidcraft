@@ -21,6 +21,7 @@ pub mod connector;
 pub mod deployment;
 mod http_listener;
 pub mod http_server;
+mod http_transfer;
 pub mod managed;
 pub mod managed_workspace;
 pub mod pairing;
@@ -28,7 +29,9 @@ pub mod relay;
 pub mod relay_client;
 pub mod relay_http;
 pub mod s3_blob_store;
+pub mod stream_io;
 pub mod transfer_staging;
+pub mod transfers;
 pub mod workspace;
 
 pub const PROTOCOL: &str = "solidcraft-pdm/2";
@@ -119,6 +122,10 @@ pub enum Error {
     Conflict,
     #[error("document is referenced by retained versions")]
     Referenced,
+    #[error("content requires binary transfer")]
+    TransferRequired,
+    #[error("file exceeds limit: {actual} bytes; maximum {max} bytes")]
+    FileTooLarge { actual: u64, max: u64 },
     #[error("version not found")]
     NotFound,
     #[error("storage integrity failure")]
@@ -237,6 +244,19 @@ pub(crate) fn digest(content: &[u8]) -> String {
 }
 
 impl Store {
+    /// Explicit operator action for an empty transactional filesystem archive.
+    /// Failure leaves an on-disk fence: restore the prior backup to a NEW root.
+    pub fn initialize_streaming(&mut self, policy: stream_io::StreamPolicy) -> Result<(), Error> {
+        for entry in fs::read_dir(&self.root)? {
+            if entry?.file_name().to_string_lossy().starts_with("d-") {
+                return Err(Error::Invalid("streaming initialization requires an empty archive"));
+            }
+        }
+        self.managed.initialize_streaming(policy)
+    }
+    pub(crate) fn verify_reference(&self, reference: &VersionRef) -> Result<Version, Error> {
+        if reference.document.starts_with("m-") { self.managed.verify_reference(reference) } else { self.download(reference).map(|v| v.0) }
+    }
     pub fn list(&self, document: Option<&str>) -> Result<Vec<Version>, Error> {
         let mut result = Vec::new();
         if let Some(document) = document {
@@ -324,9 +344,6 @@ impl Store {
     }
     pub(crate) fn blob_inventory(&self) -> Result<Vec<blob_store::BlobReceipt>, Error> {
         self.managed.blob_inventory()
-    }
-    pub(crate) fn get_verified_blob(&self, hash: &str) -> Result<Vec<u8>, Error> {
-        self.managed.get_verified_blob(hash)
     }
 
     fn document_path(&self, document: &str) -> Result<PathBuf, Error> {
@@ -416,7 +433,7 @@ impl Store {
     }
 
     pub fn where_used(&self, reference: &VersionRef) -> Result<Vec<VersionRef>, Error> {
-        self.download(reference)?;
+        self.verify_reference(reference)?;
         let mut result = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -533,6 +550,7 @@ impl Store {
                 Error::Forbidden => "forbidden",
                 Error::Conflict => "conflict",
                 Error::Referenced => "referenced",
+                Error::TransferRequired => "transfer_required",
                 Error::NotFound => "not_found",
                 Error::Invalid(_) => "invalid_request",
                 Error::Integrity => "integrity",

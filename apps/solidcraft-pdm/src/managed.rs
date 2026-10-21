@@ -16,6 +16,7 @@ const MAX_METADATA_STORAGE: u64 = 64 * 1024 * 1024;
 mod administration;
 mod metadata_db;
 mod namespace;
+mod transfers;
 pub use namespace::{NamespaceAction, NamespaceCapabilities, NamespaceMetadata, NamespaceMutation};
 pub const NAMESPACE_CAPABILITIES_PATH: &str = "/pdm/v1/namespace-capabilities";
 pub const NAMESPACE_PROTOCOL: &str = "solidcraft-pdm-namespace/1";
@@ -136,6 +137,10 @@ struct Receipt {
 #[serde(deny_unknown_fields)]
 struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    transfers: Option<transfers::Ledger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_policy: Option<crate::stream_io::StreamPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     namespace: Option<namespace::NamespaceState>,
     server_id: String,
     checkout_tokens: BTreeMap<String, String>,
@@ -151,13 +156,20 @@ fn hash_id(value: &str) -> bool {
 
 impl State {
     fn validate(&self) -> Result<(), Error> {
+        if let Some(ledger) = &self.transfers {
+            ledger.validate(self)?;
+        }
+        if let Some(policy) = &self.stream_policy {
+            policy.validate()?;
+        }
         if let Some(namespace) = &self.namespace {
             namespace.validate(self)?;
         }
         if !hash_id(&self.server_id)
             || self.documents.len() > MAX_VERSIONS
             || self.versions.len() > MAX_VERSIONS
-            || self.content_bytes > MAX_STORED_CONTENT
+            || self.content_bytes
+                > self.stream_policy.as_ref().map_or(MAX_STORED_CONTENT, |_| crate::stream_io::HARD_FILE_BYTES.saturating_mul(MAX_VERSIONS as u64))
             || self.receipts.len() != self.versions.len()
         {
             return Err(Error::Integrity);
@@ -289,7 +301,7 @@ pub fn validate_logical_path(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_inventory(inventory: &[BlobReceipt]) -> Result<(), Error> {
+fn validate_inventory(inventory: &[BlobReceipt], policy: Option<&crate::stream_io::StreamPolicy>) -> Result<(), Error> {
     if inventory.len() > MAX_VERSIONS {
         return Err(Error::Invalid("blob inventory quota"));
     }
@@ -297,11 +309,11 @@ fn validate_inventory(inventory: &[BlobReceipt]) -> Result<(), Error> {
     let mut total = 0u64;
     for item in inventory {
         validate_digest(&item.sha256)?;
-        if !seen.insert(&item.sha256) || item.bytes > MAX_CONTENT as u64 {
+        if !seen.insert(&item.sha256) || item.bytes > policy.map_or(MAX_CONTENT as u64, |_| crate::stream_io::HARD_FILE_BYTES) {
             return Err(Error::Integrity);
         }
         total = total.checked_add(item.bytes).ok_or(Error::Integrity)?;
-        if total > MAX_STORED_CONTENT {
+        if total > policy.map_or(MAX_STORED_CONTENT, |p| p.max_store_bytes) {
             return Err(Error::Invalid("blob inventory quota"));
         }
     }
@@ -309,9 +321,53 @@ fn validate_inventory(inventory: &[BlobReceipt]) -> Result<(), Error> {
 }
 
 impl ManagedStore {
+    fn validate_stream_policy(&self) -> Result<(), Error> {
+        if crate::stream_io::StreamPolicy::read(&self.root)? != self.state.stream_policy {
+            return Err(Error::Integrity);
+        }
+        Ok(())
+    }
+    pub(crate) fn stream_policy(&self) -> Option<&crate::stream_io::StreamPolicy> {
+        self.state.stream_policy.as_ref()
+    }
+    pub(crate) fn initialize_streaming(&mut self, policy: crate::stream_io::StreamPolicy) -> Result<(), Error> {
+        policy.validate()?;
+        if self.metadata.is_none()
+            || self.blobs.binding() != BlobBinding::Filesystem
+            || self.state.stream_policy.is_some()
+            || !self.state.documents.is_empty()
+            || !self.state.versions.is_empty()
+            || !self.blobs.inventory()?.is_empty()
+        {
+            return Err(Error::Invalid("streaming initialization requires empty transactional filesystem archive"));
+        }
+        let pending = self.root.join(crate::stream_io::PENDING);
+        crate::write_synced(&pending, b"Incomplete stream policy initialization; restore into a new destination.\n")?;
+        let mut state = self.state.clone();
+        state.stream_policy = Some(policy.clone());
+        state.transfers = Some(transfers::Ledger::new()?);
+        self.publish_as(state, "system", "import")?;
+        crate::write_synced(&self.root.join(crate::stream_io::POLICY), &serde_json::to_vec(&policy)?)?;
+        fs::remove_file(pending)?;
+        self.validate_stream_policy()?;
+        self.blobs = Box::new(FsBlobStore::open(&self.root)?);
+        Ok(())
+    }
+    pub(crate) fn open_blob_stream(&self, hash: &str) -> Result<Box<dyn std::io::Read + Send>, Error> {
+        self.blobs.open_verified_stream(hash)
+    }
+    pub(crate) fn verify_reference(&self, reference: &VersionRef) -> Result<Version, Error> {
+        let version = self.state.versions.iter().find(|v| v.version.reference == *reference).ok_or(Error::NotFound)?.version.clone();
+        let mut stream = self.open_blob_stream(&version.sha256)?;
+        let limit = self.state.stream_policy.as_ref().map_or(MAX_CONTENT as u64, |_| crate::stream_io::HARD_FILE_BYTES);
+        if crate::stream_io::copy_hash(&mut stream, &mut std::io::sink(), limit)?.sha256 != version.sha256 {
+            return Err(Error::Integrity);
+        }
+        Ok(version)
+    }
     pub(crate) fn blob_inventory(&self) -> Result<Vec<BlobReceipt>, Error> {
         let inventory = self.blobs.inventory()?;
-        validate_inventory(&inventory)?;
+        validate_inventory(&inventory, self.state.stream_policy.as_ref())?;
         Ok(inventory)
     }
     pub(crate) fn get_verified_blob(&self, hash: &str) -> Result<Vec<u8>, Error> {
@@ -339,7 +395,9 @@ impl ManagedStore {
     pub(crate) fn open(store_root: &Path) -> Result<Self, Error> {
         let root = store_root.join("managed");
         let blobs = Box::new(FsBlobStore::open(&root)?);
-        Self::open_inner(root, blobs, true)
+        let store = Self::open_inner(root, blobs, true)?;
+        store.validate_stream_policy()?;
+        Ok(store)
     }
     pub(crate) fn open_portable_snapshot(store_root: &Path) -> Result<Self, Error> {
         let root = store_root.join("managed");
@@ -348,7 +406,9 @@ impl ManagedStore {
             return Err(Error::Integrity);
         }
         let blobs = Box::new(FsBlobStore::open(&root)?);
-        Self::open_inner(root, blobs, false)
+        let store = Self::open_inner(root, blobs, false)?;
+        store.validate_stream_policy()?;
+        Ok(store)
     }
     pub(crate) fn open_external(store_root: &Path, blobs: Box<dyn BlobStore>) -> Result<Self, Error> {
         let binding = blobs.binding();
@@ -392,7 +452,7 @@ impl ManagedStore {
         // One bounded inventory call covers the whole startup preflight. No
         // per-version GET loop or fallback can hide a missing provider namespace.
         let inventory = blobs.inventory()?;
-        validate_inventory(&inventory)?;
+        validate_inventory(&inventory, None)?;
         let store = Self::open_inner(root, blobs, fresh)?;
         store.snapshot_from_inventory(&inventory)?;
         Ok(store)
@@ -696,6 +756,19 @@ impl ManagedStore {
 
     pub(crate) fn download(&self, reference: &VersionRef) -> Result<(Version, Vec<u8>), Error> {
         let version = &self.state.versions.iter().find(|v| v.version.reference == *reference).ok_or(Error::NotFound)?.version;
+        if let Some(policy) = &self.state.stream_policy {
+            let mut content = self.open_blob_stream(&version.sha256)?;
+            let mut prefix = Vec::new();
+            use std::io::Read;
+            content.by_ref().take(MAX_CONTENT as u64 + 1).read_to_end(&mut prefix)?;
+            if prefix.len() > MAX_CONTENT {
+                return Err(Error::TransferRequired);
+            }
+            if prefix.len() as u64 > policy.max_file_bytes || digest(&prefix) != version.sha256 {
+                return Err(Error::Integrity);
+            }
+            return Ok((version.clone(), prefix));
+        }
         let content = self.get_verified_blob(&version.sha256)?;
         Ok((version.clone(), content))
     }
@@ -731,7 +804,8 @@ impl ManagedStore {
             return Err(Error::Conflict);
         }
         if self.state.versions.len() >= MAX_VERSIONS
-            || self.state.content_bytes.checked_add(input.content.len() as u64).is_none_or(|bytes| bytes > MAX_STORED_CONTENT)
+            || (self.state.stream_policy.is_none()
+                && self.state.content_bytes.checked_add(input.content.len() as u64).is_none_or(|bytes| bytes > MAX_STORED_CONTENT))
         {
             return Err(Error::Invalid("managed storage quota"));
         }
@@ -743,7 +817,7 @@ impl ManagedStore {
             if dependency.document == input.document || !unique.insert(dependency) {
                 return Err(Error::Invalid("self or duplicate dependency"));
             }
-            self.download(dependency)?;
+            self.verify_reference(dependency)?;
         }
         let number = entry.head.unwrap_or(0).checked_add(1).ok_or(Error::Invalid("version exhausted"))?;
         let version = ManagedVersion {
@@ -758,6 +832,15 @@ impl ManagedStore {
             comment: input.comment,
             request_id: input.request_id.clone(),
         };
+        if let Some(policy) = &self.state.stream_policy {
+            let reserved = self.reserved_transfer_bytes()?;
+            let inventory = self.blob_inventory()?;
+            let used = inventory.iter().try_fold(0u64, |sum, b| sum.checked_add(b.bytes).ok_or(Error::Integrity))?;
+            let incoming = if inventory.iter().any(|b| b.sha256 == version.version.sha256) { 0 } else { input.content.len() as u64 };
+            if used.checked_add(reserved).and_then(|n| n.checked_add(incoming)).is_none_or(|n| n > policy.max_store_bytes) {
+                return Err(Error::Invalid("managed storage quota reserved by transfers"));
+            }
+        }
         let receipt = self.blobs.put_verified_if_absent(&version.version.sha256, &input.content)?;
         if receipt.sha256 != version.version.sha256 || receipt.bytes != input.content.len() as u64 {
             return Err(Error::Integrity);

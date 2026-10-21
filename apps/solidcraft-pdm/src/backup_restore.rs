@@ -1,6 +1,11 @@
 //! Offline, bounded, verified backup/restore foundation. No power-loss durability claim.
 //! Backups contain private metadata, including checkout capabilities; protect their directory.
-use crate::{Error, MAX_CONTENT, MAX_STORED_CONTENT, MAX_VERSIONS, Store, blob_store::BlobReceipt, digest};
+use crate::{
+    Error, MAX_CONTENT, MAX_STORED_CONTENT, MAX_VERSIONS, Store,
+    blob_store::BlobReceipt,
+    digest,
+    stream_io::{self, StreamPolicy},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -26,6 +31,8 @@ struct BackupFile {
 #[serde(deny_unknown_fields)]
 struct Manifest {
     format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_policy: Option<StreamPolicy>,
     server_id: String,
     files: Vec<BackupFile>,
 }
@@ -56,6 +63,7 @@ fn allowed(path: &str) -> bool {
         }
         ["managed", "generations", generation, "state.json"] => number(generation),
         ["managed", "metadata-snapshot.json"] => true,
+        ["managed", "stream-policy.json"] => true,
         _ => false,
     }
 }
@@ -105,6 +113,7 @@ fn collect(
         if ignore_uncommitted
             && (relative == "writer.lock"
                 || relative == "managed/blobs"
+                || relative == "managed/uploads"
                 || relative == "managed/blob-provider.json"
                 || relative == "managed/blobs/pending"
                 || relative == "managed/generations/pending"
@@ -146,12 +155,12 @@ fn verify_domain(store: &Store) -> Result<(), Error> {
         if !hex(&version.sha256) || !crate::valid_id(&version.reference.document) || version.dependencies.len() > crate::MAX_DEPENDENCIES {
             return Err(Error::Integrity);
         }
-        let (verified, _) = store.download(&version.reference)?;
+        let verified = store.verify_reference(&version.reference)?;
         if verified != version {
             return Err(Error::Integrity);
         }
         for dependency in version.dependencies {
-            store.download(&dependency)?;
+            store.verify_reference(&dependency)?;
         }
     }
     Ok(())
@@ -167,7 +176,9 @@ impl Store {
         // supported or made safe by this process-local lock.
         let snapshot = self.managed_snapshot()?;
         let mut inventory = self.blob_inventory()?;
-        validate_inventory(&inventory)?;
+        let policy = self.managed.stream_policy().cloned();
+        validate_inventory(&inventory, policy.as_ref())?;
+        let max_bytes = policy.as_ref().map_or(MAX_BYTES, |p| p.max_store_bytes.saturating_add(MAX_BYTES));
         let referenced: BTreeSet<_> = snapshot.digests.iter().collect();
         let available: BTreeSet<_> = inventory.iter().map(|blob| &blob.sha256).collect();
         if !referenced.is_subset(&available) {
@@ -190,21 +201,21 @@ impl Store {
         let mut files = Vec::new();
         let mut total = 0u64;
         for path in paths {
-            let bytes = crate::client::read_file(&source.join(&path), MAX_FILE)?;
-            total = total.checked_add(bytes.len() as u64).ok_or(Error::Invalid("backup size quota"))?;
-            if total > MAX_BYTES {
+            let (_, receipt) = stream_io::verified_file(&source.join(&path), MAX_FILE as u64)?;
+            total = total.checked_add(receipt.bytes).ok_or(Error::Invalid("backup size quota"))?;
+            if total > max_bytes {
                 return Err(Error::Invalid("backup size quota"));
             }
             let target = data.join(&path);
             fs::create_dir_all(target.parent().ok_or(Error::Integrity)?)?;
-            crate::write_synced(&target, &bytes)?;
-            files.push(BackupFile { path, bytes: bytes.len() as u64, sha256: digest(&bytes) });
+            stream_io::copy_new(&source.join(&path), &target, &receipt, MAX_FILE as u64)?;
+            files.push(BackupFile { path, bytes: receipt.bytes, sha256: receipt.sha256 });
         }
         // Export the committed logical aggregate, never copy an open redb file.
         // The store lock and immutable borrow exclude domain mutations throughout.
         if let Some(bytes) = self.managed.database_snapshot()? {
             total = total.checked_add(bytes.len() as u64).ok_or(Error::Invalid("backup size quota"))?;
-            if total > MAX_BYTES {
+            if total > max_bytes {
                 return Err(Error::Invalid("backup size quota"));
             }
             let path = "managed/metadata-snapshot.json".to_owned();
@@ -216,16 +227,17 @@ impl Store {
         // authority for both referenced bytes and complete published orphan blobs.
         fs::create_dir_all(data.join("managed/blobs"))?;
         for blob in inventory {
-            let bytes = self.get_verified_blob(&blob.sha256)?;
-            if bytes.len() > MAX_CONTENT || bytes.len() as u64 != blob.bytes || digest(&bytes) != blob.sha256 {
-                return Err(Error::Integrity);
-            }
             total = total.checked_add(blob.bytes).ok_or(Error::Invalid("backup size quota"))?;
-            if total > MAX_BYTES || files.len() >= MAX_FILES {
+            if total > max_bytes || files.len() >= MAX_FILES {
                 return Err(Error::Invalid("backup quota"));
             }
             let path = format!("managed/blobs/{}", blob.sha256);
-            crate::write_synced(&data.join(&path), &bytes)?;
+            let mut input = self.managed.open_blob_stream(&blob.sha256)?;
+            let mut output = OpenOptions::new().write(true).create_new(true).open(data.join(&path))?;
+            if stream_io::copy_hash(&mut input, &mut output, policy.as_ref().map_or(MAX_CONTENT as u64, |_| stream_io::HARD_FILE_BYTES))? != blob {
+                return Err(Error::Integrity);
+            }
+            output.sync_all()?;
             files.push(BackupFile { path, bytes: blob.bytes, sha256: blob.sha256 });
         }
         // Re-open copied metadata without creating a lock file in the immutable backup.
@@ -244,7 +256,12 @@ impl Store {
             return Err(Error::Integrity);
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
-        let manifest = Manifest { format: FORMAT.into(), server_id: snapshot.server_id, files };
+        let manifest = Manifest {
+            format: if policy.is_some() { "solidcraft-pdm-backup/2" } else { FORMAT }.into(),
+            stream_policy: policy,
+            server_id: snapshot.server_id,
+            files,
+        };
         let bytes = serde_json::to_vec_pretty(&manifest)?;
         if bytes.len() > MAX_MANIFEST {
             return Err(Error::Invalid("backup manifest quota"));
@@ -255,18 +272,18 @@ impl Store {
     }
 }
 
-fn validate_inventory(inventory: &[BlobReceipt]) -> Result<(), Error> {
+fn validate_inventory(inventory: &[BlobReceipt], policy: Option<&StreamPolicy>) -> Result<(), Error> {
     if inventory.len() > MAX_VERSIONS {
         return Err(Error::Invalid("backup blob count"));
     }
     let mut hashes = BTreeSet::new();
     let mut total = 0u64;
     for blob in inventory {
-        if !hex(&blob.sha256) || blob.bytes > MAX_CONTENT as u64 || !hashes.insert(&blob.sha256) {
+        if !hex(&blob.sha256) || blob.bytes > policy.map_or(MAX_CONTENT as u64, |_| stream_io::HARD_FILE_BYTES) || !hashes.insert(&blob.sha256) {
             return Err(Error::Integrity);
         }
         total = total.checked_add(blob.bytes).ok_or(Error::Integrity)?;
-        if total > MAX_STORED_CONTENT {
+        if total > policy.map_or(MAX_STORED_CONTENT, |p| p.max_store_bytes) {
             return Err(Error::Invalid("backup blob quota"));
         }
     }
@@ -277,19 +294,31 @@ fn manifest(root: &Path) -> Result<(Manifest, Vec<u8>), Error> {
     crate::reject_symlink_ancestors(root)?;
     let bytes = crate::client::read_file(&root.join("backup.json"), MAX_MANIFEST)?;
     let manifest: Manifest = serde_json::from_slice(&bytes)?;
-    if manifest.format != FORMAT || !hex(&manifest.server_id) || manifest.files.is_empty() || manifest.files.len() > MAX_FILES {
+    let expected_format = if manifest.stream_policy.is_some() { "solidcraft-pdm-backup/2" } else { FORMAT };
+    if let Some(policy) = &manifest.stream_policy {
+        policy.validate()?;
+    }
+    if manifest.format != expected_format || !hex(&manifest.server_id) || manifest.files.is_empty() || manifest.files.len() > MAX_FILES {
         return Err(Error::Integrity);
     }
     let mut names = BTreeSet::new();
     let mut total = 0u64;
     for file in &manifest.files {
-        if !allowed(&file.path) || !hex(&file.sha256) || file.bytes > MAX_FILE as u64 || !names.insert(&file.path) {
+        let limit = if file.path.starts_with("managed/blobs/") {
+            manifest.stream_policy.as_ref().map_or(MAX_FILE as u64, |_| stream_io::HARD_FILE_BYTES)
+        } else {
+            MAX_FILE as u64
+        };
+        if !allowed(&file.path) || !hex(&file.sha256) || file.bytes > limit || !names.insert(&file.path) {
             return Err(Error::Integrity);
         }
         total = total.checked_add(file.bytes).ok_or(Error::Integrity)?;
-        if total > MAX_BYTES {
+        if total > manifest.stream_policy.as_ref().map_or(MAX_BYTES, |p| p.max_store_bytes.saturating_add(MAX_BYTES)) {
             return Err(Error::Invalid("backup size quota"));
         }
+    }
+    if names.contains(&"managed/stream-policy.json".to_owned()) != manifest.stream_policy.is_some() {
+        return Err(Error::Integrity);
     }
     if !manifest.files.iter().any(|file| file.path.starts_with("managed/generations/") || file.path == "managed/metadata-snapshot.json") {
         return Err(Error::Integrity);
@@ -312,14 +341,17 @@ pub fn verify_backup(root: &Path) -> Result<BackupReceipt, Error> {
     }
     let mut total = 0;
     for file in &manifest.files {
-        let content = crate::client::read_file(&data.join(&file.path), MAX_FILE)?;
-        if content.len() as u64 != file.bytes || digest(&content) != file.sha256 {
+        let (_, receipt) = stream_io::verified_file(&data.join(&file.path), file.bytes)?;
+        if receipt.bytes != file.bytes || receipt.sha256 != file.sha256 {
             return Err(Error::Integrity);
         }
         total += file.bytes;
     }
+    if StreamPolicy::read(&data.join("managed"))? != manifest.stream_policy {
+        return Err(Error::Integrity);
+    }
     Ok(BackupReceipt {
-        format: FORMAT.into(),
+        format: manifest.format,
         server_id: manifest.server_id,
         files: manifest.files.len() as u64,
         bytes: total,
@@ -341,13 +373,14 @@ fn restore_backup_inner(source: &Path, destination: &Path, database: bool) -> Re
     lock.try_lock().map_err(|_| Error::Invalid("restore destination is open"))?;
     crate::write_synced(&destination.join("restore.pending"), b"Restore incomplete; preserve and restore into another new directory.\n")?;
     for file in &manifest.files {
-        let bytes = crate::client::read_file(&source.join("data").join(&file.path), MAX_FILE)?;
-        if bytes.len() as u64 != file.bytes || digest(&bytes) != file.sha256 {
-            return Err(Error::Integrity);
-        }
         let target = destination.join(&file.path);
         fs::create_dir_all(target.parent().ok_or(Error::Integrity)?)?;
-        crate::write_synced(&target, &bytes)?;
+        stream_io::copy_new(
+            &source.join("data").join(&file.path),
+            &target,
+            &BlobReceipt { bytes: file.bytes, sha256: file.sha256.clone() },
+            file.bytes,
+        )?;
     }
     let managed = crate::managed::ManagedStore::open(destination)?;
     let mut store = Store { root: destination.to_path_buf(), _lock: lock, managed };
@@ -360,6 +393,7 @@ fn restore_backup_inner(source: &Path, destination: &Path, database: bool) -> Re
     if database {
         store.managed.convert_restored_to_database()?;
     }
+    store.managed.reset_transfers_after_restore()?;
     fs::remove_file(destination.join("restore.pending"))?;
     Ok(receipt)
 }

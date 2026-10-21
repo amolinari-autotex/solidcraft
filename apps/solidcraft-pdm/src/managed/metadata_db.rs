@@ -168,6 +168,8 @@ impl Image {
                         | "checkout"
                         | "cancel_checkout"
                         | "check_in"
+                        | "transfer.begin"
+                        | "transfer.cancel"
                         | "document.rename"
                         | "document.tombstone"
                         | "user.create"
@@ -393,6 +395,43 @@ mod tests {
         assert_eq!(version.version.reference.version, 1);
         assert_eq!(store.managed.check_in(&principal, input).unwrap(), version);
         assert_eq!(store.managed.metadata.as_ref().unwrap().image.audit.len(), 4);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_transfer_cancel_intent_preserves_prefix_and_retry_is_idempotent() {
+        use crate::transfers::{TransferInput, TransferTarget};
+        let root = std::env::temp_dir().join(format!("pdm-cancel-intent-{}", crate::AuthToken::generate().unwrap()));
+        let principal = super::super::Principal { id: "alice".into(), role: super::super::Role::Contributor };
+        let mut store = crate::Store::open(&root).unwrap();
+        store.managed.convert_restored_to_database().unwrap();
+        store
+            .initialize_streaming(crate::stream_io::StreamPolicy { version: 1, max_file_bytes: 2 * 1024 * 1024, max_store_bytes: 4 * 1024 * 1024 })
+            .unwrap();
+        let caps = store.managed.transfer_capabilities(&principal);
+        let bytes = b"private disposable bytes";
+        let input = TransferInput {
+            server_id: caps.server_id,
+            recovery_epoch: caps.recovery_epoch,
+            request_id: "cancel-test".into(),
+            target: TransferTarget::NewOnly { logical_path: "cancel.bin".into() },
+            total_bytes: bytes.len() as u64,
+            sha256: crate::digest(bytes),
+            dependencies: vec![],
+            comment: String::new(),
+        };
+        let progress = store.managed.begin_transfer(&principal, input).unwrap();
+        store.managed.transfer_chunk(&principal, &progress.transfer_id, 0, bytes, &crate::digest(bytes)).unwrap();
+        store.managed.metadata.as_mut().unwrap().abort_next = true;
+        assert!(store.managed.cancel_transfer(&principal, &progress.transfer_id).is_err());
+        assert_eq!(store.managed.transfer_status(&principal, &progress.transfer_id).unwrap().offset, bytes.len() as u64);
+        drop(store);
+        let mut store = crate::Store::open(&root).unwrap();
+        assert_eq!(store.managed.transfer_status(&principal, &progress.transfer_id).unwrap().offset, bytes.len() as u64);
+        store.managed.cancel_transfer(&principal, &progress.transfer_id).unwrap();
+        store.managed.cancel_transfer(&principal, &progress.transfer_id).unwrap();
+        assert!(store.managed.catalog().entries.is_empty());
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

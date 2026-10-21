@@ -58,9 +58,13 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     file.sync_all()?;
     Ok(())
 }
-fn prepare(root: &Path) -> Result<(), Error> {
+fn prepare(root: &Path, stream_policy: Option<solidcraft_pdm::stream_io::StreamPolicy>) -> Result<(), Error> {
     let mut service = Service::new(MemoryCredentials::default());
-    service.perform(Action::Create { root: root.to_owned(), administrator: ADMIN.into(), port: 0 })?;
+    let create = match stream_policy {
+        Some(stream_policy) => Action::CreateConfigured { root: root.to_owned(), administrator: ADMIN.into(), port: 0, stream_policy },
+        None => Action::Create { root: root.to_owned(), administrator: ADMIN.into(), port: 0 },
+    };
+    service.perform(create)?;
     service.perform(Action::CreateUser { id: AUTHOR.into(), role: Role::Contributor })?;
     let snapshot = service.snapshot.clone();
     let certificate_der_path = root.join("tls/certificate.der");
@@ -209,7 +213,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: paired_fixture prepare NEW_ABSOLUTE_ROOT | proof OWNED_FIXTURE_ROOT".into());
     }
     match args.first().map(String::as_str) {
-        Some("prepare") => prepare(root)?,
+        Some("prepare") => prepare(root, None)?,
+        Some("prepare-stream") => prepare(
+            root,
+            Some(solidcraft_pdm::stream_io::StreamPolicy { version: 1, max_file_bytes: 8 * 1024 * 1024, max_store_bytes: 20 * 1024 * 1024 * 1024 }),
+        )?,
         Some("proof") => proof(root)?,
         _ => return Err("unknown paired fixture operation".into()),
     }

@@ -8,6 +8,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+mod transfers;
 
 #[derive(Clone)]
 pub struct Client {
@@ -375,6 +376,7 @@ impl Client {
                 | "conflict"
                 | "not_found"
                 | "referenced"
+                | "transfer_required"
                 | "invalid_request"
                 | "integrity"
                 | "storage_error"

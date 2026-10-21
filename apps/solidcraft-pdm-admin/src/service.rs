@@ -9,6 +9,7 @@ use solidcraft_pdm::{
     client::Client,
     http_server::{HttpsConfig, HttpsServer},
     managed::Role,
+    stream_io::StreamPolicy,
 };
 use std::{
     fs,
@@ -22,6 +23,20 @@ fn invalid(reason: &'static str) -> Error {
 }
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+pub fn default_stream_policy() -> StreamPolicy {
+    StreamPolicy { version: 1, max_file_bytes: 512 * 1024 * 1024, max_store_bytes: 20 * 1024 * 1024 * 1024 }
+}
+/// Pure conversion for the new-installation controls; the worker validates the
+/// byte policy again before creating any directory or administrator authority.
+pub fn stream_policy_from_units(file_mib: u64, archive_gib: u64) -> Result<StreamPolicy, Error> {
+    let policy = StreamPolicy {
+        version: 1,
+        max_file_bytes: file_mib.checked_mul(1024 * 1024).ok_or(invalid("stream policy"))?,
+        max_store_bytes: archive_gib.checked_mul(1024 * 1024 * 1024).ok_or(invalid("stream policy"))?,
+    };
+    policy.validate()?;
+    Ok(policy)
 }
 fn path_check(path: &Path) -> Result<(), Error> {
     if !path.is_absolute() || path.components().any(|part| matches!(part, Component::ParentDir)) {
@@ -129,6 +144,8 @@ pub struct Installation {
     pub administrator: String,
     pub port: u16,
     certificate_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_policy: Option<StreamPolicy>,
 }
 impl Installation {
     fn origin(&self) -> String {
@@ -147,12 +164,32 @@ impl Installation {
         if !root.join("archive/managed/metadata.redb").is_file() {
             return Err(invalid("existing transactional archive required"));
         }
+        result.0.verify_saved_policy(root)?;
         Ok(result)
+    }
+    fn verify_saved_policy(&self, root: &Path) -> Result<(), Error> {
+        if let Some(expected) = &self.stream_policy {
+            expected.validate()?;
+            let managed = root.join("archive/managed");
+            path_check(&managed.join("stream-policy.pending"))?;
+            if managed.join("stream-policy.pending").try_exists()? {
+                return Err(invalid("incomplete stream policy initialization; preserve installation"));
+            }
+            let actual: StreamPolicy = serde_json::from_slice(&read(&managed.join("stream-policy.json"), 1024)?)?;
+            actual.validate()?;
+            if actual != *expected {
+                return Err(invalid("saved stream policy differs from installation intent"));
+            }
+        }
+        Ok(())
     }
     fn load_record(root: &Path, file: &str) -> Result<(Self, Vec<u8>, Vec<u8>), Error> {
         let record: Self = serde_json::from_slice(&read(&root.join(file), 16 * 1024)?)?;
         if record.version != 1 || record.port == 0 {
             return Err(invalid("unsupported console installation"));
+        }
+        if let Some(policy) = &record.stream_policy {
+            policy.validate()?;
         }
         let der = read(&root.join("tls/certificate.der"), 64 * 1024)?;
         if hash(&der) != record.certificate_sha256 {
@@ -183,6 +220,7 @@ pub struct Snapshot {
 }
 pub enum Action {
     Create { root: PathBuf, administrator: String, port: u16 },
+    CreateConfigured { root: PathBuf, administrator: String, port: u16, stream_policy: StreamPolicy },
     Open(PathBuf),
     Start,
     Stop,
@@ -237,6 +275,10 @@ impl<C: CredentialStore> Service<C> {
     fn execute(&mut self, action: Action) -> Result<String, Error> {
         match action {
             Action::Create { root, administrator, port } => {
+                self.execute(Action::CreateConfigured { root, administrator, port, stream_policy: default_stream_policy() })
+            }
+            Action::CreateConfigured { root, administrator, port, stream_policy } => {
+                stream_policy.validate()?;
                 self.require_stopped()?;
                 if self.root.is_some() {
                     self.require_no_pending()?;
@@ -270,6 +312,7 @@ impl<C: CredentialStore> Service<C> {
                         administrator: receipt.administrator.clone(),
                         port,
                         certificate_sha256: hash(&der),
+                        stream_policy: Some(stream_policy.clone()),
                     };
                     // Durable public trusted intent precedes secret capture and
                     // authority publication. Interrupted setup never invents identity.
@@ -282,7 +325,15 @@ impl<C: CredentialStore> Service<C> {
                 })?;
                 Store::open(&root.join("seed"))?.backup(&root.join("seed-backup"))?;
                 backup_restore::restore_backup_to_redb(&root.join("seed-backup"), &root.join("archive"))?;
-                let installation = Installation { version: 1, server_id: receipt.server_id, administrator, port, certificate_sha256: hash(&der) };
+                Store::open(&root.join("archive"))?.initialize_streaming(stream_policy.clone())?;
+                let installation = Installation {
+                    version: 1,
+                    server_id: receipt.server_id,
+                    administrator,
+                    port,
+                    certificate_sha256: hash(&der),
+                    stream_policy: Some(stream_policy),
+                };
                 installation.save(&root)?;
                 let previous_root = self.root.replace(root);
                 let previous_installation = self.installation.replace(installation);
@@ -410,13 +461,24 @@ impl<C: CredentialStore> Service<C> {
             return Err(invalid("interrupted seed backup identity mismatch"));
         }
         let archive = root.join("archive");
-        if !archive.try_exists()? {
+        let restored_new = !archive.try_exists()?;
+        if restored_new {
             backup_restore::restore_backup_to_redb(&backup, &archive)?;
         }
         path_check(&archive.join("managed/metadata.redb"))?;
         if !archive.join("managed/metadata.redb").is_file() {
             return Err(invalid("interrupted restore; preserve installation and restore to a NEW location"));
         }
+        // Only an archive restored NEW in this recovery may be initialized.
+        // Existing archives must already contain the policy promised by the
+        // captured intent. A partial initialization fence remains an error.
+        {
+            let mut store = Store::open(&archive)?;
+            if restored_new && let Some(policy) = &record.stream_policy {
+                store.initialize_streaming(policy.clone())?;
+            }
+        }
+        record.verify_saved_policy(root)?;
         record.save(root)?;
         Ok(())
     }
@@ -436,6 +498,12 @@ impl<C: CredentialStore> Service<C> {
         let verification = (|| {
             let client = Client::https_with_ca(&record.origin(), AuthToken::parse(secret.expose().into())?, &der)?.bind_server(&record.server_id)?;
             self.verify(&record, &client.capabilities()?)?;
+            if let Some(policy) = &record.stream_policy {
+                let capabilities = client.transfer_capabilities()?.ok_or(invalid("binary transfer capabilities unavailable for new installation"))?;
+                if !capabilities.binary_transfer_v1 || capabilities.limits.as_ref() != Some(policy) {
+                    return Err(invalid("binary transfer capabilities differ from new installation policy"));
+                }
+            }
             Ok::<Client, Error>(client)
         })();
         let client = match verification {
@@ -663,6 +731,97 @@ mod tests {
         Ok(std::env::temp_dir().join(format!("solidcraft-console-test-{}", AuthToken::generate()?)))
     }
     #[test]
+    fn new_default_installation_negotiates_binary_transfers() -> Result<(), Error> {
+        let root = new_root()?;
+        let mut service = Service::new(MemoryCredentials::default());
+        service.perform(Action::Create { root: root.clone(), administrator: "operator".into(), port: 0 })?;
+        let capabilities = service.client()?.transfer_capabilities()?.ok_or(Error::Integrity)?;
+        assert!(capabilities.binary_transfer_v1);
+        let policy = capabilities.limits.ok_or(Error::Integrity)?;
+        assert_eq!(policy.max_file_bytes, 512 * 1024 * 1024);
+        assert_eq!(policy.max_store_bytes, 20 * 1024 * 1024 * 1024);
+        service.perform(Action::Stop)?;
+        drop(service);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    fn new_custom_stream_policy_is_durable_and_reports_precise_file_limit() -> Result<(), Error> {
+        use solidcraft_pdm::{
+            stream_io::StreamPolicy,
+            transfers::{TransferInput, TransferTarget},
+        };
+        let root = new_root()?;
+        let policy = StreamPolicy { version: 1, max_file_bytes: 2 * 1024 * 1024, max_store_bytes: 3 * 1024 * 1024 * 1024 };
+        let mut service = Service::new(MemoryCredentials::default());
+        service.perform(Action::CreateConfigured { root: root.clone(), administrator: "operator".into(), port: 0, stream_policy: policy.clone() })?;
+        let capabilities = service.client()?.transfer_capabilities()?.ok_or(Error::Integrity)?;
+        assert!(capabilities.binary_transfer_v1);
+        assert_eq!(capabilities.limits, Some(policy.clone()));
+        let disk: StreamPolicy = serde_json::from_slice(&read(&root.join("archive/managed/stream-policy.json"), 1024)?)?;
+        assert_eq!(disk, policy);
+        let input = TransferInput {
+            server_id: capabilities.server_id,
+            recovery_epoch: capabilities.recovery_epoch,
+            request_id: "oversized-policy-test".into(),
+            target: TransferTarget::NewOnly { logical_path: "oversized.bin".into() },
+            total_bytes: policy.max_file_bytes + 1,
+            sha256: "a".repeat(64),
+            dependencies: Vec::new(),
+            comment: String::new(),
+        };
+        assert!(
+            matches!(service.client()?.begin_transfer(input), Err(Error::FileTooLarge { actual, max }) if actual == policy.max_file_bytes + 1 && max == policy.max_file_bytes)
+        );
+        service.perform(Action::Stop)?;
+        service.perform(Action::Start)?;
+        assert_eq!(service.client()?.transfer_capabilities()?.ok_or(Error::Integrity)?.limits, Some(policy));
+        service.perform(Action::Stop)?;
+        drop(service);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    fn invalid_new_stream_policy_creates_no_root_or_authority() -> Result<(), Error> {
+        use solidcraft_pdm::stream_io::{HARD_FILE_BYTES, HARD_STORE_BYTES, StreamPolicy};
+        let mut service = Service::new(MemoryCredentials::default());
+        for policy in [
+            StreamPolicy { version: 1, max_file_bytes: 0, max_store_bytes: 1 },
+            StreamPolicy { version: 2, max_file_bytes: 1, max_store_bytes: 1 },
+            StreamPolicy { version: 1, max_file_bytes: HARD_FILE_BYTES + 1, max_store_bytes: HARD_STORE_BYTES },
+            StreamPolicy { version: 1, max_file_bytes: 2, max_store_bytes: 1 },
+            StreamPolicy { version: 1, max_file_bytes: 1, max_store_bytes: HARD_STORE_BYTES + 1 },
+        ] {
+            let root = new_root()?;
+            assert!(
+                service
+                    .perform(Action::CreateConfigured { root: root.clone(), administrator: "operator".into(), port: 0, stream_policy: policy })
+                    .is_err()
+            );
+            assert!(!root.exists());
+            assert!(service.credentials.0.borrow().is_empty());
+        }
+        Ok(())
+    }
+    #[test]
+    fn existing_prepared_archive_missing_stream_policy_is_not_silently_upgraded() -> Result<(), Error> {
+        let root = new_root()?;
+        let mut service = Service::new(MemoryCredentials::default());
+        service.perform(Action::Create { root: root.clone(), administrator: "operator".into(), port: 0 })?;
+        service.perform(Action::Stop)?;
+        let prepared = read(&root.join("prepared.json"), 16 * 1024)?;
+        fs::remove_file(root.join("console.json"))?;
+        fs::rename(root.join("archive/managed/stream-policy.json"), root.join("archive/managed/policy-held-for-test"))?;
+        assert!(service.perform(Action::Open(root.clone())).is_err());
+        assert!(!root.join("console.json").exists());
+        assert!(!root.join("archive/managed/stream-policy.json").exists());
+        assert_eq!(prepared, read(&root.join("prepared.json"), 16 * 1024)?);
+        assert!(!service.snapshot.running);
+        drop(service);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
     fn real_https_lifecycle_accounts_backup_restore_and_trust_rejection() -> Result<(), Error> {
         let root = new_root()?;
         let backup = new_root()?;
@@ -825,42 +984,48 @@ mod tests {
     }
     #[test]
     fn captured_prepared_enrollment_resumes_same_identity_without_reset() -> Result<(), Error> {
-        let root = new_root()?;
-        directory(&root)?;
-        directory(&root.join("tls"))?;
-        directory(&root.join("seed"))?;
-        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).map_err(|_| Error::Integrity)?;
-        let der = certificate.cert.der().to_vec();
-        publish(&root.join("tls/certificate.der"), &der)?;
-        publish(&root.join("tls/private-key.der"), &certificate.signing_key.serialize_der())?;
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let port = listener.local_addr()?.port();
-        let mut service = Service::new(MemoryCredentials::default());
-        let captured = bootstrap::initialize_to(&root.join("seed"), "operator", |receipt, bearer| {
-            let record = Installation {
-                version: 1,
-                server_id: receipt.server_id.clone(),
-                administrator: receipt.administrator.clone(),
-                port,
-                certificate_sha256: hash(&der),
-            };
-            publish(&root.join("prepared.json"), &serde_json::to_vec(&record)?)?;
-            let secret = BearerSecret::parse(bearer.into()).map_err(|_| Error::Integrity)?;
-            service.credentials.set(&record.key(&der, "operator")?, &secret).map_err(|_| Error::Integrity)?;
-            Err(invalid("injected interruption after durable capture"))
-        });
-        assert!(captured.is_err());
-        assert!(!root.join("seed/managed-principals.json").exists());
-        let (prepared, _, _) = Installation::load_record(&root, "prepared.json")?;
-        drop(listener);
-        service.perform(Action::Open(root.clone()))?;
-        service.perform(Action::Start)?;
-        assert_eq!(service.snapshot.server_id, prepared.server_id);
-        assert!(service.snapshot.verified);
-        assert_eq!(service.snapshot.administrator, "operator");
-        service.perform(Action::Stop)?;
-        drop(service);
-        fs::remove_dir_all(root)?;
+        for stream_policy in [None, Some(default_stream_policy())] {
+            let root = new_root()?;
+            directory(&root)?;
+            directory(&root.join("tls"))?;
+            directory(&root.join("seed"))?;
+            let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).map_err(|_| Error::Integrity)?;
+            let der = certificate.cert.der().to_vec();
+            publish(&root.join("tls/certificate.der"), &der)?;
+            publish(&root.join("tls/private-key.der"), &certificate.signing_key.serialize_der())?;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            let port = listener.local_addr()?.port();
+            let mut service = Service::new(MemoryCredentials::default());
+            let captured = bootstrap::initialize_to(&root.join("seed"), "operator", |receipt, bearer| {
+                let record = Installation {
+                    version: 1,
+                    server_id: receipt.server_id.clone(),
+                    administrator: receipt.administrator.clone(),
+                    port,
+                    certificate_sha256: hash(&der),
+                    stream_policy: stream_policy.clone(),
+                };
+                publish(&root.join("prepared.json"), &serde_json::to_vec(&record)?)?;
+                let secret = BearerSecret::parse(bearer.into()).map_err(|_| Error::Integrity)?;
+                service.credentials.set(&record.key(&der, "operator")?, &secret).map_err(|_| Error::Integrity)?;
+                Err(invalid("injected interruption after durable capture"))
+            });
+            assert!(captured.is_err());
+            assert!(!root.join("seed/managed-principals.json").exists());
+            let (prepared, _, _) = Installation::load_record(&root, "prepared.json")?;
+            drop(listener);
+            service.perform(Action::Open(root.clone()))?;
+            service.perform(Action::Start)?;
+            assert_eq!(service.snapshot.server_id, prepared.server_id);
+            assert!(service.snapshot.verified);
+            assert_eq!(service.snapshot.administrator, "operator");
+            let capabilities = service.client()?.transfer_capabilities()?.ok_or(Error::Integrity)?;
+            assert_eq!(capabilities.binary_transfer_v1, stream_policy.is_some());
+            assert_eq!(capabilities.limits, stream_policy);
+            service.perform(Action::Stop)?;
+            drop(service);
+            fs::remove_dir_all(root)?;
+        }
         Ok(())
     }
     #[test]

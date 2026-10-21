@@ -17,11 +17,12 @@ use std::{
 use tokio::sync::oneshot;
 const DEADLINE: Duration = Duration::from_secs(5);
 type Reply = HttpResponse<Full<Bytes>>;
-enum JobRequest {
+pub(crate) enum JobRequest {
     Rpc(Request),
     Extension(Option<AdminRequest>),
+    Transfer { call: crate::transfers::Call, epoch: Option<u64> },
 }
-type Job = (JobRequest, String, Option<String>, oneshot::Sender<(u16, Vec<u8>)>);
+pub(crate) type Job = (JobRequest, String, Option<String>, oneshot::Sender<crate::transfers::HttpReply>);
 pub struct HttpsServer {
     address: SocketAddr,
     listener: Option<HttpListener>,
@@ -46,23 +47,39 @@ impl HttpsServer {
         let (send, receive) = mpsc::sync_channel::<Job>(16);
         let writer = thread::Builder::new().name("pdm-writer".into()).spawn(move || {
             while let Ok((request, credential, expected, reply)) = receive.recv() {
+                let request = match request {
+                    JobRequest::Transfer { call, epoch } => {
+                        let _ = reply.send(store.execute_transfer(call, &credential, expected.as_deref().unwrap_or(""), epoch));
+                        continue;
+                    }
+                    other => other,
+                };
                 let (status, bytes) = match request {
                     JobRequest::Rpc(request) => (200, serde_json::to_vec(&store.execute_configured_for(request, &credential, expected.as_deref()))),
                     JobRequest::Extension(request) => {
                         let response = store.execute_extension(request, &credential, expected.as_deref().unwrap_or(""));
                         (response.status(), serde_json::to_vec(&response))
                     }
+                    JobRequest::Transfer { .. } => (500, Ok(b"{}".to_vec())),
                 };
                 let wire = match bytes {
-                    Ok(bytes) if bytes.len() <= MAX_FRAME as usize => (status, bytes),
-                    _ => (500, b"{}".to_vec()),
+                    Ok(bytes) if bytes.len() <= MAX_FRAME as usize => (status, bytes, vec![]),
+                    _ => (500, b"{}".to_vec(), vec![]),
                 };
                 let _ = reply.send(wire);
             }
         })?;
+        let transfer_permits = Arc::new(crate::http_transfer::Admission::new());
         let handler: Handler = Arc::new(move |request| {
             let send = send.clone();
+            let permits = transfer_permits.clone();
             Box::pin(async move {
+                if request.uri().path() == crate::transfers::CAPABILITIES_PATH
+                    || request.uri().path().starts_with("/pdm/v1/transfers")
+                    || request.uri().path().starts_with("/pdm/v1/content/")
+                {
+                    return crate::http_transfer::serve(request, send, permits).await;
+                }
                 match rpc(request, send).await {
                     Ok(reply) => reply,
                     Err(never) => match never {},
@@ -192,7 +209,7 @@ async fn rpc(request: HttpRequest<Incoming>, send: mpsc::SyncSender<Job>) -> Res
         return Ok(reply(StatusCode::SERVICE_UNAVAILABLE, "{}"));
     }
     match tokio::time::timeout(DEADLINE, receive).await {
-        Ok(Ok((status, bytes))) => Ok(reply(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), bytes)),
+        Ok(Ok((status, bytes, _))) => Ok(reply(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), bytes)),
         _ => Ok(reply(StatusCode::SERVICE_UNAVAILABLE, "{}")),
     }
 }

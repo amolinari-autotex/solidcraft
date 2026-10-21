@@ -9,6 +9,7 @@
 use crate::{Error, MAX_CONTENT, MAX_STORED_CONTENT, MAX_VERSIONS, digest};
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -39,11 +40,22 @@ pub trait BlobStore: Send {
     fn put_verified_if_absent(&mut self, sha256: &str, content: &[u8]) -> Result<BlobReceipt, Error>;
     fn get_verified(&self, sha256: &str) -> Result<Vec<u8>, Error>;
     fn inventory(&self) -> Result<Vec<BlobReceipt>, Error>;
+    fn open_verified_stream(&self, sha256: &str) -> Result<Box<dyn Read + Send>, Error> {
+        let bytes = self.get_verified(sha256)?;
+        if bytes.len() > MAX_CONTENT || digest(&bytes) != sha256 {
+            return Err(Error::Integrity);
+        }
+        Ok(Box::new(std::io::Cursor::new(bytes)))
+    }
+    fn put_stream_if_absent(&mut self, _sha256: &str, _bytes: u64, _reader: &mut dyn Read) -> Result<BlobReceipt, Error> {
+        Err(Error::Invalid("streaming provider unsupported"))
+    }
 }
 
 /// Uses the existing managed-root/blobs/<lowercase-sha256> layout.
 pub struct FsBlobStore {
     directory: PathBuf,
+    policy: Option<crate::stream_io::StreamPolicy>,
 }
 
 pub(crate) fn validate_digest(value: &str) -> Result<(), Error> {
@@ -74,6 +86,7 @@ fn reject_links(path: &Path) -> Result<(), Error> {
 
 impl FsBlobStore {
     pub fn open(managed_root: &Path) -> Result<Self, Error> {
+        let policy = crate::stream_io::StreamPolicy::read(managed_root)?;
         // Preserve Store::open's existing support for trusted relative roots,
         // without canonicalizing away a pre-existing symlink or junction.
         let directory = std::path::absolute(managed_root)?.join("blobs");
@@ -85,7 +98,7 @@ impl FsBlobStore {
         reject_links(&directory)?;
         fs::create_dir_all(&directory)?;
         reject_links(&directory)?;
-        let store = Self { directory };
+        let store = Self { directory, policy };
         store.scan()?;
         Ok(store)
     }
@@ -95,6 +108,15 @@ impl FsBlobStore {
         let path = self.directory.join(sha256);
         reject_links(&path)?;
         Ok(path)
+    }
+    fn file_limit(&self) -> u64 {
+        self.policy.as_ref().map_or(MAX_CONTENT as u64, |p| p.max_file_bytes)
+    }
+    fn read_limit(&self) -> u64 {
+        if self.policy.is_some() { crate::stream_io::HARD_FILE_BYTES } else { MAX_CONTENT as u64 }
+    }
+    fn store_limit(&self) -> u64 {
+        self.policy.as_ref().map_or(MAX_STORED_CONTENT, |p| p.max_store_bytes)
     }
 
     /// Count even a leftover staging file against both quotas. Unknown entries
@@ -113,11 +135,11 @@ impl FsBlobStore {
             let path = entry.path();
             reject_links(&path)?;
             let metadata = fs::symlink_metadata(&path)?;
-            if !metadata.is_file() || metadata.len() > MAX_CONTENT as u64 {
+            if !metadata.is_file() || metadata.len() > self.read_limit() {
                 return Err(Error::Integrity);
             }
             bytes = bytes.checked_add(metadata.len()).ok_or(Error::Integrity)?;
-            if bytes > MAX_STORED_CONTENT {
+            if bytes > self.store_limit() {
                 return Err(Error::Invalid("blob storage quota"));
             }
             let name = entry.file_name();
@@ -142,7 +164,7 @@ impl BlobStore for FsBlobStore {
     }
     fn put_verified_if_absent(&mut self, sha256: &str, content: &[u8]) -> Result<BlobReceipt, Error> {
         let path = self.path(sha256)?;
-        if content.len() > MAX_CONTENT {
+        if content.len() > MAX_CONTENT || content.len() as u64 > self.file_limit() {
             return Err(Error::Invalid("blob content size"));
         }
         if digest(content) != sha256 {
@@ -160,7 +182,7 @@ impl BlobStore for FsBlobStore {
             Err(error) => return Err(error.into()),
         }
         let (blobs, _, bytes) = self.scan()?;
-        if blobs.len() >= MAX_VERSIONS || bytes.checked_add(content.len() as u64).is_none_or(|sum| sum > MAX_STORED_CONTENT) {
+        if blobs.len() >= MAX_VERSIONS || bytes.checked_add(content.len() as u64).is_none_or(|sum| sum > self.store_limit()) {
             return Err(Error::Invalid("blob storage quota"));
         }
         // create_new refuses a leftover or another writer's staging file. Never
@@ -199,12 +221,62 @@ impl BlobStore for FsBlobStore {
     fn inventory(&self) -> Result<Vec<BlobReceipt>, Error> {
         let (blobs, _, _) = self.scan()?;
         for blob in &blobs {
-            let content = self.get_verified(&blob.sha256)?;
-            if content.len() as u64 != blob.bytes {
+            let (_, actual) = crate::stream_io::verified_file(&self.path(&blob.sha256)?, self.read_limit())?;
+            if actual != *blob {
                 return Err(Error::Integrity);
             }
         }
         Ok(blobs)
+    }
+    fn open_verified_stream(&self, sha256: &str) -> Result<Box<dyn Read + Send>, Error> {
+        let (file, receipt) = crate::stream_io::verified_file(&self.path(sha256)?, self.read_limit())?;
+        if receipt.sha256 != sha256 {
+            return Err(Error::Integrity);
+        }
+        Ok(Box::new(file))
+    }
+    fn put_stream_if_absent(&mut self, sha256: &str, bytes: u64, reader: &mut dyn Read) -> Result<BlobReceipt, Error> {
+        let target = self.path(sha256)?;
+        if self.policy.is_none() || bytes > self.file_limit() {
+            return Err(Error::Invalid("streaming file limit"));
+        }
+        let expected = BlobReceipt { sha256: sha256.into(), bytes };
+        if target.try_exists()? {
+            let (_, actual) = crate::stream_io::verified_file(&target, self.file_limit())?;
+            if actual != expected {
+                return Err(Error::Integrity);
+            }
+            return Ok(actual);
+        }
+        let (blobs, _, used) = self.scan()?;
+        if blobs.len() >= MAX_VERSIONS || used.checked_add(bytes).is_none_or(|n| n > self.store_limit()) {
+            return Err(Error::Invalid("blob storage quota"));
+        }
+        let pending = self.directory.join("pending");
+        reject_links(&pending)?;
+        let mut file = fs::OpenOptions::new().read(true).write(true).create_new(true).open(&pending)?;
+        let result = (|| {
+            if crate::stream_io::copy_hash(reader, &mut file, bytes)? != expected {
+                return Err(Error::Integrity);
+            }
+            file.sync_all()?;
+            // Re-read the actual private file before making it immutable/published.
+            file.seek(SeekFrom::Start(0))?;
+            if crate::stream_io::copy_hash(&mut file, &mut std::io::sink(), bytes)? != expected {
+                return Err(Error::Integrity);
+            }
+            fs::hard_link(&pending, &target)?;
+            #[cfg(unix)]
+            fs::File::open(&self.directory)?.sync_all()?;
+            Ok(expected)
+        })();
+        drop(file);
+        let cleanup = fs::remove_file(&pending);
+        let receipt = result?;
+        // Publication is already complete. Retained pending bytes remain counted
+        // by scan and block the next writer; do not misreport a lost publication.
+        let _ = cleanup;
+        Ok(receipt)
     }
 }
 
