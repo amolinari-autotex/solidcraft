@@ -72,6 +72,7 @@ mod hole_placement_ui_tests;
 pub(crate) mod hole_refs;
 #[cfg(test)]
 mod hole_refs_ui_tests;
+pub mod hole_presets;
 pub mod home;
 pub mod i18n;
 #[cfg(test)]

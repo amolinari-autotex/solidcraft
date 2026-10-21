@@ -15,6 +15,125 @@ use crate::dialogs::Kind;
 use crate::scenario::Harness;
 use crate::viewport::Hit;
 
+fn personal_preset_harness() -> Harness {
+    let mut h = Harness::new();
+    crate::fonts::setup_bundled_fonts(&h.ctx);
+    h.call("ui.resize", json!({"width":1400,"height":1100}));
+    h.app.run("solid.box", json!({"name":"PresetFixture","length":40,"width":30,"height":20})).unwrap();
+    h.app.session.selection = vec![Sel::Face { body: "PresetFixture".into(), index: 5, point: Vec3::new(10.0, 10.0, 20.0) }];
+    h.app.start("solid.hole");
+    h.frames(4);
+    h.step(&json!({"click":{"handle":"dialog:section:hole_presets.title"}})).unwrap();
+    h.frames(2);
+    h
+}
+
+fn preset_name(h: &mut Harness, name: &str) {
+    h.step(&json!({"click":{"handle":"dialog:hole_presets.name"}})).unwrap();
+    h.step(&json!({"key":"A","cmd":true})).unwrap();
+    h.step(&json!({"text":name})).unwrap();
+}
+
+#[test]
+fn hole_presets_save_explicit_source_units_including_mm_without_document_edits() {
+    for unit in ["in", "mm"] {
+        let mut h = personal_preset_harness();
+        h.app.session.doc_mut().units = unit.into();
+        if let Kind::Hole { diameter, depth, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+            *diameter = "0.25".into();
+            *depth = "2 * 3".into();
+        }
+        preset_name(&mut h, "Portable");
+        h.step(&json!({"widget":"Save new"})).unwrap();
+        let presets = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+        assert_eq!(presets[0]["diameter"], format!("0.25 {unit}"));
+        assert_eq!(presets[0]["depth"], format!("(2 * 3) * 1 {unit}"));
+        assert_eq!(h.app.session.doc.features.len(), 1);
+        assert!(h.app.dialog.is_some());
+    }
+}
+
+#[test]
+fn hole_presets_save_recall_rename_delete_and_enter_only_change_the_form_or_profile() {
+    let mut h = personal_preset_harness();
+    if let Kind::Hole { diameter, depth, opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *diameter = "4.2 mm".into();
+        *depth = "0.5 in".into();
+        opts.tapped = true;
+        opts.thread = "M5".into();
+    }
+    preset_name(&mut h, "Workshop");
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_some(), "Enter in a preset name must not apply the Hole");
+    h.step(&json!({"widget":"Save new"})).unwrap();
+    let saved = h.app.prefs();
+    if let Kind::Hole { diameter, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *diameter = "9 mm".into();
+    }
+    h.frames(2);
+    h.step(&json!({"widget":"Recall"})).unwrap();
+    assert!(
+        matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Hole {diameter,depth,opts,..} if diameter=="4.2 mm" && depth=="0.5 in" && opts.tapped && opts.thread=="M5")
+    );
+    preset_name(&mut h, "Renamed");
+    h.step(&json!({"widget":"Rename"})).unwrap();
+    let renamed = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+    assert_eq!(renamed[0]["name"], "Renamed");
+    h.step(&json!({"widget":"Delete"})).unwrap();
+    assert_eq!(serde_json::to_value(&h.app.preferences.hole_presets).unwrap().as_array().unwrap().len(), 1);
+    h.step(&json!({"widget":"Confirm delete"})).unwrap();
+    assert_eq!(serde_json::to_value(&h.app.preferences.hole_presets).unwrap(), json!([]));
+    assert_eq!(h.app.session.doc.features.len(), 1);
+    let mut other = crate::SolveApp::new(Default::default(), Default::default());
+    other.load_prefs(&saved);
+    assert_eq!(serde_json::to_value(other.preferences.hole_presets).unwrap()[0]["name"], "Workshop");
+}
+
+#[test]
+fn hole_presets_inactive_incomplete_dimensions_do_not_block_valid_simple_all_preset() {
+    let mut h = personal_preset_harness();
+    if let Kind::Hole { diameter, depth, cb_depth, cs_diameter, opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *diameter = "4 mm".into();
+        *depth = "unfinished(".into();
+        *cb_depth = "missing_parameter".into();
+        *cs_diameter = "3 deg".into();
+        opts.all = true;
+    }
+    preset_name(&mut h, "Simple through");
+    h.step(&json!({"widget":"Save new"})).unwrap();
+    let saved = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+    assert_eq!(saved[0]["name"], "Simple through");
+    assert_eq!(saved[0]["extent"], "all");
+    assert_eq!(saved[0]["depth"], "unfinished(");
+    assert_eq!(saved[0]["cb_depth"], "missing_parameter");
+    assert_eq!(saved[0]["cs_diameter"], "3 deg");
+    assert_eq!(h.app.session.doc.features.len(), 1);
+    assert!(h.app.dialog.is_some());
+}
+
+#[test]
+fn hole_presets_unknown_options_refuse_recall_without_changing_valid_hole_fields() {
+    let mut h = personal_preset_harness();
+    preset_name(&mut h, "Future");
+    h.step(&json!({"widget":"Save new"})).unwrap();
+    let mut saved = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+    saved[0]["thread_options"]["starts"] = json!(2);
+    h.app.preferences.hole_presets = serde_json::from_value(saved).unwrap();
+    if let Kind::Hole { diameter, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *diameter = "9 mm".into();
+    }
+    let before = serde_json::to_value(&*h.app.session.doc).unwrap();
+    h.frames(2);
+    h.step(&json!({"widget":"Recall"})).unwrap();
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Hole { diameter,.. } if diameter=="9 mm"));
+    assert_eq!(serde_json::to_value(&*h.app.session.doc).unwrap(), before);
+    preset_name(&mut h, "Future renamed");
+    h.step(&json!({"widget":"Rename"})).unwrap();
+    let retained = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+    assert_eq!(retained[0]["name"], "Future renamed");
+    assert_eq!(retained[0]["thread_options"]["starts"], 2);
+}
+
 /// A 40 × 30 × 20 block, seen from the top, with a sketch on its top face: a circle of radius 4
 /// about (12, 9). Returns the circle centre in the world.
 fn block_with_circle() -> (Harness, Vec3) {

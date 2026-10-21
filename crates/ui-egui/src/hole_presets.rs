@@ -1,0 +1,362 @@
+//! Personal, cross-design Hole parameter presets. Geometry references never enter this
+//! library; recalling a preset only edits the open dialog, never the document.
+
+use serde::{Deserialize, Serialize, de};
+use solidcraft_engine::doc::{DocError, Document, expr};
+use std::collections::BTreeMap;
+
+use crate::dialogs::{Dialog, Kind};
+use crate::i18n::tr;
+use crate::ui_kit::{self, Button, Text};
+
+const MAX_PRESETS: usize = 64;
+const MAX_NAME: usize = 96;
+const MAX_EXPRESSION: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Style {
+    Simple,
+    Drilled,
+    Counterbore,
+    Countersink,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Extent {
+    Distance,
+    All,
+    ToObject,
+}
+
+/// Additive thread options retain their defaults in older presets. The mapper for a
+/// future thread-depth/handedness feature can extend this record without a design ID.
+/// This version preserves these values on rename/save, but refuses to silently recall
+/// a non-default option its Hole dialog cannot yet represent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct ThreadOptions {
+    handedness: String,
+    full_length: bool,
+    depth: Option<String>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for ThreadOptions {
+    fn default() -> Self {
+        Self { handedness: "right".into(), full_length: true, depth: None, unknown: BTreeMap::new() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Preset {
+    name: String,
+    style: Style,
+    extent: Extent,
+    diameter: String,
+    depth: String,
+    cb_diameter: String,
+    cb_depth: String,
+    cs_diameter: String,
+    cs_angle: String,
+    tip_angle: String,
+    tapped: bool,
+    thread: String,
+    #[serde(default)]
+    thread_options: ThreadOptions,
+}
+
+fn valid_text(text: &str, max: usize) -> bool {
+    text.len() <= max && !text.chars().any(char::is_control)
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.trim().is_empty() && name == name.trim() && valid_text(name, MAX_NAME)
+}
+
+impl Preset {
+    fn validate(&self) -> Result<(), &'static str> {
+        if !valid_name(&self.name) {
+            return Err("hole_presets.invalid_name");
+        }
+        let expressions =
+            [&self.diameter, &self.depth, &self.cb_diameter, &self.cb_depth, &self.cs_diameter, &self.cs_angle, &self.tip_angle, &self.thread];
+        if expressions.into_iter().any(|text| !valid_text(text, MAX_EXPRESSION)) {
+            return Err("hole_presets.invalid_parameters");
+        }
+        let mut required = vec![&self.diameter];
+        if self.extent == Extent::Distance {
+            required.push(&self.depth);
+        }
+        match self.style {
+            Style::Drilled => required.push(&self.tip_angle),
+            Style::Counterbore => required.extend([&self.cb_diameter, &self.cb_depth]),
+            Style::Countersink => required.extend([&self.cs_diameter, &self.cs_angle]),
+            Style::Simple => {}
+        }
+        if self.tapped {
+            required.push(&self.thread);
+        }
+        if required.into_iter().any(|text| text.trim().is_empty())
+            || !["right", "left"].contains(&self.thread_options.handedness.as_str())
+            || self.thread_options.depth.as_ref().is_some_and(|text| text.trim().is_empty() || !valid_text(text, MAX_EXPRESSION))
+            || self.thread_options.unknown.len() > 8
+            || self.thread_options.unknown.iter().any(|(key, value)| {
+                key.is_empty()
+                    || !valid_text(key, 64)
+                    || match value {
+                        serde_json::Value::String(text) => !valid_text(text, MAX_EXPRESSION),
+                        serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::Null => false,
+                        _ => true,
+                    }
+            })
+        {
+            return Err("hole_presets.invalid_parameters");
+        }
+        Ok(())
+    }
+
+    fn capture(d: &Dialog, name: &str, doc: &Document) -> Result<Self, &'static str> {
+        let Kind::Hole { diameter, depth, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } = &d.kind else {
+            return Err("hole_presets.invalid_parameters");
+        };
+        let (values, _) = doc.param_values();
+        let lookup = |name: &str| values.get(name).copied().ok_or_else(|| DocError::Expr(format!("unknown parameter `{name}`")));
+        let portable_length = |text: &str, active: bool| -> Result<String, &'static str> {
+            if text.trim().is_empty() {
+                return Ok(text.into());
+            }
+            let checked = expr::eval_with(text, &lookup).and_then(|value| {
+                value.to_kind(expr::Kind::Length)?;
+                Ok(value)
+            });
+            let value = match checked {
+                Ok(value) => value,
+                // Hidden fields may contain an unfinished edit. Keep bounded text for
+                // later editing; only dimensions used by this style/extent must parse.
+                Err(_) if !active => return Ok(text.into()),
+                Err(_) => return Err("hole_presets.invalid_parameters"),
+            };
+            if value.unitless() {
+                let unit = expr::length_unit_or_mm(&doc.units);
+                // Keep the expression, not its evaluated number. Explicit mm matters too:
+                // an unsuffixed value would otherwise acquire the destination design's unit.
+                Ok(if expr::is_bare_number(text) { format!("{} {unit}", text.trim()) } else { format!("({text}) * 1 {unit}") })
+            } else {
+                Ok(text.into())
+            }
+        };
+        let preset = Self {
+            name: name.trim().into(),
+            style: match *kind {
+                0 if opts.angled => Style::Drilled,
+                0 => Style::Simple,
+                1 => Style::Counterbore,
+                2 => Style::Countersink,
+                _ => return Err("hole_presets.invalid_parameters"),
+            },
+            extent: if d.inputs.iter().any(|input| input.label == "To Object") {
+                Extent::ToObject
+            } else if opts.all {
+                Extent::All
+            } else {
+                Extent::Distance
+            },
+            diameter: portable_length(diameter, true)?,
+            depth: portable_length(depth, !opts.all && !d.inputs.iter().any(|input| input.label == "To Object"))?,
+            cb_diameter: portable_length(cb_diameter, *kind == 1)?,
+            cb_depth: portable_length(cb_depth, *kind == 1)?,
+            cs_diameter: portable_length(cs_diameter, *kind == 2)?,
+            cs_angle: cs_angle.clone(),
+            tip_angle: opts.tip_angle.clone(),
+            tapped: opts.tapped,
+            thread: opts.thread.clone(),
+            thread_options: ThreadOptions::default(),
+        };
+        preset.validate()?;
+        Ok(preset)
+    }
+
+    fn recall(&self, d: &mut Dialog) -> Result<(), &'static str> {
+        self.validate()?;
+        if self.thread_options.handedness != "right" || !self.thread_options.full_length || !self.thread_options.unknown.is_empty() {
+            return Err("hole_presets.unsupported_options");
+        }
+        let Kind::Hole { diameter, depth, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } = &mut d.kind else {
+            return Err("hole_presets.invalid_parameters");
+        };
+        diameter.clone_from(&self.diameter);
+        depth.clone_from(&self.depth);
+        *kind = match self.style {
+            Style::Simple | Style::Drilled => 0,
+            Style::Counterbore => 1,
+            Style::Countersink => 2,
+        };
+        cb_diameter.clone_from(&self.cb_diameter);
+        cb_depth.clone_from(&self.cb_depth);
+        cs_diameter.clone_from(&self.cs_diameter);
+        cs_angle.clone_from(&self.cs_angle);
+        opts.angled = self.style == Style::Drilled;
+        opts.tip_angle.clone_from(&self.tip_angle);
+        opts.all = self.extent == Extent::All;
+        opts.tapped = self.tapped;
+        opts.thread.clone_from(&self.thread);
+        // Existing placement picks stay with this dialog. To Object stores its mode only:
+        // recalling it always asks for a fresh destination in the current design.
+        crate::dialogs::preset_to_object(d, self.extent == Extent::ToObject);
+        Ok(())
+    }
+}
+
+/// Stored as one preference array. A malformed row cannot discard unrelated preferences
+/// or valid rows. Bound the retained rows and all user-controlled strings.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct Library(Vec<Preset>);
+
+impl<'de> Deserialize<'de> for Library {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LibraryVisitor;
+        impl<'de> de::Visitor<'de> for LibraryVisitor {
+            type Value = Library;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array of personal Hole presets")
+            }
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Library, A::Error> {
+                let mut library = Library::default();
+                for _ in 0..MAX_PRESETS {
+                    let Some(row) = seq.next_element::<serde_json::Value>()? else { return Ok(library) };
+                    if let Ok(preset) = serde_json::from_value::<Preset>(row)
+                        && preset.validate().is_ok()
+                        && library.find(&preset.name).is_none()
+                    {
+                        library.0.push(preset);
+                    }
+                }
+                while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+                Ok(library)
+            }
+        }
+        deserializer.deserialize_seq(LibraryVisitor)
+    }
+}
+
+impl Library {
+    fn find(&self, name: &str) -> Option<usize> {
+        let name = name.to_lowercase();
+        self.0.iter().position(|preset| preset.name.to_lowercase() == name)
+    }
+
+    fn save(&mut self, d: &Dialog, name: &str, doc: &Document) -> Result<(), &'static str> {
+        if self.find(name.trim()).is_some() {
+            return Err("hole_presets.name_exists");
+        }
+        if self.0.len() >= MAX_PRESETS {
+            return Err("hole_presets.full");
+        }
+        self.0.push(Preset::capture(d, name, doc)?);
+        Ok(())
+    }
+
+    fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
+        let new = new.trim();
+        if !valid_name(new) {
+            return Err("hole_presets.invalid_name");
+        }
+        let index = self.find(old).ok_or("hole_presets.missing")?;
+        if self.find(new).is_some_and(|other| other != index) {
+            return Err("hole_presets.name_exists");
+        }
+        let preset = self.0.get_mut(index).ok_or("hole_presets.missing")?;
+        preset.name = new.into();
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct PanelState {
+    selected: String,
+    name: String,
+    confirming_delete: bool,
+    error: Option<&'static str>,
+}
+
+/// One hook above the existing Hole form. The library belongs to application preferences;
+/// the panel's selection/name/error are temporary and never serialized with a design.
+pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, doc: &Document) {
+    if !matches!(d.kind, Kind::Hole { .. }) {
+        return;
+    }
+    let id = egui::Id::new("personal_hole_presets_panel");
+    let mut state = ui.ctx().data_mut(|data| data.get_temp::<PanelState>(id)).unwrap_or_default();
+    ui_kit::section(ui, "personal_hole_presets", "hole_presets.title", false, |ui| {
+        ui.label(tr("hole_presets.scope"));
+        crate::dialogs::form_row(ui, "hole_presets.preset", |ui| {
+            let before = library.find(&state.selected).map_or(0, |index| index + 1);
+            let mut selected = before;
+            let mut labels = vec![tr("hole_presets.select")];
+            labels.extend(library.0.iter().map(|preset| preset.name.as_str()));
+            crate::dialogs::combo(ui, "personal_hole_preset_choice", &labels, &mut selected);
+            if selected != before {
+                state.selected =
+                    selected.checked_sub(1).and_then(|index| library.0.get(index)).map_or_else(String::new, |preset| preset.name.clone());
+                state.name.clone_from(&state.selected);
+                state.confirming_delete = false;
+                state.error = None;
+            }
+        });
+        let chosen = library.find(&state.selected);
+        if ui_kit::button(ui, tr("hole_presets.recall"), Button::Enabled(chosen.is_some())).clicked() {
+            state.error = chosen.and_then(|index| library.0.get(index)).and_then(|preset| preset.recall(d).err());
+        }
+        let (enter, _) = ui_kit::text_row(ui, "hole_presets.name", &mut state.name, tr("hole_presets.name_hint"));
+        if state.name.len() > MAX_NAME {
+            let end = state.name.char_indices().map(|(index, _)| index).take_while(|index| *index <= MAX_NAME).last().unwrap_or(0);
+            state.name.truncate(end);
+        }
+        if enter {
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui_kit::button(ui, tr("hole_presets.save"), Button::Normal).clicked() {
+                state.error = library.save(d, &state.name, doc).err();
+                if state.error.is_none() {
+                    state.selected = state.name.trim().into();
+                    state.name.clone_from(&state.selected);
+                }
+                state.confirming_delete = false;
+            }
+            if ui_kit::button(ui, tr("hole_presets.rename"), Button::Enabled(chosen.is_some())).clicked() {
+                state.error = library.rename(&state.selected, &state.name).err();
+                if state.error.is_none() {
+                    state.selected = state.name.trim().into();
+                }
+                state.confirming_delete = false;
+            }
+            if ui_kit::button(ui, tr("hole_presets.delete"), Button::Enabled(chosen.is_some())).clicked() {
+                state.confirming_delete = true;
+                state.error = None;
+            }
+        });
+        if state.confirming_delete {
+            ui.label(tr("hole_presets.delete_prompt"));
+            ui.horizontal_wrapped(|ui| {
+                if ui_kit::button(ui, tr("hole_presets.confirm_delete"), Button::Normal).clicked() {
+                    if let Some(index) = library.find(&state.selected) {
+                        library.0.remove(index);
+                    }
+                    state = PanelState::default();
+                }
+                if ui_kit::button(ui, tr("Cancel"), Button::Normal).clicked() {
+                    state.confirming_delete = false;
+                }
+            });
+        }
+        if let Some(error) = state.error {
+            ui_kit::text(ui, tr(error), Text::Report("hole_presets_error", true));
+        }
+    });
+    ui.ctx().data_mut(|data| data.insert_temp(id, state));
+}

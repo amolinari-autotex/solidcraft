@@ -2567,6 +2567,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
             let body = |ui: &mut egui::Ui| {
                 d.sync_fillet_chain(&app.session);
+                crate::hole_presets::rows(ui, &mut d, &mut app.preferences.hole_presets, &app.session.doc);
                 enter |= dense::rows(app, ctx, &mut d, ui);
                 d.sync_fillet_chain(&app.session);
                 if cell_enter {
@@ -2788,6 +2789,14 @@ fn to_object_on(inputs: &[SelInput]) -> bool {
 /// Add or remove the To Object input; the active input moves to it when it is added.
 fn set_to_object(inputs: &mut Vec<SelInput>, active: &mut usize, on: bool) {
     set_object(inputs, active, TO_OBJECT, on);
+}
+
+/// A personal preset remembers the extent mode, never its destination geometry.
+pub(crate) fn preset_to_object(d: &mut Dialog, on: bool) {
+    set_to_object(&mut d.inputs, &mut d.active, on);
+    if let Some(input) = d.inputs.iter_mut().find(|input| input.label == TO_OBJECT) {
+        input.items.clear();
+    }
 }
 
 fn set_object(inputs: &mut Vec<SelInput>, active: &mut usize, label: &'static str, on: bool) {
