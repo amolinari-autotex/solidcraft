@@ -54,6 +54,8 @@ impl Default for ThreadOptions {
 struct Preset {
     name: String,
     style: Style,
+    #[serde(default)]
+    angled_bottom: bool,
     extent: Extent,
     diameter: String,
     depth: String,
@@ -91,10 +93,13 @@ impl Preset {
             required.push(&self.depth);
         }
         match self.style {
-            Style::Drilled => required.push(&self.tip_angle),
+            Style::Drilled if self.extent != Extent::All => required.push(&self.tip_angle),
             Style::Counterbore => required.extend([&self.cb_diameter, &self.cb_depth]),
             Style::Countersink => required.extend([&self.cs_diameter, &self.cs_angle]),
-            Style::Simple => {}
+            Style::Simple | Style::Drilled => {}
+        }
+        if self.angled_bottom && self.extent != Extent::All && self.style != Style::Drilled {
+            required.push(&self.tip_angle);
         }
         if self.tapped {
             required.push(&self.thread);
@@ -157,6 +162,7 @@ impl Preset {
                 2 => Style::Countersink,
                 _ => return Err("hole_presets.invalid_parameters"),
             },
+            angled_bottom: opts.angled,
             extent: if d.inputs.iter().any(|input| input.label == "To Object") {
                 Extent::ToObject
             } else if opts.all {
@@ -198,7 +204,8 @@ impl Preset {
         cb_depth.clone_from(&self.cb_depth);
         cs_diameter.clone_from(&self.cs_diameter);
         cs_angle.clone_from(&self.cs_angle);
-        opts.angled = self.style == Style::Drilled;
+        // Drilled is the legacy representation; recesses have an independent bottom choice.
+        opts.angled = self.angled_bottom || self.style == Style::Drilled;
         opts.tip_angle.clone_from(&self.tip_angle);
         opts.all = self.extent == Extent::All;
         opts.tapped = self.tapped;
@@ -275,22 +282,28 @@ impl Library {
     }
 }
 
+#[derive(Clone)]
+struct NamePrompt {
+    name: String,
+    renaming: bool,
+}
+
 #[derive(Clone, Default)]
 struct PanelState {
     selected: String,
-    name: String,
+    prompt: Option<NamePrompt>,
     confirming_delete: bool,
     error: Option<&'static str>,
 }
 
-/// One hook above the existing Hole form. The library belongs to application preferences;
-/// the panel's selection/name/error are temporary and never serialized with a design.
-pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, doc: &Document) {
+/// One hook above the existing Hole form. Only the library is persisted in preferences;
+/// selection, errors and the naming prompt belong to this dialog's temporary UI state.
+pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, reset: bool) {
     if !matches!(d.kind, Kind::Hole { .. }) {
         return;
     }
     let id = egui::Id::new("personal_hole_presets_panel");
-    let mut state = ui.ctx().data_mut(|data| data.get_temp::<PanelState>(id)).unwrap_or_default();
+    let mut state = if reset { PanelState::default() } else { ui.ctx().data_mut(|data| data.get_temp::<PanelState>(id)).unwrap_or_default() };
     ui_kit::section(ui, "personal_hole_presets", "hole_presets.title", false, |ui| {
         ui.label(tr("hole_presets.scope"));
         crate::dialogs::form_row(ui, "hole_presets.preset", |ui| {
@@ -300,39 +313,25 @@ pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, doc
             labels.extend(library.0.iter().map(|preset| preset.name.as_str()));
             crate::dialogs::combo(ui, "personal_hole_preset_choice", &labels, &mut selected);
             if selected != before {
-                state.selected =
-                    selected.checked_sub(1).and_then(|index| library.0.get(index)).map_or_else(String::new, |preset| preset.name.clone());
-                state.name.clone_from(&state.selected);
+                let preset = selected.checked_sub(1).and_then(|index| library.0.get(index));
+                state.selected = preset.map_or_else(String::new, |preset| preset.name.clone());
+                // Recall validates every option before changing any draft field. Do this
+                // only on selection changes, so later manual edits remain untouched.
+                state.error = preset.and_then(|preset| preset.recall(d).err());
+                state.prompt = None;
                 state.confirming_delete = false;
-                state.error = None;
             }
         });
         let chosen = library.find(&state.selected);
-        if ui_kit::button(ui, tr("hole_presets.recall"), Button::Enabled(chosen.is_some())).clicked() {
-            state.error = chosen.and_then(|index| library.0.get(index)).and_then(|preset| preset.recall(d).err());
-        }
-        let (enter, _) = ui_kit::text_row(ui, "hole_presets.name", &mut state.name, tr("hole_presets.name_hint"));
-        if state.name.len() > MAX_NAME {
-            let end = state.name.char_indices().map(|(index, _)| index).take_while(|index| *index <= MAX_NAME).last().unwrap_or(0);
-            state.name.truncate(end);
-        }
-        if enter {
-            ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        }
         ui.horizontal_wrapped(|ui| {
             if ui_kit::button(ui, tr("hole_presets.save"), Button::Normal).clicked() {
-                state.error = library.save(d, &state.name, doc).err();
-                if state.error.is_none() {
-                    state.selected = state.name.trim().into();
-                    state.name.clone_from(&state.selected);
-                }
+                state.prompt = Some(NamePrompt { name: String::new(), renaming: false });
+                state.error = None;
                 state.confirming_delete = false;
             }
             if ui_kit::button(ui, tr("hole_presets.rename"), Button::Enabled(chosen.is_some())).clicked() {
-                state.error = library.rename(&state.selected, &state.name).err();
-                if state.error.is_none() {
-                    state.selected = state.name.trim().into();
-                }
+                state.prompt = Some(NamePrompt { name: state.selected.clone(), renaming: true });
+                state.error = None;
                 state.confirming_delete = false;
             }
             if ui_kit::button(ui, tr("hole_presets.delete"), Button::Enabled(chosen.is_some())).clicked() {
@@ -354,9 +353,61 @@ pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, doc
                 }
             });
         }
-        if let Some(error) = state.error {
+        if state.prompt.is_none()
+            && let Some(error) = state.error
+        {
             ui_kit::text(ui, tr(error), Text::Report("hole_presets_error", true));
         }
     });
     ui.ctx().data_mut(|data| data.insert_temp(id, state));
+}
+
+/// Global shortcuts run before dialogs. A pending name modal owns their keyboard even
+/// when Escape has already blurred its text field. Stale state cannot block other tools.
+pub(crate) fn name_prompt_open(ctx: &egui::Context, dialog: Option<&Dialog>) -> bool {
+    dialog.is_some_and(|d| matches!(&d.kind, Kind::Hole { .. }))
+        && ctx.data_mut(|data| data.get_temp::<PanelState>(egui::Id::new("personal_hole_presets_panel"))).is_some_and(|state| state.prompt.is_some())
+}
+
+/// Draw after the Hole card so the modal owns input and its footer handles. `true` also
+/// covers the confirmation frame: Enter/Cancel must never reach the underlying Hole.
+pub(crate) fn name_prompt(ctx: &egui::Context, d: &mut Dialog, library: &mut Library, doc: &Document) -> bool {
+    if !matches!(d.kind, Kind::Hole { .. }) {
+        return false;
+    }
+    let id = egui::Id::new("personal_hole_presets_panel");
+    let mut state = ctx.data_mut(|data| data.get_temp::<PanelState>(id)).unwrap_or_default();
+    let Some(mut prompt) = state.prompt.take() else { return false };
+    let title = tr(if prompt.renaming { "hole_presets.rename" } else { "hole_presets.save" });
+    let (closed, action) = ui_kit::Confirm::new(egui::Id::new("personal_hole_preset_name"), "save", title)
+        .actions(if prompt.renaming { tr("hole_presets.rename") } else { crate::i18n::tr_label("Save") }, "Cancel", None)
+        .show(ctx, true, |ui| {
+            ui_kit::row(ui, "hole_presets.name", |ui| ui_kit::focused_text_field(ui, &mut prompt.name, tr("hole_presets.name_hint")));
+            // Retain over-limit names for a clear validation error, but bound UI storage too.
+            if prompt.name.len() > MAX_EXPRESSION {
+                let end = prompt.name.char_indices().map(|(index, _)| index).take_while(|index| *index <= MAX_EXPRESSION).last().unwrap_or(0);
+                prompt.name.truncate(end);
+            }
+            if let Some(error) = state.error {
+                ui_kit::text(ui, tr(error), Text::Report("hole_presets_name_error", true));
+            }
+        });
+    ctx.input_mut(|input| {
+        input.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+        input.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+    });
+    if closed || action == ui_kit::Action::Cancel {
+        state.error = None;
+    } else if action == ui_kit::Action::Ok {
+        state.error = if prompt.renaming { library.rename(&state.selected, &prompt.name).err() } else { library.save(d, &prompt.name, doc).err() };
+        if state.error.is_none() {
+            state.selected = prompt.name.trim().into();
+        } else {
+            state.prompt = Some(prompt);
+        }
+    } else {
+        state.prompt = Some(prompt);
+    }
+    ctx.data_mut(|data| data.insert_temp(id, state));
+    true
 }
