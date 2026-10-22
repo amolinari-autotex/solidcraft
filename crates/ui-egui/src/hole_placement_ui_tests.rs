@@ -918,3 +918,171 @@ fn combined_recessed_point_presets_keep_left_partial_across_units_and_legacy_def
         assert_eq!(format!("{:?}", h.app.dialog), draft, "unknown options must refuse before changing any bottom/thread field");
     }
 }
+
+fn preset_dirty_save_enabled(h: &Harness) -> bool {
+    let node = h
+        .output
+        .accesskit_update
+        .as_ref()
+        .unwrap()
+        .nodes
+        .iter()
+        .rev()
+        .find(|(_, node)| node.label() == Some("Save changes to selected preset"))
+        .map(|(_, node)| node)
+        .expect("the small Save action must be present");
+    !node.is_disabled()
+}
+
+fn dirty_depth(h: &mut Harness, text: &str) {
+    if let Kind::Hole { depth, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *depth = text.into();
+    }
+    h.frames(3);
+}
+
+fn dirty_save(h: &mut Harness) {
+    h.step(&json!({"click":{"handle":"dialog:hole_presets:overwrite"}})).unwrap();
+}
+
+#[test]
+fn hole_presets_dirty_indicator_and_disabled_save_follow_changes_and_revert() {
+    let mut h = personal_preset_harness();
+    assert!(!preset_dirty_save_enabled(&h));
+    dirty_depth(&mut h, "12 mm");
+    save_preset(&mut h, "Workshop");
+    let library = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+    h.frames(8);
+    assert!(!preset_dirty_save_enabled(&h), "unchanged frames must not dirty a saved preset");
+    dirty_save(&mut h);
+    assert_eq!(serde_json::to_value(&h.app.preferences.hole_presets).unwrap(), library);
+    dirty_depth(&mut h, "13 mm");
+    assert!(preset_dirty_save_enabled(&h));
+    h.step(&json!({"expect":{"shown":"* Workshop"}})).unwrap();
+    assert_eq!(serde_json::to_value(&h.app.preferences.hole_presets).unwrap()[0]["name"], "Workshop");
+    let field = crate::scenario::rect_of("dialog:widget:hole_presets.preset").unwrap();
+    let save = crate::scenario::rect_of("dialog:hole_presets:overwrite").unwrap();
+    assert!(save.left() >= field.right() && save.width() <= 32.0, "small save belongs right of the name");
+    choose_preset(&mut h, "Select a preset");
+    assert!(!preset_dirty_save_enabled(&h));
+    choose_preset(&mut h, "Workshop");
+    dirty_depth(&mut h, "13 mm");
+    dirty_depth(&mut h, "12 mm");
+    assert!(!preset_dirty_save_enabled(&h), "reverting the parameter clears dirty state without saving");
+    h.step(&json!({"expect":{"not_shown":"* Workshop"}})).unwrap();
+}
+
+#[test]
+fn hole_presets_dirty_overwrite_keeps_name_and_all_pointed_left_partial_parameters() {
+    let mut h = personal_preset_harness();
+    if let Kind::Hole { kind, depth, opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *kind = 2;
+        *depth = "12 mm".into();
+        opts.angled = true;
+        opts.tapped = true;
+        opts.thread = "M8".into();
+        opts.handedness = solidcraft_engine::doc::ThreadHandedness::Left;
+        opts.thread_full_depth = false;
+        opts.thread_depth = "5 mm".into();
+    }
+    save_preset(&mut h, "Workshop");
+    let document = h.app.session.doc.to_json();
+    dirty_depth(&mut h, "13 mm");
+    dirty_save(&mut h);
+    let saved = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+    assert_eq!(saved.as_array().unwrap().len(), 1);
+    assert_eq!(saved[0]["name"], "Workshop");
+    assert_eq!(saved[0]["depth"], "13 mm");
+    assert_eq!(saved[0]["angled_bottom"], true);
+    assert_eq!(saved[0]["thread_options"]["handedness"], "left");
+    assert_eq!(saved[0]["thread_options"]["depth"], "5 mm");
+    assert!(!preset_dirty_save_enabled(&h));
+    h.step(&json!({"expect":{"hidden_handles":["dialog:hole_presets.name"],"not_shown":"* Workshop"}})).unwrap();
+    assert_eq!(h.app.session.doc.to_json(), document, "overwrite edits only the personal library");
+}
+
+#[test]
+fn hole_presets_dirty_legacy_drilled_bottom_is_unchanged_after_recall_and_revert() {
+    let mut h = personal_preset_harness();
+    dirty_depth(&mut h, "12 mm");
+    save_preset(&mut h, "Legacy");
+    let mut saved = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+    assert_eq!(saved[0]["style"], "drilled");
+    saved[0].as_object_mut().unwrap().remove("angled_bottom");
+    choose_preset(&mut h, "Select a preset");
+    h.app.preferences.hole_presets = serde_json::from_value(saved).unwrap();
+    choose_preset(&mut h, "Legacy");
+    h.frames(8);
+    assert!(!preset_dirty_save_enabled(&h), "legacy Drilled implies the same effective angled bottom");
+    dirty_depth(&mut h, "13 mm");
+    assert!(preset_dirty_save_enabled(&h));
+    dirty_depth(&mut h, "12 mm");
+    assert!(!preset_dirty_save_enabled(&h));
+}
+
+#[test]
+fn hole_presets_dirty_invalid_expression_refuses_overwrite_and_cancel_changes_no_data() {
+    let mut h = personal_preset_harness();
+    dirty_depth(&mut h, "12 mm");
+    save_preset(&mut h, "Workshop");
+    let saved = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+    let doc = h.app.session.doc.to_json();
+    dirty_depth(&mut h, "bad length");
+    assert!(preset_dirty_save_enabled(&h));
+    dirty_save(&mut h);
+    assert_eq!(serde_json::to_value(&h.app.preferences.hole_presets).unwrap(), saved);
+    h.step(&json!({"expect":{"shown":"Complete the hole parameters using valid expressions of reasonable length."}})).unwrap();
+    assert!(preset_dirty_save_enabled(&h));
+    h.step(&json!({"click":{"handle":"dialog:cancel"}})).unwrap();
+    assert_eq!(serde_json::to_value(&h.app.preferences.hole_presets).unwrap(), saved);
+    assert_eq!(h.app.session.doc.to_json(), doc);
+}
+
+#[test]
+fn hole_presets_dirty_unknown_options_are_never_dropped_by_overwrite() {
+    let mut h = personal_preset_harness();
+    dirty_depth(&mut h, "12 mm");
+    save_preset(&mut h, "Future");
+    let mut saved = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+    saved[0]["thread_options"]["starts"] = json!(2);
+    choose_preset(&mut h, "Select a preset");
+    h.app.preferences.hole_presets = serde_json::from_value(saved.clone()).unwrap();
+    choose_preset(&mut h, "Future");
+    dirty_depth(&mut h, "13 mm");
+    assert!(preset_dirty_save_enabled(&h));
+    dirty_save(&mut h);
+    assert_eq!(serde_json::to_value(&h.app.preferences.hole_presets).unwrap(), saved);
+    assert!(preset_dirty_save_enabled(&h));
+    h.step(&json!({"expect":{"shown":"This preset contains options that cannot be overwritten safely."}})).unwrap();
+}
+
+#[test]
+fn hole_presets_dirty_invalid_active_scalars_refuse_overwrite() {
+    for invalid in ["negative depth", "point angle", "countersink angle", "partial depth"] {
+        let mut h = personal_preset_harness();
+        if let Kind::Hole { kind, depth, opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+            *kind = 2;
+            *depth = "12 mm".into();
+            opts.tapped = true;
+            opts.thread = "M8".into();
+            opts.angled = true;
+            opts.thread_full_depth = false;
+            opts.thread_depth = "5 mm".into();
+        }
+        save_preset(&mut h, "Workshop");
+        let saved = serde_json::to_value(&h.app.preferences.hole_presets).unwrap();
+        if let Kind::Hole { depth, cs_angle, opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+            match invalid {
+                "negative depth" => *depth = "-1 mm".into(),
+                "point angle" => opts.tip_angle = "bad angle".into(),
+                "countersink angle" => *cs_angle = "0 deg".into(),
+                _ => opts.thread_depth = "-1 mm".into(),
+            }
+        }
+        h.frames(3);
+        assert!(preset_dirty_save_enabled(&h));
+        dirty_save(&mut h);
+        assert_eq!(serde_json::to_value(&h.app.preferences.hole_presets).unwrap(), saved, "{invalid}");
+        assert!(preset_dirty_save_enabled(&h));
+    }
+}

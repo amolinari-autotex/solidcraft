@@ -6,6 +6,13 @@ available in every project using that profile and survive restarting the applica
 
 Selecting a different saved name immediately fills the open Hole form. The same
 selection is not reapplied every frame, so subsequent manual edits stay intact.
+A modified selected preset displays `* ` before its name. The small Save icon to the
+right overwrites that same preset without a naming prompt; it is disabled when no
+preset is selected or the parameters are unchanged. Reverting the parameters clears
+the marker. A successful save clears the marker and disables Save again. Invalid
+active values or unrecognized future options report an error without replacing the
+stored preset. The marker is display-only and never becomes part of the preset name.
+
 Each newly opened Hole starts with no selected preset. Recall does not create or edit a feature;
 the normal Hole **OK/Apply** operation validates and commits it. Cancel closes the
 Hole form without changing the model. Saving, renaming or deleting a personal preset
@@ -28,8 +35,8 @@ Use **Rename** to open a name prompt prefilled with the selected name. Confirm
 to rename it; Cancel leaves the library and Hole form unchanged. Empty, overlong
 or duplicate names report an error in the prompt. **Delete** asks for a second
 confirmation and removes only the personal preset. Neither operation edits existing
-holes. Names are unique ignoring case. Saving an existing name reports a conflict
-instead of replacing it silently.
+holes. Names are unique ignoring case. **Save new** with an existing name reports a conflict
+instead of replacing it silently; the adjacent Save icon explicitly updates the selected preset.
 
 The library is limited to 64 entries, names to 96 UTF-8 bytes and each parameter
 expression to 512 UTF-8 bytes. Malformed saved rows are ignored without discarding

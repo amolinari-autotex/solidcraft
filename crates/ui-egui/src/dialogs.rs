@@ -2814,11 +2814,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
             let body = |ui: &mut egui::Ui| {
                 d.sync_fillet_chain(&app.session);
-                crate::hole_presets::rows(ui, &mut d, &mut app.preferences.hole_presets, reset_scroll);
+                crate::hole_presets::rows(ui, &mut d, &mut app.preferences.hole_presets, &app.session.doc, reset_scroll);
                 let (accepted, fields) = crate::ui_kit::value_fields(ctx, || dense::rows(app, ctx, &mut d, ui));
                 enter |= accepted;
                 value_fields = fields;
-)
                 d.sync_fillet_chain(&app.session);
                 if cell_enter {
                     ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
@@ -2904,7 +2903,6 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         enter = false;
         ok = false;
         cancel = false;
-)
     }
     // Keyboard: Enter applies (from a value field, or with nothing focused), Esc cancels.
     let (enter_free, esc) = ctx.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
