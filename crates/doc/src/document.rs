@@ -2020,12 +2020,20 @@ pub enum HoleKind {
         cb_diameter: Expr,
         #[walk(length = "Counterbore depth")]
         cb_depth: Expr,
+        /// Optional drill point below the narrow cylindrical bore; absent stays flat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Tip angle")]
+        tip_angle: Option<Expr>,
     },
     Countersink {
         #[walk(length = "Countersink diameter")]
         cs_diameter: Expr,
         #[walk(angle = "Countersink angle")]
         cs_angle: Expr,
+        /// Optional drill point, independent of the entry countersink.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Tip angle")]
+        tip_angle: Option<Expr>,
     },
 }
 

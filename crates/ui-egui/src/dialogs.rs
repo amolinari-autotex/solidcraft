@@ -3856,7 +3856,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 } else if !opts.all {
                     params["depth"] = json!(depth);
                 }
-                if ty == "drilled" {
+                if ty == "drilled" || (opts.angled && !opts.all) {
                     params["tip_angle"] = json!(opts.tip_angle);
                 }
                 if opts.tapped {
@@ -4632,15 +4632,23 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                     *dep = dd.to_string();
                 }
                 match hole {
-                    HoleKind::Counterbore { cb_diameter: a, cb_depth: b } => {
+                    HoleKind::Counterbore { cb_diameter: a, cb_depth: b, tip_angle } => {
                         *kind = 1;
                         *cb_diameter = a.to_string();
                         *cb_depth = b.to_string();
+                        if let Some(angle) = tip_angle {
+                            opts.angled = true;
+                            opts.tip_angle = angle.to_string();
+                        }
                     }
-                    HoleKind::Countersink { cs_diameter: a, cs_angle: b } => {
+                    HoleKind::Countersink { cs_diameter: a, cs_angle: b, tip_angle } => {
                         *kind = 2;
                         *cs_diameter = a.to_string();
                         *cs_angle = b.to_string();
+                        if let Some(angle) = tip_angle {
+                            opts.angled = true;
+                            opts.tip_angle = angle.to_string();
+                        }
                     }
                     HoleKind::Drilled { tip_angle } => {
                         opts.tip_angle = tip_angle.to_string();
@@ -5190,6 +5198,34 @@ mod refused_ok_tests {
 
     fn set_depth(h: &mut Harness, depth: &str) {
         steps(h, &[json!({"click": {"handle": "dialog:Depth"}}), json!({"key": "A", "cmd": true}), json!({"text": depth})]);
+    }
+
+    #[test]
+    fn recessed_drill_point_controls_and_payload_follow_the_bottom_choice() {
+        for recessed in [1, 2] {
+            let mut h = hole_dialog();
+            if let Kind::Hole { kind, opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+                *kind = recessed;
+                opts.angled = true;
+                opts.tip_angle = "118 deg".into();
+            }
+            h.frames(2);
+            assert!(crate::scenario::rect_of("dialog:widget:Drill Point").is_some());
+            assert!(crate::scenario::rect_of("dialog:widget:Tip Angle").is_some());
+            let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+            assert_eq!(commands[0].1["tip_angle"], "118 deg");
+            if let Kind::Hole { opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+                opts.angled = false;
+            }
+            h.frames(2);
+            assert!(crate::scenario::rect_of("dialog:widget:Tip Angle").is_none());
+            assert!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap()[0].1.get("tip_angle").is_none());
+            if let Kind::Hole { opts, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+                opts.all = true;
+            }
+            h.frames(2);
+            assert!(crate::scenario::rect_of("dialog:widget:Drill Point").is_none());
+        }
     }
 
     /// What the dialog shows in red once the live preview has finished: its own error, else the

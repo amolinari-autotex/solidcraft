@@ -2019,10 +2019,13 @@ fn hole(s: &mut Session, p: &Value) -> Result<Value> {
             _ => solidcraft_doc::HoleKind::Simple,
         },
         "drilled" => solidcraft_doc::HoleKind::Drilled { tip_angle: expr(p, "tip_angle").unwrap_or_else(|| "118 deg".into()) },
-        "counterbore" => solidcraft_doc::HoleKind::Counterbore { cb_diameter: get("cb_diameter")?, cb_depth: get("cb_depth")? },
+        "counterbore" => {
+            solidcraft_doc::HoleKind::Counterbore { cb_diameter: get("cb_diameter")?, cb_depth: get("cb_depth")?, tip_angle: expr(p, "tip_angle") }
+        }
         "countersink" => solidcraft_doc::HoleKind::Countersink {
             cs_diameter: get("cs_diameter")?,
             cs_angle: expr(p, "cs_angle").unwrap_or_else(|| "90 deg".into()),
+            tip_angle: expr(p, "tip_angle"),
         },
         other => return Err(bad(cmd, format!("unknown hole type `{other}`"))),
     };

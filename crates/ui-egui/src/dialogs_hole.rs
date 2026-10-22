@@ -41,8 +41,8 @@ impl Dim {
 }
 
 /// The sizes a hole of type `kind` takes, top to bottom: a depth unless it goes through all or
-/// to an object, a diameter unless it is tapped (the thread sets it), a tip angle for an angled
-/// tip at the bottom of a blind simple hole.
+/// to an object, a diameter unless tapped, and a tip angle for an angled bottom
+/// independently of the entry recess.
 pub(crate) fn dims(kind: usize, opts: &HoleOpts, to_object: bool) -> Vec<Dim> {
     let mut v = match kind {
         1 => vec![Dim::TopDiameter, Dim::CbDepth],
@@ -58,7 +58,7 @@ pub(crate) fn dims(kind: usize, opts: &HoleOpts, to_object: bool) -> Vec<Dim> {
     if !opts.tapped {
         v.push(Dim::Diameter);
     }
-    if kind == 0 && opts.angled && !opts.all {
+    if opts.angled && !opts.all {
         v.push(Dim::TipAngle);
     }
     v
@@ -113,7 +113,7 @@ pub(crate) fn rows(ui: &mut egui::Ui, k: &mut Kind, to_object: bool, eval: &dyn 
         kind,
         through: opts.all,
         to_object,
-        angled: kind == 0 && opts.angled,
+        angled: opts.angled,
         tapped: opts.tapped,
         thread_fraction: if opts.thread_full_depth {
             1.0
@@ -351,18 +351,18 @@ fn paint(p: &egui::Painter, pic: Rect, s: &Section, slots: &[(Dim, Rect, bool)])
         leader(Dim::CbDepth, pos2(x, y.clamp(top + 2.0, step - 2.0)));
         x += pic.width() * 0.10;
     }
-    if let Some(y) = y_of(Dim::Depth) {
-        p.line_segment([pos2(cx + bore_r, shoulder), pos2(x + 3.0, shoulder)], thin(Dim::Depth));
-        p.line_segment([pos2(right, top), pos2(x + 3.0, top)], thin(Dim::Depth));
-        dimension(p, pos2(x, top), pos2(x, shoulder), ink(Dim::Depth));
-        leader(Dim::Depth, pos2(x, y.clamp(top + 2.0, shoulder - 2.0)));
-        x += pic.width() * 0.10;
-    }
     if let Some(y) = y_of(Dim::ThreadDepth) {
         p.line_segment([pos2(cx + bore_r * 1.22, thread_start), pos2(x + 3.0, thread_start)], thin(Dim::ThreadDepth));
         p.line_segment([pos2(cx + bore_r * 1.22, thread_end), pos2(x + 3.0, thread_end)], thin(Dim::ThreadDepth));
         dimension(p, pos2(x, thread_start), pos2(x, thread_end), ink(Dim::ThreadDepth));
         leader(Dim::ThreadDepth, pos2(x, y.clamp(thread_start, thread_end.max(thread_start))));
+        x += pic.width() * 0.10;
+    }
+    if let Some(y) = y_of(Dim::Depth) {
+        p.line_segment([pos2(cx + bore_r, shoulder), pos2(x + 3.0, shoulder)], thin(Dim::Depth));
+        p.line_segment([pos2(right, top), pos2(x + 3.0, top)], thin(Dim::Depth));
+        dimension(p, pos2(x, top), pos2(x, shoulder), ink(Dim::Depth));
+        leader(Dim::Depth, pos2(x, y.clamp(top + 2.0, shoulder - 2.0)));
     }
     if let Some(y) = y_of(Dim::CsAngle) {
         // About the point where the countersink's sides meet, between them.
@@ -394,6 +394,56 @@ fn paint(p: &egui::Painter, pic: Rect, s: &Section, slots: &[(Dim, Rect, bool)])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recessed_drill_point_total_depth_dimension_is_outside_partial_tapping() {
+        for kind in [1, 2] {
+            for width in [80.0, 120.0] {
+                for fraction in [0.05, 0.5] {
+                    let ctx = crate::fonts::test_context();
+                    let pic = Rect::from_min_size(pos2(10.0, 10.0), vec2(width, 200.0));
+                    let section = Section {
+                        kind,
+                        through: false,
+                        to_object: false,
+                        angled: false,
+                        tapped: true,
+                        thread_fraction: fraction,
+                        ratio: 0.5,
+                        cs_half: std::f32::consts::FRAC_PI_4,
+                        tip_half: 1.03,
+                    };
+                    let slots = [
+                        (Dim::TopDiameter, 25.0),
+                        (if kind == 1 { Dim::CbDepth } else { Dim::CsAngle }, 60.0),
+                        (Dim::Depth, 105.0),
+                        (Dim::ThreadDepth, 145.0),
+                    ]
+                    .map(|(dim, y)| (dim, Rect::from_min_size(pos2(150.0, y), vec2(100.0, 20.0)), false));
+                    let output = ctx.run_ui(egui::RawInput::default(), |ui| paint(ui.painter(), pic, &section, &slots));
+                    let mut dimensions: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|clipped| match &clipped.shape {
+                            Shape::LineSegment { points, stroke }
+                                if (stroke.width - 1.0).abs() < 1e-4
+                                    && (points[0].x - points[1].x).abs() < 1e-4
+                                    && points[0].x > pic.left() + width * 0.68
+                                    && (points[0].y - points[1].y).abs() > 0.5 =>
+                            {
+                                Some((points[0].x, (points[0].y - points[1].y).abs()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(dimensions.len() >= 2, "both total and partial depths must be drawn");
+                    dimensions.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let total = dimensions[0];
+                    assert!(dimensions.iter().skip(1).all(|shorter| total.0 > shorter.0), "longest drill depth must be outside: {dimensions:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn tapped_section_uses_the_current_nominal_size_and_pitch() {
