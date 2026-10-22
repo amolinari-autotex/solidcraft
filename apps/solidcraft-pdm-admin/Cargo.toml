@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 solidcraft-pdm = { path = "../solidcraft-pdm" }
+solidcraft-ui-egui.workspace = true
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 egui.workspace = true
 rfd.workspace = true

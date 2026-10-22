@@ -8,6 +8,7 @@ mod pdm_credentials;
 mod service;
 use service::{Action, MemoryCredentials, Service, Snapshot};
 use solidcraft_pdm::managed::Role;
+use solidcraft_ui_egui::ui_kit::{Container, Surface};
 use std::{
     path::PathBuf,
     sync::{
@@ -508,8 +509,16 @@ impl eframe::App for Console {
                 // function, retaining ALL initial font/texture deltas.
                 let proof_ctx = egui::Context::default();
                 let mut frames = Vec::new();
-                for (page, filename) in [(1, "server-console-proof.png"), (2, "server-console-accounts.png"), (3, "server-console-audit.png")] {
+                for (page, filename) in [
+                    (1, "server-console-proof.png"),
+                    (2, "server-console-accounts.png"),
+                    (3, "server-console-audit.png"),
+                    (2, "server-console-confirmation.png"),
+                ] {
                     self.page = page;
+                    if filename == "server-console-confirmation.png" {
+                        self.confirm = Some(Confirm::Disable("design-reader".into()));
+                    }
                     for settle in 0..4 {
                         let input = egui::RawInput {
                             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0, 780.0))),
@@ -577,7 +586,8 @@ impl Console {
         if let Some(confirm) = self.confirm.take() {
             let text = match &confirm { Confirm::Disable(id) => format!("Disable account {id}? Its credentials will stop authenticating on the next request."), Confirm::Reset(id) => format!("Replace credential for {id}? The old credential will stop working; the new credential is captured only on this machine."), Confirm::Restore => "Restore this verified backup to the NEW installation directory? The original remains intact; retain its private credential and TLS data.".into() };
             let mut keep = true;
-            egui::Window::new("Confirm administration change").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
+            let modal = Container::new(ui.ctx(), Surface::Window).modal(egui::Id::new("Confirm administration change")).show(ui.ctx(), |ui| {
+                ui.heading("Confirm administration change");
                 ui.label(text);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
@@ -594,6 +604,9 @@ impl Console {
                     }
                 });
             });
+            if modal.should_close() {
+                keep = false;
+            }
             if keep {
                 self.confirm = Some(confirm);
             }
@@ -651,6 +664,83 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn confirmation_fixture() -> (Console, Receiver<Job>) {
+        let (sender, jobs) = mpsc::sync_channel(1);
+        let (_, receiver) = mpsc::sync_channel(2);
+        let worker = Worker { sender: Some(sender), receiver, join: None };
+        let mut console = Console::new(worker, None, Arc::new(AtomicBool::new(false)));
+        console.confirm = Some(Confirm::Disable("toy-user".into()));
+        (console, jobs)
+    }
+
+    fn confirmation_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080.0, 780.0))),
+            events,
+            focused: true,
+            ..Default::default()
+        }
+    }
+
+    fn text_center(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos + text.galley.size() * 0.5),
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_center(shape, label)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn confirmation_cancel_and_confirm_dispatch_only_the_explicit_choice() -> Result<(), Box<dyn std::error::Error>> {
+        for label in ["Cancel", "Confirm"] {
+            let (mut console, jobs) = confirmation_fixture();
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(confirmation_input(vec![]), |ui| console.draw_frame(ui));
+            for _ in 0..3 {
+                output = ctx.run_ui(confirmation_input(vec![]), |ui| console.draw_frame(ui));
+            }
+            assert!(matches!(jobs.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            let pos = output.shapes.iter().find_map(|shape| text_center(&shape.shape, label)).ok_or("confirmation button not rendered")?;
+            for pressed in [true, false] {
+                let events = vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+                ];
+                let _ = ctx.run_ui(confirmation_input(events), |ui| console.draw_frame(ui));
+            }
+            assert!(console.confirm.is_none());
+            if label == "Confirm" {
+                assert!(matches!(jobs.try_recv()?, Job::Service(Action::Enabled { id, enabled: false }) if id == "toy-user"));
+                assert!(console.busy);
+            } else {
+                assert!(!console.busy);
+            }
+            assert!(matches!(jobs.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn confirmation_escape_dismisses_without_dispatching_an_administration_change() {
+        let (mut console, jobs) = confirmation_fixture();
+        let ctx = egui::Context::default();
+        for _ in 0..4 {
+            let _ = ctx.run_ui(confirmation_input(vec![]), |ui| console.draw_frame(ui));
+        }
+        let event = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: Some(egui::Key::Escape),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run_ui(confirmation_input(vec![event]), |ui| console.draw_frame(ui));
+        assert!(console.confirm.is_none());
+        assert!(!console.busy);
+        assert!(matches!(jobs.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
     #[test]
     fn proof_tessellation_keeps_glyph_uvs_from_the_original_frame() {
         let ctx = egui::Context::default();

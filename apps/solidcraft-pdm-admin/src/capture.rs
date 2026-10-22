@@ -3,7 +3,7 @@ use eframe::egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor, wgpu};
 use std::{collections::BTreeMap, fmt, sync::mpsc, time::Duration};
 
 const MAX_SIDE: u32 = 2048;
-// The console proof paints twelve settled frames across three pages.
+// The console proof paints sixteen settled frames across four pages.
 const MAX_FRAMES: u32 = 64;
 const MAX_TEXTURES: usize = 256;
 const MAX_TEXTURE_SIDE: usize = 4096;
