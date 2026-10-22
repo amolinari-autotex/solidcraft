@@ -38,7 +38,13 @@ no design-file format change or dependency on a project, PDM service or connecti
 
 Older drilled presets still imply an angled bottom; older recess presets default to flat.
 
-The preference record reserves defaulted thread options for future independent
-thread-depth and handedness changes. This version keeps those options on rename
-and serialization, but rejects Recall when they contain values its Hole dialog
-cannot represent. No support for those future features is implied.
+Presets retain Right/Left thread direction and Full/Partial tapping independently
+of drill depth. Partial-depth expressions carry explicit source units, so recalling
+an mm preset in an inch design keeps the same physical depth. Older records without
+these options retain Right/Full defaults. A recalled preset clears an unfinished
+Custom thread draft; saving an invalid active Custom draft reports an error instead
+of saving its last valid value. Inactive diameter and full-depth fields do not block
+saving a valid tapped preset.
+
+Unrecognized future thread options survive renaming and serialization. Recall
+rejects them before changing any Hole field, rather than silently discarding them.
