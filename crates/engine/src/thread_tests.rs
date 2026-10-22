@@ -286,7 +286,6 @@ fn thread_handedness_modelled_internal_and_external_keep_chirality_and_bounded_v
     }
 }
 
-
 /// Keep the original 48-station reproduction of the shell error even though new fine
 /// threads now use more stations. The same cut polygons must rebuild as a closed solid.
 #[test]

@@ -30,10 +30,8 @@ enum Extent {
     ToObject,
 }
 
-/// Additive thread options retain their defaults in older presets. The mapper for a
-/// future thread-depth/handedness feature can extend this record without a design ID.
-/// This version preserves these values on rename/save, but refuses to silently recall
-/// a non-default option its Hole dialog cannot yet represent.
+/// Additive thread options retain their defaults in older presets. Known options map to
+/// the Hole form without design IDs; unknown options survive rename and refuse recall.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct ThreadOptions {
@@ -88,7 +86,7 @@ impl Preset {
         if expressions.into_iter().any(|text| !valid_text(text, MAX_EXPRESSION)) {
             return Err("hole_presets.invalid_parameters");
         }
-        let mut required = vec![&self.diameter];
+        let mut required = if self.tapped { Vec::new() } else { vec![&self.diameter] };
         if self.extent == Extent::Distance {
             required.push(&self.depth);
         }
@@ -103,10 +101,13 @@ impl Preset {
         }
         if self.tapped {
             required.push(&self.thread);
+            if !self.thread_options.full_length {
+                required.push(self.thread_options.depth.as_ref().ok_or("hole_presets.invalid_parameters")?);
+            }
         }
         if required.into_iter().any(|text| text.trim().is_empty())
             || !["right", "left"].contains(&self.thread_options.handedness.as_str())
-            || self.thread_options.depth.as_ref().is_some_and(|text| text.trim().is_empty() || !valid_text(text, MAX_EXPRESSION))
+            || self.thread_options.depth.as_ref().is_some_and(|text| !valid_text(text, MAX_EXPRESSION))
             || self.thread_options.unknown.len() > 8
             || self.thread_options.unknown.iter().any(|(key, value)| {
                 key.is_empty()
@@ -127,6 +128,9 @@ impl Preset {
         let Kind::Hole { diameter, depth, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } = &d.kind else {
             return Err("hole_presets.invalid_parameters");
         };
+        if opts.tapped && opts.custom_thread.as_ref().is_some_and(|draft| draft.error.is_some()) {
+            return Err("hole_presets.invalid_parameters");
+        }
         let (values, _) = doc.param_values();
         let lookup = |name: &str| values.get(name).copied().ok_or_else(|| DocError::Expr(format!("unknown parameter `{name}`")));
         let portable_length = |text: &str, active: bool| -> Result<String, &'static str> {
@@ -170,7 +174,7 @@ impl Preset {
             } else {
                 Extent::Distance
             },
-            diameter: portable_length(diameter, true)?,
+            diameter: portable_length(diameter, !opts.tapped)?,
             depth: portable_length(depth, !opts.all && !d.inputs.iter().any(|input| input.label == "To Object"))?,
             cb_diameter: portable_length(cb_diameter, *kind == 1)?,
             cb_depth: portable_length(cb_depth, *kind == 1)?,
@@ -179,7 +183,16 @@ impl Preset {
             tip_angle: opts.tip_angle.clone(),
             tapped: opts.tapped,
             thread: opts.thread.clone(),
-            thread_options: ThreadOptions::default(),
+            thread_options: if opts.tapped {
+                ThreadOptions {
+                    handedness: if opts.handedness.is_right() { "right".into() } else { "left".into() },
+                    full_length: opts.thread_full_depth,
+                    depth: if opts.thread_full_depth { None } else { Some(portable_length(&opts.thread_depth, true)?) },
+                    unknown: BTreeMap::new(),
+                }
+            } else {
+                ThreadOptions::default()
+            },
         };
         preset.validate()?;
         Ok(preset)
@@ -187,7 +200,7 @@ impl Preset {
 
     fn recall(&self, d: &mut Dialog) -> Result<(), &'static str> {
         self.validate()?;
-        if self.thread_options.handedness != "right" || !self.thread_options.full_length || !self.thread_options.unknown.is_empty() {
+        if !self.thread_options.unknown.is_empty() {
             return Err("hole_presets.unsupported_options");
         }
         let Kind::Hole { diameter, depth, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } = &mut d.kind else {
@@ -210,6 +223,14 @@ impl Preset {
         opts.all = self.extent == Extent::All;
         opts.tapped = self.tapped;
         opts.thread.clone_from(&self.thread);
+        opts.custom_thread = None;
+        opts.handedness = if self.thread_options.handedness == "left" {
+            solidcraft_engine::doc::ThreadHandedness::Left
+        } else {
+            solidcraft_engine::doc::ThreadHandedness::Right
+        };
+        opts.thread_full_depth = self.thread_options.full_length;
+        opts.thread_depth = self.thread_options.depth.clone().unwrap_or_else(|| crate::dialogs::HoleOpts::default().thread_depth);
         // Existing placement picks stay with this dialog. To Object stores its mode only:
         // recalling it always asks for a fresh destination in the current design.
         crate::dialogs::preset_to_object(d, self.extent == Extent::ToObject);
