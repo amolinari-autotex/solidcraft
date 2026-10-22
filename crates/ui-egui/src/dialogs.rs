@@ -2567,7 +2567,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
             let body = |ui: &mut egui::Ui| {
                 d.sync_fillet_chain(&app.session);
-                crate::hole_presets::rows(ui, &mut d, &mut app.preferences.hole_presets, reset_scroll);
+                crate::hole_presets::rows(ui, &mut d, &mut app.preferences.hole_presets, &app.session.doc, reset_scroll);
                 enter |= dense::rows(app, ctx, &mut d, ui);
                 d.sync_fillet_chain(&app.session);
                 if cell_enter {

@@ -198,6 +198,46 @@ impl Preset {
         Ok(preset)
     }
 
+    fn same_parameters(&self, other: &Self) -> bool {
+        let normalized = |preset: &Self| {
+            let mut p = preset.clone();
+            p.name.clear();
+            p.angled_bottom |= p.style == Style::Drilled;
+            if p.style == Style::Drilled {
+                p.style = Style::Simple;
+            }
+            // Unknown options cannot be captured by this form and cannot be overwritten.
+            p.thread_options.unknown.clear();
+            if !p.tapped {
+                p.thread_options = ThreadOptions::default();
+            } else if p.thread_options.full_length {
+                p.thread_options.depth = None;
+            }
+            p
+        };
+        normalized(self) == normalized(other)
+    }
+
+    fn validate_active(&self, doc: &Document) -> Result<(), &'static str> {
+        let length = |text: &str| doc.eval(text, expr::Kind::Length).is_ok_and(|v| v.is_finite() && v > 0.0);
+        let angle = |text: &str| doc.eval(text, expr::Kind::Angle).is_ok_and(|v| v.is_finite() && v > 0.0 && v < std::f64::consts::PI);
+        let style_valid = match self.style {
+            Style::Counterbore => length(&self.cb_diameter) && length(&self.cb_depth),
+            Style::Countersink => length(&self.cs_diameter) && angle(&self.cs_angle),
+            Style::Simple | Style::Drilled => true,
+        };
+        if !style_valid
+            || (!self.tapped && !length(&self.diameter))
+            || (self.extent == Extent::Distance && !length(&self.depth))
+            || (self.extent != Extent::All && (self.angled_bottom || self.style == Style::Drilled) && !angle(&self.tip_angle))
+            || (self.tapped && solidcraft_engine::doc::parse_metric_thread(&self.thread).is_none())
+            || (self.tapped && !self.thread_options.full_length && self.thread_options.depth.as_deref().is_none_or(|text| !length(text)))
+        {
+            return Err("hole_presets.invalid_parameters");
+        }
+        Ok(())
+    }
+
     fn recall(&self, d: &mut Dialog) -> Result<(), &'static str> {
         self.validate()?;
         if !self.thread_options.unknown.is_empty() {
@@ -288,6 +328,26 @@ impl Library {
         Ok(())
     }
 
+    fn modified(&self, selected: &str, d: &Dialog, doc: &Document) -> bool {
+        self.find(selected).and_then(|index| self.0.get(index)).is_some_and(|saved| match Preset::capture(d, &saved.name, doc) {
+            Ok(current) => !current.same_parameters(saved),
+            Err(_) => true,
+        })
+    }
+
+    fn overwrite(&mut self, selected: &str, d: &Dialog, doc: &Document) -> Result<(), &'static str> {
+        let index = self.find(selected).ok_or("hole_presets.missing")?;
+        let saved = self.0.get(index).ok_or("hole_presets.missing")?;
+        if !saved.thread_options.unknown.is_empty() {
+            return Err("hole_presets.unsupported_overwrite");
+        }
+        let candidate = Preset::capture(d, &saved.name, doc)?;
+        candidate.validate_active(doc)?;
+        // Capture and all validation finish before the existing record is replaced.
+        *self.0.get_mut(index).ok_or("hole_presets.missing")? = candidate;
+        Ok(())
+    }
+
     fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
         let new = new.trim();
         if !valid_name(new) {
@@ -319,7 +379,7 @@ struct PanelState {
 
 /// One hook above the existing Hole form. Only the library is persisted in preferences;
 /// selection, errors and the naming prompt belong to this dialog's temporary UI state.
-pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, reset: bool) {
+pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, doc: &Document, reset: bool) {
     if !matches!(d.kind, Kind::Hole { .. }) {
         return;
     }
@@ -330,18 +390,47 @@ pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, res
         crate::dialogs::form_row(ui, "hole_presets.preset", |ui| {
             let before = library.find(&state.selected).map_or(0, |index| index + 1);
             let mut selected = before;
-            let mut labels = vec![tr("hole_presets.select")];
-            labels.extend(library.0.iter().map(|preset| preset.name.as_str()));
-            crate::dialogs::combo(ui, "personal_hole_preset_choice", &labels, &mut selected);
+            let dirty = library.modified(&state.selected, d, doc);
+            let display = library.find(&state.selected).and_then(|index| library.0.get(index)).map_or_else(
+                || tr("hole_presets.select").to_string(),
+                |preset| {
+                    if dirty { format!("* {}", preset.name) } else { preset.name.clone() }
+                },
+            );
+            let height = ui_kit::row_height();
+            let width = (ui.available_width() - height - ui.spacing().item_spacing.x).max(1.0);
+            ui.allocate_ui_with_layout(egui::vec2(width, height), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let response = ui_kit::dropdown_menu(ui, "personal_hole_preset_choice", &display, |ui| {
+                    let placeholder = ui.selectable_value(&mut selected, 0, tr("hole_presets.select"));
+                    crate::scenario::publish_handle(&format!("dialog:hole_presets.preset:{}", tr("hole_presets.select")), placeholder.rect.center());
+                    for (index, preset) in library.0.iter().enumerate() {
+                        let option = ui.selectable_value(&mut selected, index + 1, &preset.name);
+                        crate::scenario::publish_handle(&format!("dialog:hole_presets.preset:{}", preset.name), option.rect.center());
+                    }
+                });
+                response.widget_info(|| {
+                    let mut info = egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), tr("hole_presets.preset"));
+                    info.current_text_value = Some(display.clone());
+                    info
+                });
+            });
             if selected != before {
                 let preset = selected.checked_sub(1).and_then(|index| library.0.get(index));
                 state.selected = preset.map_or_else(String::new, |preset| preset.name.clone());
-                // Recall validates every option before changing any draft field. Do this
-                // only on selection changes, so later manual edits remain untouched.
                 state.error = preset.and_then(|preset| preset.recall(d).err());
                 state.prompt = None;
                 state.confirming_delete = false;
             }
+            let modified = library.modified(&state.selected, d, doc);
+            ui.add_enabled_ui(modified, |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(height, height), egui::Sense::hover());
+                let save = ui_kit::icon_button_at(ui, rect, "save", tr("hole_presets.overwrite"));
+                crate::scenario::publish_target("dialog:hole_presets:overwrite", save.rect);
+                if save.clicked() {
+                    state.error = library.overwrite(&state.selected, d, doc).err();
+                    state.confirming_delete = false;
+                }
+            });
         });
         let chosen = library.find(&state.selected);
         ui.horizontal_wrapped(|ui| {
