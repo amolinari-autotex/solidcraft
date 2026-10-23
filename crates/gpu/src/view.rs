@@ -2607,6 +2607,7 @@ mod glass_tests {
             back: [0.0, 0.0, 1.0],
             size_px: [SIZE as f32; 2],
             clip: [0.0; 4],
+            clip_second: [0.0; 4],
             cap: [0.0; 4],
             images: Vec::new(),
             analysis: [0.0; 8],
