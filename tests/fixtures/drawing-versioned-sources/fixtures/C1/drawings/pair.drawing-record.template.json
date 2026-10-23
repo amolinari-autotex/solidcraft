@@ -1,0 +1,39 @@
+{
+  "format": "solidcraft-drawing/N",
+  "format_pending": "${writer_format_pending}",
+  "name": "Versioned pair changed",
+  "sources": [
+    {
+      "id": "${source_a_id}",
+      "path": "../models/plate.solidcraft"
+    },
+    {
+      "id": "${source_b_id}",
+      "path": "../models/block.solidcraft"
+    }
+  ],
+  "properties": {
+    "project": "Versioned drawing acceptance",
+    "description": "One drawing, two source designs"
+  },
+  "units": "${fixed_mm_encoding}",
+  "language": "en",
+  "sheets": [
+    {
+      "id": "${sheet_a_id}",
+      "name": "Plate",
+      "sheet": "${paper_encoding}",
+      "border": "${border_profile_encoding}",
+      "documents": "${plate_root_documents_encoding}",
+      "excluded": "${empty_exclusions_encoding}"
+    },
+    {
+      "id": "${sheet_b_id}",
+      "name": "Block",
+      "sheet": "${paper_encoding}",
+      "border": "${border_profile_encoding}",
+      "documents": "${block_root_documents_encoding}",
+      "excluded": "${empty_exclusions_encoding}"
+    }
+  ]
+}

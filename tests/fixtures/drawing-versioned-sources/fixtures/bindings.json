@@ -1,0 +1,27 @@
+{
+  "purpose": "Fixture binding notes only; this is not an application file format or a JSON schema.",
+  "record_status": "Illustrative template, not an importable drawing. Replace entire placeholder values with writer-owned typed values.",
+  "logical_ids": {
+    "source_a": "The plate source record; one owner-allocated ID reused in C0 and C1.",
+    "source_b": "The block source record; distinct from source_a and reused in C0 and C1.",
+    "sheet_a": "The plate sheet; distinct owner-allocated ID reused in C0 and C1.",
+    "sheet_b": "The block sheet; distinct owner-allocated ID reused in C0 and C1."
+  },
+  "writer_owned": {
+    "format": "The assigned solidcraft-drawing/N format and pending-change policy; never mint N here.",
+    "writer_format_pending": "Use the actual type/value supplied by the Drawing writer, not this placeholder string.",
+    "fixed_mm_encoding": "Fixed millimetres in the agreed Drawing units encoding.",
+    "paper_encoding": "Any one supported paper size/orientation, held fixed across both sheets/states.",
+    "border_profile_encoding": "A copy of the supported border profile; do not assume an ID-only link.",
+    "plate_root_documents_encoding": "The agreed documents value referring by ID to source_a and the plate root component.",
+    "block_root_documents_encoding": "The agreed documents value referring by ID to source_b and the block root component.",
+    "empty_exclusions_encoding": "The agreed empty exclusion value."
+  },
+  "source_root_component": "Existing native fixture documents use root component 0. Bind that identity through the agreed Drawing representation; do not guess a new globally unique ID or rewrite the source.",
+  "not_decided_here": [
+    "ID representation",
+    "Drawing field value types",
+    "View/cache record encoding",
+    "Printed revision versus protected repository tag"
+  ]
+}
