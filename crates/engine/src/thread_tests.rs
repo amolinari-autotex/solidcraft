@@ -159,7 +159,11 @@ fn thread_handedness_cosmetic_defaults_and_save_reopen_keep_axis_and_extent() {
             let mut s = Session::default();
             let (command, mut params) = if hole {
                 run(&mut s, "solid.box", json!({"length":20,"width":20,"height":10}));
-                ("solid.hole", json!({"position":[10,10,10],"thread":"M6","depth":6}))
+                (
+                    "solid.hole",
+                    json!({"position":[10,10,10],"thread":"M6","depth":6,
+                        "references":[{"edge":[0,10,10],"distance":"7 mm"},{"edge":[10,0,10],"distance":"8 mm"}]}),
+                )
             } else {
                 run(&mut s, "solid.cylinder", json!({"radius":3,"height":6}));
                 ("solid.thread", json!({"face":[3,0,2],"designation":"M6","length":4}))
