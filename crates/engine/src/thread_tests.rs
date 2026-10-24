@@ -27,7 +27,7 @@ const SIZES: [(f64, f64); 9] = [(3.0, 0.5), (4.0, 0.7), (5.0, 0.8), (6.0, 1.0), 
 #[test]
 fn thread_handedness_cosmetic_defaults_and_save_reopen_keep_axis_and_extent() {
     use solidcraft_doc::{Document, FeatureKind, ThreadHandedness};
-    for hole in [false, true] {
+    for (hole, designation) in [(false, "M6"), (true, "M6"), (true, "G 1/4"), (true, "1/4-20 UNC")] {
         let mut reference = None;
         for hand in [None, Some("right"), Some("left")] {
             let mut s = Session::default();
@@ -35,7 +35,7 @@ fn thread_handedness_cosmetic_defaults_and_save_reopen_keep_axis_and_extent() {
                 run(&mut s, "solid.box", json!({"length":20,"width":20,"height":10}));
                 (
                     "solid.hole",
-                    json!({"position":[10,10,10],"thread":"M6","depth":6,
+                    json!({"position":[10,10,10],"thread":designation,"depth":6,
                         "references":[{"edge":[0,10,10],"distance":"7 mm"},{"edge":[10,0,10],"distance":"8 mm"}]}),
                 )
             } else {
