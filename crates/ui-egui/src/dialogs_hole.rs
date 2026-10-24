@@ -64,14 +64,14 @@ pub(crate) fn dims(kind: usize, opts: &HoleOpts, to_object: bool) -> Vec<Dim> {
     v
 }
 
-/// Tapped bores follow the engine's rounded nominal-minus-pitch sizing policy.
+/// Tapped bores use the engine's catalogued cut-tap drill, including Unified and parallel pipe sizes.
 /// A custom draft with an error must not illustrate its stale, last valid designation.
 fn bore_diameter(diameter: &str, opts: &HoleOpts, eval: &dyn Fn(&str, ValueKind) -> Option<f64>) -> Option<f64> {
     if opts.tapped {
         if opts.custom_thread.as_ref().is_some_and(|draft| draft.error.is_some()) {
             return None;
         }
-        solidcraft_engine::doc::parse_metric_thread(&opts.thread).map(|(major, pitch)| ((major - pitch) * 1000.0).round() / 1000.0)
+        solidcraft_engine::doc::parse_tapped_thread(&opts.thread).map(|size| size.tap_drill)
     } else {
         eval(diameter, ValueKind::Length).filter(|v| v.is_finite() && *v > 0.0)
     }
@@ -452,6 +452,10 @@ mod tests {
         assert_eq!(bore_diameter("4 mm", &opts, &stale_diameter), Some(6.75));
         opts.thread = "M8x1.2".into();
         assert_eq!(bore_diameter("4 mm", &opts, &stale_diameter), Some(6.8));
+        for (designation, drill) in [("G 1/4", 11.75), ("Rp 1/4", 11.4), ("1/4-20 UNC", 5.1054)] {
+            opts.thread = designation.into();
+            assert_eq!(bore_diameter("4 mm", &opts, &stale_diameter), Some(drill), "{designation}");
+        }
         opts.thread = "invalid".into();
         assert_eq!(bore_diameter("4 mm", &opts, &stale_diameter), None);
         opts.tapped = false;

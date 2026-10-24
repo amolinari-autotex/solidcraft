@@ -35,6 +35,29 @@ fn assert_tapped_depth(state: &solidcraft_doc::ModelState, entry: Vec3, inward: 
 }
 
 #[test]
+fn tapped_thread_depth_keeps_reference_edge_placement_after_reopen() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":60,"width":60,"height":12}));
+    run(
+        &mut s,
+        "solid.hole",
+        json!({"position":[30,30,12],"thread":"M6","depth":8,"thread_depth":3,
+            "references":[{"edge":[0,25,12],"distance":"10 mm"},{"edge":[25,0,12],"distance":"12 mm"}]}),
+    );
+    let inward = Vec3::new(0.0, 0.0, -1.0);
+    let entry = Vec3::new(10.0, 12.0, 12.0);
+    assert_tapped_depth(&s.model.state(), entry, inward, 0.0, 3.0);
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert_tapped_depth(&reopened.model.state(), entry, inward, 0.0, 3.0);
+    let solidcraft_doc::FeatureKind::Hole { references, thread_depth, .. } = &reopened.doc.features.last().unwrap().kind else {
+        panic!("expected a referenced tapped hole");
+    };
+    assert_eq!(references.len(), 2);
+    assert_eq!(thread_depth.as_ref().unwrap().to_string(), "3");
+    assert!(!reopened.model.state().bodies[0].body.contains(Vec3::new(10.0, 12.0, 10.0)));
+}
+
+#[test]
 fn tapped_thread_depth_is_independent_through_preview_redefine_undo_and_reload() {
     for (height, mut params, full) in
         [(12.0, json!({"depth":8,"type":"drilled"}), 8.0), (12.0, json!({}), 12.0), (12.0, json!({"to":[30,30,5]}), 7.0)]
@@ -78,6 +101,8 @@ fn tapped_thread_depth_is_independent_through_preview_redefine_undo_and_reload()
 fn tapped_thread_depth_uses_the_cylinder_beyond_recesses_and_in_shallow_holes() {
     for (height, mut params, offset, full) in [
         (12.0, json!({"thread":"M6","type":"counterbore","cb_diameter":12,"cb_depth":5,"depth":9}), 5.0, 4.0),
+        (12.0, json!({"thread":"G 1/4","type":"counterbore","cb_diameter":20,"cb_depth":5,"depth":9}), 5.0, 4.0),
+        (12.0, json!({"thread":"1/4-20 UNC","type":"counterbore","cb_diameter":12,"cb_depth":5,"depth":9}), 5.0, 4.0),
         (12.0, json!({"thread":"M6","type":"countersink","cs_diameter":11,"cs_angle":"90 deg","depth":9}), 3.0, 6.0),
         (12.0, json!({"thread":"M36","type":"drilled","depth":3}), 0.0, 3.0),
         (5.0, json!({"thread":"M36"}), 0.0, 5.0),

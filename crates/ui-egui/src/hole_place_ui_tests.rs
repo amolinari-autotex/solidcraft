@@ -274,7 +274,12 @@ fn the_dialog_shows_the_sizes_beside_a_section_of_the_hole() {
     h.frames(3);
     let (cb, cbd, depth, dia) = (at("Counterbore Ø"), at("Counterbore depth"), at("Depth"), at("Diameter"));
     assert!(cb.y < cbd.y && cbd.y < depth.y && depth.y < dia.y, "{cb:?} {cbd:?} {depth:?} {dia:?}");
-    assert!(handle_at("dialog:Tip Angle").is_none(), "no tip on a counterbore");
+    assert!(handle_at("dialog:Tip Angle").is_some(), "a counterbore retains the selected angled bottom");
+    if let Some(Kind::Hole { opts, .. }) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
+        opts.angled = false;
+    }
+    h.frames(3);
+    assert!(handle_at("dialog:Tip Angle").is_none(), "a flat bottom needs no tip angle");
     // Through all: no depth.
     if let Some(Kind::Hole { opts, .. }) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
         opts.all = true;
