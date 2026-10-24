@@ -458,7 +458,7 @@ pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, doc
                     }
                     state = PanelState::default();
                 }
-                if ui_kit::button(ui, tr("Cancel"), Button::Normal).clicked() {
+                if ui_kit::button(ui, tr("ui.cancel"), Button::Normal).clicked() {
                     state.confirming_delete = false;
                 }
             });
@@ -520,4 +520,28 @@ pub(crate) fn name_prompt(ctx: &egui::Context, d: &mut Dialog, library: &mut Lib
     }
     ctx.data_mut(|data| data.insert_temp(id, state));
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hole_presets_recall_preserves_current_reference_distances() {
+        let harness = crate::scenario::Harness::new();
+        let mut dialog = Dialog::for_command(&harness.app, "solid.hole").unwrap();
+        let Kind::Hole { opts, .. } = &mut dialog.kind else { panic!("expected Hole") };
+        opts.refs.distance = ["10 mm".into(), "12 mm".into()];
+        let preset = Preset::capture(&dialog, "Portable", &Document::default()).unwrap();
+        let saved = serde_json::to_value(&preset).unwrap();
+        assert!(saved.get("references").is_none() && saved.get("refs").is_none());
+        let Kind::Hole { opts, .. } = &mut dialog.kind else { panic!("expected Hole") };
+        opts.refs.distance = ["17 mm".into(), "18 mm".into()];
+        let references = opts.refs.clone();
+        let inputs = dialog.inputs.clone();
+        preset.recall(&mut dialog).unwrap();
+        let Kind::Hole { opts, .. } = &dialog.kind else { panic!("expected Hole") };
+        assert_eq!(*opts.refs, *references);
+        assert_eq!(dialog.inputs, inputs);
+    }
 }
