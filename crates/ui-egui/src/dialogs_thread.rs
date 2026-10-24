@@ -1,7 +1,9 @@
 //! Tapped-hole catalogues and metric Thread choices share document sizing data.
 //! Browsing choices does not edit the model or freeze an automatic Thread feature.
 
-use solidcraft_engine::doc::{Document, TappedThreadFamily, ThreadHandedness, metric_thread_sizes, parse_metric_thread, parse_tapped_thread, tapped_thread_sizes};
+use solidcraft_engine::doc::{
+    Document, TappedThreadFamily, ThreadHandedness, metric_thread_sizes, parse_metric_thread, parse_tapped_thread, tapped_thread_sizes,
+};
 
 use crate::dialogs::{combo, form_row};
 use crate::i18n::tr;
