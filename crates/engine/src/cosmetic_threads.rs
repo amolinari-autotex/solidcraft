@@ -269,7 +269,8 @@ mod tests {
     #[test]
     fn tapped_hole_marks_survive_reopen_and_rotated_occurrences() {
         let mut s = Session::default();
-        let c = s.execute("component.create", &json!({"name":"Plate"})).unwrap();
+        // This fixture rotates its first component; new assemblies ground that part by default.
+        let c = s.execute("component.create", &json!({"name":"Plate","grounded":false})).unwrap();
         run(&mut s, "solid.box", json!({"length":20,"width":20,"height":10,"body_name":"PlateBody"}));
         run(&mut s, "solid.hole", json!({"position":[10,10,10],"direction":[0,0,-1],"thread":"M6","depth":7}));
         run(&mut s, "occurrence.move", json!({"occurrence":c["occurrence"],"translate":[30,20,10],"axis":[1,0,0],"angle":"90 deg","capture":true}));

@@ -1223,6 +1223,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn model_render_cosmetic_threads_preserve_section_hatch_preview() {
+        let mut app = SolveApp::new(Session::default(), Services::default());
+        for cosmetic_threads in [false, true] {
+            app.preferences.cosmetic_threads = cosmetic_threads;
+            for hatch in [false, true] {
+                app.session.section_hatch = hatch;
+                assert_eq!(view_scene(&app, Default::default()).plain_cap, !hatch);
+                app.session.selection = vec![Sel::Plane { name: "XZ".into() }];
+                app.start("inspect.section");
+                let Some(crate::dialogs::Kind::Section { hatch: preview_hatch, .. }) = app.dialog.as_mut().map(|d| &mut d.kind) else {
+                    panic!("no section dialog")
+                };
+                *preview_hatch = !hatch;
+                assert_eq!(
+                    view_scene(&app, Default::default()).plain_cap,
+                    hatch,
+                    "the preview's hatch overrides the session with cosmetic_threads={cosmetic_threads}"
+                );
+                app.dialog = None;
+            }
+        }
+    }
+
     /// `ui.render` with extra request parameters.
     fn render_with(app: &mut SolveApp, path: &std::path::Path, extra: serde_json::Value) -> Vec<u8> {
         let mut params = json!({"path": path.to_string_lossy(), "width": 200, "height": 140});
