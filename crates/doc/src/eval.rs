@@ -429,7 +429,15 @@ pub fn suggested_thread(st: &ModelState, p: Vec3) -> Result<String> {
 
 /// A cosmetic thread on the cylindrical face at `p`. A `turned` (modelled) thread also fits a
 /// shaft thicker than it, which it turns down to its major diameter first.
-fn thread_on(st: &ModelState, feature: u64, p: Vec3, designation: Option<&str>, length: Option<f64>, turned: bool, handedness: crate::ThreadHandedness) -> Result<ThreadInfo> {
+fn thread_on(
+    st: &ModelState,
+    feature: u64,
+    p: Vec3,
+    designation: Option<&str>,
+    length: Option<f64>,
+    turned: bool,
+    handedness: crate::ThreadHandedness,
+) -> Result<ThreadInfo> {
     thread_on_impl(st, feature, p, designation, length, false, turned, handedness)
 }
 
