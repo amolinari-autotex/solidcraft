@@ -100,9 +100,20 @@
     },
     {
       "id": "A3-no-cache",
-      "start": "C0",
-      "action": "Remove derived cache and reopen.",
-      "expected": "Authored records survive; no unsupported claim that a cached result is current; no invented serialized status."
+      "start": "C0 plus a genuinely generated baseline view and its verified existing derived cache",
+      "action": "Remove the verified baseline derived cache, reopen the drawing through the actual reader/session, and inspect authored identities and the allowed regeneration/no-cache state.",
+      "expected": "Authored records, IDs and references survive unchanged. The real provider either regenerates a result with valid current provenance or reports its agreed no-cache/pending state; it never claims the removed cache is current. No invented serialized status.",
+      "preconditions": [
+        "Generate a real view through the actual view/session provider.",
+        "Verify that the view has produced a nonempty derived cache before removal; fail the scenario setup if no cache was generated.",
+        "Record the authored drawing/source/sheet IDs, references and authored text before cache removal."
+      ],
+      "evidence": [
+        "Baseline view generation and cache-existence evidence",
+        "Cache removal evidence",
+        "Reopened authored IDs and references",
+        "Actual provider regeneration/no-cache observation"
+      ]
     },
     {
       "id": "A3-broken-id",
@@ -117,5 +128,5 @@
       "expected": "No-edit bytes identical in each form. Cache refresh leaves authored text unchanged. Cache never enters text form."
     }
   ],
-  "runtime_status": "Not executed: Drawing reader/writer/container/view/session APIs are pending."
+  "runtime_status": "Not executed: K2 authored record fields are bound; executable scenarios await the actual dependency/container/view/session providers."
 }

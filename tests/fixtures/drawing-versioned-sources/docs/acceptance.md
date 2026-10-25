@@ -21,10 +21,10 @@ repository/
 
 The drawing has two sheets: one documents the plate's root component and the other the block's root component. Its source paths are `../models/plate.solidcraft` and `../models/block.solidcraft`.
 
-| State | Drawing name | Plate dimensions, mm | Block dimensions, mm | Analytic volumes, mm³ |
+| State | Drawing name | Plate dimensions, mm | Block dimensions, mm | Analytic volumes, mmÂ³ |
 | --- | --- | --- | --- | --- |
-| C0 | Versioned pair initial | 40 × 30 × 5 | 10 × 10 × 20 | Plate 6000; block 2000 |
-| C1 | Versioned pair changed | 60 × 30 × 5 | 12 × 10 × 20 | Plate 9000; block 2400 |
+| C0 | Versioned pair initial | 40 Ã— 30 Ã— 5 | 10 Ã— 10 Ã— 20 | Plate 6000; block 2000 |
+| C1 | Versioned pair changed | 60 Ã— 30 Ã— 5 | 12 Ã— 10 Ã— 20 | Plate 9000; block 2400 |
 
 Both sources change at the same paths, so accidentally combining an old drawing with current source files is observable. Source feature identities and logical drawing/source/sheet identities are retained between states. Values are simple rectangular-solid calculations, not measurements from a CAD run.
 
@@ -47,7 +47,7 @@ Both sources change at the same paths, so accidentally combining an old drawing 
 
 **When** a historical-open operation requests C0.
 
-**Then** resolve the C0 drawing and both source blobs from C0 through their relative paths. The drawing name is `Versioned pair initial`; the plate is 40 × 30 × 5 and the block 10 × 10 × 20. Opening C1 yields its changed name and dimensions instead.
+**Then** resolve the C0 drawing and both source blobs from C0 through their relative paths. The drawing name is `Versioned pair initial`; the plate is 40 Ã— 30 Ã— 5 and the block 10 Ã— 10 Ã— 20. Opening C1 yields its changed name and dimensions instead.
 
 Record the requested commit, the resolved path/blob identities and the original source bytes. If geometry is evaluated, check the dimensions/volumes in the table too. File/blob identity is mandatory; a plausible rendered picture alone does not prove historical resolution.
 
@@ -65,7 +65,7 @@ Run each subcase independently from C0; do not carry mutations between subcases.
 | Move `models/block.solidcraft` to `models/block-renamed.solidcraft`, then explicitly Relink that source | Only the selected source path changes. Sheet references remain associated with the block source; no view silently switches to the plate. IDs/references remain internally consistent using the agreed representation. |
 | Remove the plate after a view was successfully generated from C0 | The affected view is `lost`, never `current`. Any retained old image is identified as historical/lost. Opening and listing the authored drawing still work. |
 | Replace only the plate with its C1 bytes after generating C0 views | The affected view is `out of date`, never `current`. A successful explicit update, or the agreed automatic update, may establish a fresh result. This contract does not choose an update mode. |
-| Reopen with derived cache absent | Do not claim that a cached view is current without evidence. Regeneration or the eventual no-cache state belongs to the view/session contract; do not invent an extra serialized status here. |
+| Generate a real baseline view, verify its derived cache exists, then remove that cache and reopen | Fail setup if no baseline cache was generated. Record baseline generation/cache existence and removal. Reopening preserves authored drawing/source/sheet IDs and references. Observe regeneration or the actual provider's agreed no-cache/pending state; never claim that the removed cache is current, and do not invent a serialized status. |
 | Break an internal sheet-to-source reference while leaving its path present | Report a damaged drawing; do not silently allocate a replacement ID, repair the reference or retarget it to a look-alike source. This differs from a valid source reference whose external file is missing. |
 
 Cache provenance belongs to `cache/` or the future session mechanism, never to authored `sources`. View records and cache encodings are later work: the fixture describes the observations required when those APIs exist, not a fabricated cache file or currently executable view test.
@@ -103,4 +103,4 @@ These are declarative expectations for the actual K2 reader, not a parallel pars
 - A new ID comes from the shared allocator and never reuses a removed object's ID during that run. Read/save/read preserves identity; repeated save of the unchanged authored record yields identical bytes.
 - Missing external source files remain distinct from a damaged authored reference. K2 can validate the authored record without opening a model. Dependency-reader invocation counters in A1 still require the actual integration API.
 
-Source binding: `crates/doc/src/drawing.rs`, `drawing_tests.rs`, `ids.rs` and `crates/geom/src/drawing_sheet.rs` at the PR #3891 head recorded in this update's receipt. K2 is still a draft branch: these examples do not claim its merge, container availability, or passing SolidCraft runtime checks.
+Source binding: `crates/doc/src/drawing.rs`, `drawing_tests.rs`, `ids.rs` and `crates/geom/src/drawing_sheet.rs` at K2 commit [`cef6b585e988a526bb69cef29e521a17323b1371`](https://github.com/CamWight/solidcraft/commit/cef6b585e988a526bb69cef29e521a17323b1371), reviewed in draft PR #3891. K2 is still a draft branch: these examples do not claim its merge, container availability, or passing SolidCraft runtime checks.
