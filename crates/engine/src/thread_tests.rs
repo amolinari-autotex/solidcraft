@@ -161,7 +161,7 @@ fn thread_handedness_cosmetic_defaults_and_save_reopen_keep_axis_and_extent() {
                 run(&mut s, "solid.box", json!({"length":20,"width":20,"height":10}));
                 (
                     "solid.hole",
-                    json!({"position":[10,10,10],"thread":designation,"depth":6,
+                    json!({"position":[10,10,10],"thread":designation,"depth":6,"thread_depth":3,
                         "references":[{"edge":[0,10,10],"distance":"7 mm"},{"edge":[10,0,10],"distance":"8 mm"}]}),
                 )
             } else {
@@ -175,6 +175,9 @@ fn thread_handedness_cosmetic_defaults_and_save_reopen_keep_axis_and_extent() {
             let expected = if hand == Some("left") { ThreadHandedness::Left } else { ThreadHandedness::Right };
             let info = s.model.state().threads[0].clone();
             assert_eq!(info.handedness, expected);
+            if hole {
+                assert!((info.end - info.start - 3.0).abs() < 1e-8, "direction must retain the independent thread depth");
+            }
             let dimensions = (info.axis_point, info.axis, info.start, info.end, info.major_diameter, info.pitch);
             assert_eq!(*reference.get_or_insert(dimensions), dimensions, "direction must not change axis, length or size");
             let mut kind = serde_json::to_value(&s.doc.features.last().unwrap().kind).unwrap();
