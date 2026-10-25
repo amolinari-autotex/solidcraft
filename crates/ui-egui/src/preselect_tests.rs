@@ -1290,7 +1290,9 @@ fn thread_handedness_tapped_hole_edit_retains_and_changes_direction() {
     h.step(&json!({"click":{"handle":"dialog:thread.direction"}})).unwrap();
     h.step(&json!({"click":{"handle":"dialog:thread.direction:thread.right_hand"}})).unwrap();
     let command = crate::dialogs::apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
-    assert_eq!(command[0].1["thread_depth"], "3 mm", "editing direction must retain the independent thread depth");
+    assert_eq!(command[0].0, "timeline.redefine");
+    assert_eq!(command[0].1["command"], "solid.hole");
+    assert_eq!(command[0].1["params"]["thread_depth"], "3 mm", "editing direction must retain the independent thread depth");
     h.step(&json!({"widget":"OK"})).unwrap();
     assert!(matches!(&h.app.session.doc.feature(id).unwrap().kind, FeatureKind::Hole { handedness: ThreadHandedness::Right, .. }));
     let state = h.app.session.model.state();
