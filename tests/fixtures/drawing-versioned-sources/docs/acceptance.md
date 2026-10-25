@@ -21,10 +21,10 @@ repository/
 
 The drawing has two sheets: one documents the plate's root component and the other the block's root component. Its source paths are `../models/plate.solidcraft` and `../models/block.solidcraft`.
 
-| State | Drawing name | Plate dimensions, mm | Block dimensions, mm | Analytic volumes, mmÂ³ |
+| State | Drawing name | Plate dimensions, mm | Block dimensions, mm | Analytic volumes, mm³ |
 | --- | --- | --- | --- | --- |
-| C0 | Versioned pair initial | 40 Ã— 30 Ã— 5 | 10 Ã— 10 Ã— 20 | Plate 6000; block 2000 |
-| C1 | Versioned pair changed | 60 Ã— 30 Ã— 5 | 12 Ã— 10 Ã— 20 | Plate 9000; block 2400 |
+| C0 | Versioned pair initial | 40 × 30 × 5 | 10 × 10 × 20 | Plate 6000; block 2000 |
+| C1 | Versioned pair changed | 60 × 30 × 5 | 12 × 10 × 20 | Plate 9000; block 2400 |
 
 Both sources change at the same paths, so accidentally combining an old drawing with current source files is observable. Source feature identities and logical drawing/source/sheet identities are retained between states. Values are simple rectangular-solid calculations, not measurements from a CAD run.
 
@@ -47,7 +47,7 @@ Both sources change at the same paths, so accidentally combining an old drawing 
 
 **When** a historical-open operation requests C0.
 
-**Then** resolve the C0 drawing and both source blobs from C0 through their relative paths. The drawing name is `Versioned pair initial`; the plate is 40 Ã— 30 Ã— 5 and the block 10 Ã— 10 Ã— 20. Opening C1 yields its changed name and dimensions instead.
+**Then** resolve the C0 drawing and both source blobs from C0 through their relative paths. The drawing name is `Versioned pair initial`; the plate is 40 × 30 × 5 and the block 10 × 10 × 20. Opening C1 yields its changed name and dimensions instead.
 
 Record the requested commit, the resolved path/blob identities and the original source bytes. If geometry is evaluated, check the dimensions/volumes in the table too. File/blob identity is mandatory; a plausible rendered picture alone does not prove historical resolution.
 
