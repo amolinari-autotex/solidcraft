@@ -282,7 +282,7 @@ fn alignment_direction(doc: &Document, st: &ModelState, reference: &super::Align
             if owner != component || end_owner != component {
                 return Err(bad("alignment center is not on the origin's component"));
             }
-            let nf = named_face(doc, st, pick, name)?;
+            let nf = named_face(doc, st, component, pick, name)?;
             let cylinder = nf.own_cylinder().ok_or_else(|| bad("alignment center must remain a cylindrical rim"))?;
             let at = end_named(nf.body, nf.face, &cylinder, end).ok_or_else(|| bad("alignment circle rim is missing or ambiguous"))?;
             Ok(Round::at(placed(&nf.offset, cylinder), at).centre - origin)
@@ -312,7 +312,7 @@ fn alignment_direction(doc: &Document, st: &ModelState, reference: &super::Align
             if owner != component {
                 return Err(bad("alignment face is not on the origin's component"));
             }
-            let nf = named_face(doc, st, pick, name)?;
+            let nf = named_face(doc, st, component, pick, name)?;
             nf.cylinder().map(|c| *c.axis).ok_or_else(|| bad("alignment reference must remain cylindrical"))
         }
         AlignmentRef::Construction { feature } => {
@@ -350,12 +350,12 @@ fn alignment_direction(doc: &Document, st: &ModelState, reference: &super::Align
 }
 
 /// The x axis an x reference gives a frame at `o` with axis `z` (`None`: no reference).
-pub(super) fn x_axis(doc: &Document, st: &ModelState, x: Option<&XRef>, o: Vec3, z: Vec3, occurrence: u64) -> Result<Option<Vec3>> {
+pub(super) fn x_axis(doc: &Document, st: &ModelState, component: u64, x: Option<&XRef>, o: Vec3, z: Vec3) -> Result<Option<Vec3>> {
     Ok(match x {
         None => None,
         Some(XRef::Dir(d)) => Some(*d),
         Some(XRef::Reference { reference, reverse }) => {
-            let direction = alignment_direction(doc, st, reference, super::component_of(doc, occurrence)?, o)?;
+            let direction = alignment_direction(doc, st, reference, component, o)?;
             let z = z.normalized().ok_or_else(|| DocError::Invalid("alignment origin has no axis".into()))?;
             let x = (direction - z * direction.dot(z)).normalized().ok_or_else(|| {
                 DocError::Invalid(if matches!(reference, super::AlignmentRef::CircleCenter(_)) {
@@ -369,10 +369,10 @@ pub(super) fn x_axis(doc: &Document, st: &ModelState, x: Option<&XRef>, o: Vec3,
         Some(XRef::Planar { planar_face, reverse }) => {
             // locate_one refuses ambiguous split names; never choose a nearest replacement.
             let (on, pick) = named_face_spot(doc, st, None, planar_face).map_err(DocError::Invalid)?;
-            if on != super::component_of(doc, occurrence)? {
+            if on != component {
                 return Err(DocError::Invalid("alignment face is not on the origin's component".into()));
             }
-            let nf = named_face(doc, st, pick, planar_face)?;
+            let nf = named_face(doc, st, component, pick, planar_face)?;
             let (_, n) = nf.plane()?.ok_or_else(|| DocError::Invalid("alignment reference must remain planar".into()))?;
             let z = z.normalized().ok_or_else(|| DocError::Invalid("alignment origin has no axis".into()))?;
             let x = (n - z * n.dot(z))

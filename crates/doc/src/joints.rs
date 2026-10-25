@@ -917,12 +917,12 @@ pub fn resolve_origin(doc: &Document, st: &ModelState, o: &JointOrigin) -> Resul
                 Some(cn) => cn,
                 None => nearest_plane(doc, st, o, named.as_ref().map_or(*pick, |f| f.point))?,
             };
-            frame(c, n, face::x_axis(doc, st, x.as_ref(), c, n, o.occurrence)?).ok_or_else(bad)
+            frame(c, n, face::x_axis(doc, st, comp, x.as_ref(), c, n)?).ok_or_else(bad)
         }
         Snap::Edge { .. } => edge::edge_frame(doc, st, component_of(doc, o.occurrence)?, &o.snap),
         Snap::CircleCenter { x, .. } => {
             let r = round_of(doc, st, o)?;
-            frame(r.centre, r.z, face::x_axis(doc, st, x.as_ref(), r.centre, r.z, o.occurrence)?).ok_or_else(bad)
+            frame(r.centre, r.z, face::x_axis(doc, st, component_of(doc, o.occurrence)?, x.as_ref(), r.centre, r.z)?).ok_or_else(bad)
         }
     }
 }
