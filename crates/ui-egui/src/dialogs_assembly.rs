@@ -256,9 +256,10 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
                 ],
             )
         }
-        "joint.as_built" => {
-            (Asm::Joint(Box::new(JointForm::new(true, &app.session.doc))), vec![SelInput::new("Components", BODIES, true), SelInput::new("Position", SNAPS, false)])
-        }
+        "joint.as_built" => (
+            Asm::Joint(Box::new(JointForm::new(true, &app.session.doc))),
+            vec![SelInput::new("Components", BODIES, true), SelInput::new("Position", SNAPS, false)],
+        ),
         "joint.origin" => (Asm::JointOrigin { name: String::new(), hover: None }, vec![SelInput::new("Snap", SNAPS, false)]),
         "joint.rigid_group" => (Asm::RigidGroup, vec![SelInput::new("Components", BODIES, true)]),
         "joint.drive" => {
