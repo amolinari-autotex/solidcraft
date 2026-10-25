@@ -17,16 +17,13 @@ The volume oracle is `length × width × height`; no geometry engine was used to
 
 ## Drawing template
 
-`drawings/pair.drawing-record.template.json` is illustrative JSON, **not a valid production drawing file**. `${...}` strings stand for writer-owned values whose exact types are still pending. The filename suffix deliberately avoids claiming that the application can open it.
+`drawings/pair.drawing-record.template.json` now uses the implemented K2 record fields from PR #3891. Its suffix still avoids claiming that the application/container integration can open it.
 
-- `format` shows the proposed `solidcraft-drawing/N` family; `N` is not an allocated version.
-- `format_pending` must be supplied by the writer, not assigned by this fixture.
-- Logical labels `source_a`, `source_b`, `sheet_a` and `sheet_b` must bind to the owner's collision-free IDs. These strings do not choose the final ID representation.
-- Each sheet's `documents` value must bind to its specified source and that design's root component. `bindings.json` records these semantics without inventing the JSON shape of that field.
-- Units, paper, border and exclusions are unbound for the same reason.
-- `sources` contains no last-seen fingerprint, repository identity, commit hash or embedded source geometry.
-
-Only the drawing name changes between the two templates. The two source paths and logical IDs remain the same.
+- `format` is the owner-defined `solidcraft-drawing/1`; the harness reads any `format_pending` names from its pinned writer.
+- Four fixed example IDs use the confirmed 13-character lowercase Crockford base32 encoding, are nonzero and unique, and stay unchanged between C0/C1. A real application allocates IDs through `doc::ids`; there is no counter in the drawing.
+- `documents` names a drawing source ID and the native source root component `0`; the design's component ID is not a drawing ID.
+- Units are fixed millimetres; both sheets are A4 landscape, with no border, `dpi: 300`, and `excluded: {count: false, print: false}`.
+- No runtime reader/serializer/container check has run here. The actual writer still owns canonical serialization and pending migrations.
 
 ## Independent mutations
 
@@ -39,3 +36,5 @@ The declarative `scenarios.json` describes actions for a future harness, not CLI
 - **Broken internal reference:** bind a sheet to a nonexistent source ID while leaving both source files present. This is a damaged record, not an external missing-file case.
 
 No fabricated container, view-cache binary, drawing command implementation or fake successful runtime report is included.
+
+K2 update: examples now carry 13-character nonzero drawing IDs, sheet-level `dpi: 300`, `excluded: {count: false, print: false}`, fixed-mm units, A4 landscape, no border, and `documents: {source, component: 0}`. K3 container/historical integration remains pending; no runtime behavior is claimed. See the acceptance contract and binding notes.

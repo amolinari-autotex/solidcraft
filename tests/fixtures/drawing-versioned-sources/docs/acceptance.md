@@ -1,12 +1,12 @@
 # Versioned drawing and source design acceptance
 
-Draft contract for [#3890](https://github.com/tangency-labs/solidcraft/issues/3890), based on CamWight's [K2 field proposal](https://github.com/tangency-labs/solidcraft/issues/3890#issuecomment-6363836282). The Drawing record and storage APIs are planned, not implemented by this contribution. Field spellings may change in review; bind the fixtures to the agreed writer rather than introducing a second schema.
+Draft contract for [#3890](https://github.com/tangency-labs/solidcraft/issues/3890), updated to CamWight's [implemented K2 fields](https://github.com/tangency-labs/solidcraft/issues/3890#issuecomment-6393737624) and the pinned source of draft PR #3891. K2 provides the authored record; K3 container and historical source/session behavior remain pending. This contribution implements none of those APIs and reports no runtime acceptance.
 
 ## Scope and responsibility
 
 Use one drawing and two source designs in one repository. Establish dependency discovery, historical resolution, relocation/relink behavior and deterministic authored records. The deliverable is an acceptance document and small fixtures. Drawing storage, source evaluation, view generation, UI, Git/jj integration and release policy remain with their respective owners.
 
-CamWight owns the Drawing record/storage boundary. ID representation and the relationship between a printed revision and a protected repository tag remain for jyviko to clarify. `C0` and `C1` below are fixture commit labels, not released part revisions. No repository identity, commit hash or source fingerprint is added to `sources`.
+CamWight owns the Drawing record/storage boundary. IDs now use the single `doc::ids` allocator: 13 lowercase Crockford base32 characters, nonzero and unique across drawing objects. jyviko's agreed release model uses a protected jj tag on a commit, with the printed revision row recording that tag; release implementation remains outside this contribution. `C0` and `C1` below are fixture commit labels, not released part revisions. No repository identity, commit hash or source fingerprint is added to `sources`.
 
 ## Fixture layout and distinguishable states
 
@@ -72,7 +72,7 @@ Cache provenance belongs to `cache/` or the future session mechanism, never to a
 
 ## A4 Deterministic authored text and round trips
 
-Using the eventual writer, bind the template with the assigned `format` / `format_pending`, collision-free IDs and agreed encodings for units, paper, borders, documented components and exclusions.
+Use `Drawing::from_json`, `to_json`, `validate` and `allocate_id` from the pinned K2 implementation. The examples now spell `solidcraft-drawing/1`, fixed millimetres, A4 landscape, no border, root component 0, and the confirmed IDs and sheet fields. Read `format_pending` from that build's `DRAWING.pending_names`; it is omitted in the format-1 examples, not invented here. K3 container checks remain pending its real writer.
 
 For both plain JSON and the container:
 
@@ -88,6 +88,19 @@ The fixture stays within K2's stated caps: two sheets, two sources, short UTF-8 
 
 Each future executable case records its implementation commit, API entry point, fixture hashes, observed outputs and pass/fail result. A1 needs reader/evaluator counters; A2 needs historical blob/path evidence; A3 needs source/view observations; A4 needs actual serializer bytes. Static JSON parsing and analytic arithmetic are preparation checks, not evidence that Drawing behavior passes.
 
-Before executable tests, the owners must supply the writer's ID encoding, format/pending values, units/paper/border/documented-component/exclusion encodings, and later reader/view/session APIs. Use the same logical IDs across C0 and C1. Printed revision labels, protected tags, cross-repository links, choosing latest components, conflict merging and resuming historical work are outside this acceptance slice.
+K2 field spellings and ID encoding are confirmed in PR #3891. Before executable tests, pin its actual head and obtain K3 container and later dependency/source/view/session APIs. Use the same logical IDs across C0 and C1. Printed revision labels, protected tags, cross-repository links, choosing latest components, conflict merging and resuming historical work are outside this acceptance slice.
 
-After human review, the proposed publication is a bounded child issue and a documentation/fixture draft PR targeting `drawings`, referencing #3890. It must not claim to close the parent storage issue or to implement the four behaviors.
+This bounded contribution is published as issue #5428 and draft PR #5430 targeting `drawings`, referencing #3890. It must not claim to close the parent storage issue or to implement the four behaviors.
+
+## Confirmed K2 record checks
+
+These are declarative expectations for the actual K2 reader, not a parallel parser implementation.
+
+- Every source and sheet ID has exactly 13 lowercase Crockford base32 characters, is nonzero and fits u64. Refuse uppercase/alternate spellings, zero, duplicate IDs and unresolved internal source references; never repair them or save an allocation counter. Fixture IDs are retained between C0/C1. Native design component `0` remains valid and is a different ID domain.
+- Sheet `dpi` defaults to 300 and accepts 25 through 2400 inclusive; it belongs to the sheet, not to each view. Refuse out-of-range or nonfinite values. No shaded renderer is exercised here.
+- `excluded: {count, print}` controls sheet count and print/export-all respectively; it does not filter a BOM. Check all four boolean combinations independently.
+- Boundaries: 1..1000 sheets, 0..64 sources, names 1..256 UTF-8 bytes, paths 1..4096 UTF-8 bytes without NUL, drawing JSON at most 16 MiB. The actual reader must accept valid boundary values and refuse invalid values immediately outside each limit; fixtures do not allocate large test trees.
+- A new ID comes from the shared allocator and never reuses a removed object's ID during that run. Read/save/read preserves identity; repeated save of the unchanged authored record yields identical bytes.
+- Missing external source files remain distinct from a damaged authored reference. K2 can validate the authored record without opening a model. Dependency-reader invocation counters in A1 still require the actual integration API.
+
+Source binding: `crates/doc/src/drawing.rs`, `drawing_tests.rs`, `ids.rs` and `crates/geom/src/drawing_sheet.rs` at the PR #3891 head recorded in this update's receipt. K2 is still a draft branch: these examples do not claim its merge, container availability, or passing SolidCraft runtime checks.

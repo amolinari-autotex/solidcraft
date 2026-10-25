@@ -1,14 +1,13 @@
 {
-  "format": "solidcraft-drawing/N",
-  "format_pending": "${writer_format_pending}",
+  "format": "solidcraft-drawing/1",
   "name": "Versioned pair changed",
   "sources": [
     {
-      "id": "${source_a_id}",
+      "id": "1ge30wkvq38r0",
       "path": "../models/plate.solidcraft"
     },
     {
-      "id": "${source_b_id}",
+      "id": "8f47mhx6r2a9c",
       "path": "../models/block.solidcraft"
     }
   ],
@@ -16,24 +15,52 @@
     "project": "Versioned drawing acceptance",
     "description": "One drawing, two source designs"
   },
-  "units": "${fixed_mm_encoding}",
+  "units": {
+    "fixed": {
+      "unit": "mm"
+    }
+  },
   "language": "en",
   "sheets": [
     {
-      "id": "${sheet_a_id}",
+      "id": "3v8x6k0j9sd2n",
       "name": "Plate",
-      "sheet": "${paper_encoding}",
-      "border": "${border_profile_encoding}",
-      "documents": "${plate_root_documents_encoding}",
-      "excluded": "${empty_exclusions_encoding}"
+      "sheet": {
+        "size": {
+          "standard": "a4"
+        },
+        "orientation": "landscape"
+      },
+      "border": null,
+      "documents": {
+        "source": "1ge30wkvq38r0",
+        "component": 0
+      },
+      "excluded": {
+        "count": false,
+        "print": false
+      },
+      "dpi": 300
     },
     {
-      "id": "${sheet_b_id}",
+      "id": "d4q7a2m6t9w3h",
       "name": "Block",
-      "sheet": "${paper_encoding}",
-      "border": "${border_profile_encoding}",
-      "documents": "${block_root_documents_encoding}",
-      "excluded": "${empty_exclusions_encoding}"
+      "sheet": {
+        "size": {
+          "standard": "a4"
+        },
+        "orientation": "landscape"
+      },
+      "border": null,
+      "documents": {
+        "source": "8f47mhx6r2a9c",
+        "component": 0
+      },
+      "excluded": {
+        "count": false,
+        "print": false
+      },
+      "dpi": 300
     }
   ]
 }
