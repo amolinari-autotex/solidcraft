@@ -276,6 +276,7 @@ fn changed_first_cut_adopts_its_entire_suffix_without_window_evaluation() {
     let undo = h.app.session.undo.len();
     h.call("ui.editFeature", json!({"feature":target}));
     h.frames(3);
+    assert!(h.app.session.feature_edit_sketch.is_some(), "the edited Extrude keeps its input sketch visible");
     h.step(&json!({"click":{"handle":"dialog:Distance"}})).unwrap();
     h.step(&json!({"key":"A","cmd":true})).unwrap();
     h.step(&json!({"text":"9 mm"})).unwrap();
@@ -292,6 +293,7 @@ fn changed_first_cut_adopts_its_entire_suffix_without_window_evaluation() {
     });
     assert_eq!(window.features(), (0, 0), "the complete changed suffix is adopted without UI evaluation");
     assert!(h.app.dialog.is_none(), "changed edit did not complete");
+    assert_eq!(h.app.session.feature_edit_sketch, None, "Apply clears the temporary sketch override");
     let after = h.app.run("inspect.measure", json!({})).unwrap();
     let before_volume = before["total"]["volume_mm3"].as_f64().unwrap();
     let after_volume = after["total"]["volume_mm3"].as_f64().unwrap();
@@ -313,7 +315,11 @@ fn cancelling_an_edit_restores_pinned_geometry_without_evaluating_an_evicted_suf
     h.app.run("edit.undo", json!({})).unwrap();
     let before = h.app.session.world_state();
     let history = (h.app.session.undo.len(), h.app.session.redo.len());
+    let visibility = h.app.session.visibility.clone();
     h.call("ui.editFeature", json!({"feature":target}));
+    crate::dialogs::sync_feature_edit_sketch(&mut h.app);
+    let sketch = h.app.session.feature_edit_sketch.expect("edited Extrude exposes its sketch");
+    assert!(solidcraft_engine::view::sketch_shown(&h.app.session, sketch));
     let prepared = result(&h);
     let finish = hold_result(&mut h, false);
     *h.app.session.model.cache.lock().unwrap() = Default::default();
@@ -326,6 +332,8 @@ fn cancelling_an_edit_restores_pinned_geometry_without_evaluating_an_evicted_suf
     assert_eq!(window.features(), (0, 0), "Cancel never rebuilds the old suffix on the window thread");
     assert!(h.app.dialog.is_none() && h.app.applying.is_none() && h.app.editing_state.is_none());
     assert!(finish.send(prepared).is_err());
+    assert_eq!(h.app.session.feature_edit_sketch, None, "Cancel clears the temporary sketch override");
+    assert_eq!(h.app.session.visibility, visibility, "temporary sketch display does not change stored visibility");
     assert_eq!(h.app.session.doc.marker, None);
     assert_eq!((h.app.session.undo.len(), h.app.session.redo.len()), history);
     assert!(std::sync::Arc::ptr_eq(&before, &h.app.session.world_state()));
