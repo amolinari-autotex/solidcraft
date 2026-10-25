@@ -243,7 +243,7 @@ fn hole_presets_save_rename_delete_and_enter_only_change_the_form_or_profile() {
     assert_eq!(h.app.session.doc.features.len(), 1);
     let mut other = crate::SolveApp::new(Default::default(), Default::default());
     other.load_prefs(&saved);
-    assert_eq!(serde_json::to_value(other.preferences.hole_presets).unwrap()[0]["name"], "Workshop");
+    assert_eq!(serde_json::to_value(&other.preferences.hole_presets).unwrap()[0]["name"], "Workshop");
 }
 
 #[test]
