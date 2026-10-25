@@ -218,7 +218,7 @@ fn changed_document_rejects_a_completed_result() {
 fn hole_ok_adopts_real_cut_without_window_evaluation() {
     let mut h = Harness::new();
     h.app.home.open = false;
-    h.app.ui.show_origin = false;
+    h.app.set_origin_shown(false);
     h.app.apply_off_thread = Some(Duration::ZERO);
     h.app.run("solid.box", json!({"length":40,"width":30,"height":20})).unwrap();
     h.call("ui.view", json!({"view":"top"}));

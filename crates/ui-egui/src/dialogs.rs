@@ -2968,6 +2968,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
 /// Close the dialog without applying it (Esc, Cancel). An edit puts the timeline marker back.
 pub fn cancel(app: &mut SolveApp) {
     app.session.feature_edit_sketch = None;
+    if let Some(pending) = &mut app.pending_feature_edit {
+        pending.cancel();
+    }
     app.applying = None;
     if let Some(mut d) = app.dialog.take() {
         crate::dialogs_motion::closed(app, &mut d, false);

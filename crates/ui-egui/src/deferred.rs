@@ -144,7 +144,11 @@ impl SolveApp {
     /// Since when a command, or a delete's check, has been computing off the window thread (ms),
     /// if one is.
     pub fn computing_since(&self) -> Option<f64> {
-        let started = [self.deferred.as_ref().map(|d| d.started), self.delete_check.as_ref().map(|c| c.started)];
+        let started = [
+            self.deferred.as_ref().map(|d| d.started),
+            self.delete_check.as_ref().map(|c| c.started),
+            self.pending_feature_edit.as_ref().map(|edit| edit.started),
+        ];
         started.into_iter().flatten().reduce(f64::min)
     }
 

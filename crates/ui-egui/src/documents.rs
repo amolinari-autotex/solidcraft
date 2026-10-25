@@ -25,6 +25,7 @@ pub struct DocSlot {
     pub(crate) big_operation: bool,
     cam: Camera,
     pre_sketch_marker: Option<Option<usize>>,
+    pub(crate) pending_feature_edit: Option<crate::feature_edit::PendingFeatureEdit>,
     view: DocView,
     occurrence_move: Option<crate::browser::OccMove>,
     agent_chat: crate::agent_chat::AgentChat,
@@ -45,6 +46,7 @@ impl DocSlot {
             big_operation: false,
             cam: Camera::default(),
             pre_sketch_marker: None,
+            pending_feature_edit: None,
             view: DocView::default(),
             occurrence_move: None,
             agent_chat: Default::default(),
@@ -126,6 +128,7 @@ fn swap_in(app: &mut SolveApp, mut slot: DocSlot) -> DocSlot {
         big_operation: std::mem::replace(&mut app.big_operation, slot.big_operation),
         cam: std::mem::replace(&mut app.cam, slot.cam),
         pre_sketch_marker: std::mem::replace(&mut app.pre_sketch_marker, slot.pre_sketch_marker),
+        pending_feature_edit: std::mem::replace(&mut app.pending_feature_edit, slot.pending_feature_edit),
         view: take_view(app),
         occurrence_move: std::mem::replace(&mut app.tree.occurrence_move, slot.occurrence_move),
         agent_chat: slot.agent_chat,
@@ -137,7 +140,11 @@ fn swap_in(app: &mut SolveApp, mut slot: DocSlot) -> DocSlot {
     // Preferences the session holds go with the user, not the tab (#680).
     app.session.auto_project = out.session.auto_project;
     // Views cache by revision: the incoming design must not look unchanged.
+    let before = app.session.revision;
     app.session.invalidate_view(out_rev);
+    if let Some(pending) = &mut app.pending_feature_edit {
+        pending.view_changed(before, app.session.revision);
+    }
     app.ui.ribbon_context = None;
     app.ui.tab = "MODEL".into();
     crate::workspace::sync_context(app);

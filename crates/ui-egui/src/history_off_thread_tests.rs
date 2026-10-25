@@ -28,7 +28,7 @@ fn block_boss_hole() -> Harness {
 /// Frames until nothing computes or waits (a few seconds at most).
 fn until_settled(h: &mut Harness) {
     for _ in 0..500 {
-        if h.app.deferred.is_none() && h.app.deferred_queue.is_empty() && h.app.delete_check.is_none() {
+        if h.app.deferred.is_none() && h.app.deferred_queue.is_empty() && h.app.delete_check.is_none() && h.app.pending_feature_edit.is_none() {
             break;
         }
         h.frames(1);
@@ -183,6 +183,178 @@ fn switching_from_a_sketch_to_a_feature_keeps_the_original_marker_with_backgroun
     until_settled(&mut h);
     assert_eq!(marker(&h), None);
     assert_eq!(h.app.session.model.state().bodies.len(), bodies, "all later bodies return");
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_restores_partial_markers_and_sketch_changes() {
+    for original_marker in [None, Some(4)] {
+        let (mut h, sketches) = sketches_with_later_bodies();
+        h.app.run("timeline.roll_to", json!({"position": original_marker})).unwrap();
+        let bodies = h.app.session.model.state().bodies.len();
+        let feature = h.app.session.doc.features[3].id;
+        h.app.edit_sketch(sketches[0]);
+        h.app.run("sketch.line", json!({"points": [[0, 2], [10, 2]]})).unwrap();
+        h.app.edit_feature(feature);
+        let history = (h.app.session.undo.len(), h.app.session.redo.len());
+        let changed = h.app.session.doc.sketch(sketches[0]).unwrap().clone();
+        until_settled(&mut h);
+        assert!(h.app.dialog.is_some());
+        h.app.session.selection = vec![solidcraft_engine::Sel::Axis { name: "X".into() }];
+        *h.app.session.model.cache.lock().unwrap() = Default::default();
+        let window = std::sync::Arc::new(solidcraft_engine::doc::progress::Progress::default());
+        solidcraft_engine::doc::progress::watch(window.clone(), || crate::dialogs::cancel(&mut h.app));
+        assert_eq!(window.features(), (0, 0), "Cancel uses the pinned matching model");
+        assert_eq!(marker(&h), original_marker);
+        assert_eq!(h.app.session.model.state().bodies.len(), bodies);
+        assert_eq!(h.app.session.doc.sketch(sketches[0]).unwrap(), &changed);
+        assert_eq!((h.app.session.undo.len(), h.app.session.redo.len()), history);
+        assert_eq!(h.app.session.selection, vec![solidcraft_engine::Sel::Axis { name: "X".into() }]);
+    }
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_rejects_replaced_or_changed_documents() {
+    for action in ["new", "change"] {
+        let (mut h, sketches) = sketches_with_later_bodies();
+        let feature = h.app.session.doc.features[3].id;
+        h.app.edit_sketch(sketches[0]);
+        h.app.edit_feature(feature);
+        assert!(h.app.computing_since().is_some());
+        match action {
+            "new" => {
+                h.app.run("file.new", json!({})).unwrap();
+            }
+            "change" => {
+                h.app.run("solid.box", json!({"corner": [80, 0, 0], "length": 2, "width": 2, "height": 2})).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let current = h.app.session.doc.clone();
+        let sketch = h.app.session.active_sketch;
+        until_settled(&mut h);
+        assert!(h.app.dialog.is_none(), "{action} must not open the obsolete editor");
+        assert!(std::sync::Arc::ptr_eq(&current, &h.app.session.doc), "{action} must preserve the current document");
+        assert_eq!(h.app.session.active_sketch, sketch);
+    }
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_applies_with_one_undo_and_redo() {
+    let (mut h, sketches) = sketches_with_later_bodies();
+    let feature = h.app.session.doc.features[3].id;
+    let before = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    h.app.edit_sketch(sketches[0]);
+    h.app.edit_feature(feature);
+    let undo = h.app.session.undo.len();
+    until_settled(&mut h);
+    h.frames(2);
+    h.step(&json!({"click":{"handle":"dialog:length"}})).unwrap();
+    h.step(&json!({"key":"A","cmd":true})).unwrap();
+    h.step(&json!({"text":"12 mm"})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:OK"}})).unwrap();
+    for _ in 0..500 {
+        if h.app.dialog.is_none() {
+            break;
+        }
+        h.frames(1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(h.app.dialog.is_none(), "the edit must finish");
+    assert_eq!(marker(&h), None);
+    assert_eq!(h.app.session.undo.len(), undo + 1);
+    let after = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((after - before - 200.0).abs() < 0.001);
+    h.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(marker(&h), None);
+    let restored = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((restored - before).abs() < 0.001);
+    h.app.run("edit.redo", json!({})).unwrap();
+    let redone = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((redone - after).abs() < 0.001);
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_preserves_the_marker_through_cancel_and_superseding_editors() {
+    for next in ["cancel", "escape", "sketch", "feature", "tab", "tab_back_pending"] {
+        let (mut h, sketches) = sketches_with_later_bodies();
+        let feature = h.app.session.doc.features[3].id;
+        h.app.edit_sketch(sketches[0]);
+        h.app.edit_feature(feature);
+        match next {
+            "cancel" => crate::dialogs::cancel(&mut h.app),
+            "escape" => {
+                h.step(&json!({"key":"Escape"})).unwrap();
+            }
+            "sketch" => {
+                h.app.edit_sketch(sketches[1]);
+                h.app.finish_sketch();
+            }
+            "feature" => {
+                h.app.edit_feature(feature);
+                until_settled(&mut h);
+                crate::dialogs::cancel(&mut h.app);
+            }
+            _ => {
+                let other = solidcraft_engine::Session::new(Default::default());
+                crate::documents::open_tab(&mut h.app, other).unwrap();
+                if next == "tab" {
+                    h.frames(10);
+                }
+                assert!(h.app.session.doc.features.is_empty());
+                crate::documents::switch(&mut h.app, 0);
+            }
+        }
+        until_settled(&mut h);
+        assert!(h.app.dialog.is_none(), "{next} must leave no feature editor");
+        assert_eq!(marker(&h), None, "{next} must restore the original marker");
+        assert_eq!(h.app.session.model.state().bodies.len(), 3);
+    }
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_defers_a_new_command_until_restoration() {
+    let (mut h, sketches) = sketches_with_later_bodies();
+    let feature = h.app.session.doc.features[3].id;
+    let count = h.app.session.doc.features.len();
+    h.app.edit_sketch(sketches[0]);
+    h.app.edit_feature(feature);
+    h.app.start("solid.box");
+    assert!(h.app.dialog.is_none(), "the next dialog waits for the matching model");
+    until_settled(&mut h);
+    assert_eq!(marker(&h), None);
+    assert_eq!(h.app.dialog.as_ref().unwrap().editing, None);
+    let undo = h.app.session.undo.len();
+    h.frames(2);
+    h.step(&json!({"click":{"handle":"dialog:OK"}})).unwrap();
+    for _ in 0..500 {
+        if h.app.dialog.is_none() {
+            break;
+        }
+        h.frames(1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(h.app.dialog.is_none());
+    assert_eq!(marker(&h), None);
+    assert_eq!(h.app.session.doc.features.len(), count + 1);
+    assert_eq!(h.app.session.undo.len(), undo + 1);
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_defers_press_pull_with_its_pick_contract() {
+    let (mut h, sketches) = sketches_with_later_bodies();
+    let feature = h.app.session.doc.features[3].id;
+    h.app.edit_sketch(sketches[0]);
+    h.app.edit_feature(feature);
+    h.app.session.selection.clear();
+    h.app.start("solid.press_pull");
+    assert!(h.app.dialog.is_none());
+    until_settled(&mut h);
+    assert_eq!(marker(&h), None);
+    let dialog = h.app.dialog.as_ref().unwrap();
+    assert!(dialog.press_pull);
+    let picks = dialog.inputs[0].accept;
+    assert_ne!(picks & crate::selection::FACES, 0);
+    assert_ne!(picks & crate::selection::EDGES, 0);
 }
 
 /// A control request for the app, and where its reply lands.
