@@ -1,0 +1,18 @@
+{
+  "en": {
+    "material.selection.choose": "Choose a material",
+    "material.selection.mixed": "Different materials"
+  },
+  "it": {
+    "material.selection.choose": "Scegli un materiale",
+    "material.selection.mixed": "Materiali diversi"
+  },
+  "ja": {
+    "material.selection.choose": "材料を選択",
+    "material.selection.mixed": "異なる材料"
+  },
+  "zh": {
+    "material.selection.choose": "选择材料",
+    "material.selection.mixed": "不同材料"
+  }
+}

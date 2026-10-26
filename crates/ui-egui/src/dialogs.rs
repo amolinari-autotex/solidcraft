@@ -874,7 +874,9 @@ impl Dialog {
                 },
                 vec![SelInput::new("Cylindrical face", FACES, false)],
             ),
-            "material.assign" => Dialog::new(Kind::Material { index: 1, editor: Default::default() }, vec![SelInput::new("Bodies", BODIES, true)]),
+            "material.assign" => {
+                Dialog::new(Kind::Material { index: usize::MAX, editor: Default::default() }, vec![SelInput::new("Bodies", BODIES, true)])
+            }
             "inspect.section" => Dialog::new(
                 Kind::Section { offset: length_default(s, "0"), flip: false, hatch: true },
                 vec![SelInput::new("Plane", PLANES | PLANAR_FACES, false)],
@@ -1101,8 +1103,15 @@ impl Dialog {
             inp.items = default_profiles(s);
         }
         d.sync_thread(s);
+        d.sync_material(s);
         d.advance();
         Some(d)
+    }
+
+    fn sync_material(&mut self, s: &Session) {
+        let Kind::Material { index, editor } = &mut self.kind else { return };
+        let bodies = self.inputs.first().map(|input| input.items.body_names()).unwrap_or_default();
+        editor.sync_selection(&s.doc, &bodies, index);
     }
 
     /// Resolve a newly selected face without replacing an authored size or changing the
@@ -1482,6 +1491,7 @@ impl Dialog {
         self.focus = true;
         self.error = None;
         self.sync_thread(s);
+        self.sync_material(s);
         true
     }
 
@@ -1554,6 +1564,7 @@ impl Dialog {
         }
         self.error = None;
         self.sync_thread(s);
+        self.sync_material(s);
     }
 
     /// Box selection result: replace (or add to) the active input.
@@ -1599,6 +1610,7 @@ impl Dialog {
             }
         }
         self.sync_thread(s);
+        self.sync_material(s);
     }
 
     /// Rebuild a Fillet or Chamfer dialog's edge input from the edges that were picked when
@@ -2774,6 +2786,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     sync_reach(app, &mut d);
     auto_operation(app, &mut d);
     d.sync_thread(&app.session);
+    d.sync_material(&app.session);
     update_measure(app, &mut d);
     update_fill_cells(app, &mut d);
     // A refused OK's error is about the inputs it ran with (#641). Once a value (in the dialog,
@@ -2833,7 +2846,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         Kind::Sketch => false,
         // Nothing picked is an answer too: OK empties the chat's tray.
         Kind::ChatContext => true,
-        Kind::Material { editor, .. } if editor.editing() => false,
+        Kind::Material { editor, .. } => !editor.editing() && apply_commands(app, &d).is_ok(),
         Kind::SaveMesh(_) => crate::dialogs_save_mesh::ready(&d.inputs),
         Kind::SketchModify(crate::sketch_modify_ui::Mod::Corner { .. }) => {
             // Corner dialogs: preview errors are visual only; validation errors from
@@ -3650,6 +3663,7 @@ pub(crate) fn report_title(d: &Dialog) -> String {
 /// The commands OK runs (an edit rebuilds its feature in place); the live preview runs the same.
 pub fn apply_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, String> {
     let mut normalized = d.clone();
+    normalized.sync_material(&app.session);
     for value in crate::length_input::fields(&app.session.doc, &mut normalized.kind) {
         *value = crate::length_input::expression(&app.session.doc, value, ValueKind::Length);
     }
@@ -4298,7 +4312,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 return Err(crate::i18n::tr("material.editor.save_or_discard").to_string());
             }
             need(0, "bodies")?;
-            let name = s.doc.material_names().get(*index).cloned().unwrap_or_else(|| solidcraft_engine::doc::DEFAULT_MATERIAL.into());
+            let name = s.doc.material_names().get(*index).cloned().ok_or_else(|| crate::i18n::tr("material.selection.choose").to_string())?;
             ("material.assign", json!({"bodies": sels(d, 0).body_names(), "material": name}))
         }
         Kind::Section { offset, flip, hatch } => {

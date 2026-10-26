@@ -190,6 +190,7 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
     } else {
         input_rows(d, ui, &app.session);
     }
+    d.sync_material(&app.session);
     match &mut d.kind {
         Kind::Material { index, editor } => crate::material_editor::rows(app, ui, index, editor),
         Kind::Appearance(k) => enter |= crate::dialogs_appearance::rows(app, ui, k, &mut d.inputs),
