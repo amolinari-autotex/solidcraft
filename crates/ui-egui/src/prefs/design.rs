@@ -4,6 +4,9 @@ use super::*;
 pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     ui_kit::settings_heading(ui, app.tr("prefs.design"), app.tr("prefs.design_note"));
+    let response = setting::joint_auto_alignment(app, ui);
+    crate::scenario::publish_rect("prefs:joint_auto_alignment", response.rect);
+    ui_kit::text(ui, app.tr("settings.joint_auto_alignment_help"), ui_kit::Text::Note("joint_auto_alignment"));
     let response = setting::joint_moving_first(app, ui);
     crate::scenario::publish_rect("prefs:joint_moving_first", response.rect);
     ui_kit::text(ui, app.tr("settings.joint_moving_first_help"), ui_kit::Text::Note("joint_order"));

@@ -37,6 +37,67 @@ fn rim(s: &Session, body: &str, center: Vec3) -> (crate::viewport::Hit, Sel) {
 }
 
 #[test]
+fn secondary_alignment_hover_preference_defaults_on_and_persists_transactions() {
+    let old: crate::prefs::Prefs = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(serde_json::to_value(old).unwrap()["joint_auto_alignment"], true);
+    let mut h = crate::scenario::Harness::new();
+    let before = h.app.session.doc.to_json();
+    h.call("ui.prefs", json!({"open":"Design"}));
+    let checkbox = crate::scenario::rect_of("prefs:joint_auto_alignment").unwrap().center();
+    h.call("ui.click", json!({"x":checkbox.x,"y":checkbox.y}));
+    assert_eq!(serde_json::to_value(&h.app.preferences).unwrap()["joint_auto_alignment"], false);
+    let mut restored = SolveApp::new(Session::default(), Default::default());
+    restored.load_prefs(&h.app.prefs());
+    assert_eq!(serde_json::to_value(&restored.preferences).unwrap()["joint_auto_alignment"], false);
+    h.call("ui.prefs", json!({"button":"cancel"}));
+    assert_eq!(serde_json::to_value(&h.app.preferences).unwrap()["joint_auto_alignment"], true);
+    h.call("ui.prefs", json!({"open":"Design","joint_auto_alignment":false}));
+    h.call("ui.prefs", json!({"button":"apply"}));
+    h.call("ui.prefs", json!({"button":"defaults"}));
+    assert_eq!(serde_json::to_value(&h.app.preferences).unwrap()["joint_auto_alignment"], true);
+    h.call("ui.prefs", json!({"button":"cancel"}));
+    assert_eq!(serde_json::to_value(&h.app.preferences).unwrap()["joint_auto_alignment"], false);
+    assert_eq!(h.app.session.doc.to_json(), before);
+    assert!(h.app.session.undo.is_empty());
+}
+
+#[test]
+fn secondary_alignment_hover_preference_disables_automatic_rim_alignment_but_keeps_explicit_picks() {
+    let mut app = round_plates();
+    app.start("joint.create");
+    let mut d = app.dialog.take().unwrap();
+    for p in [Vec3::new(23.0, 20.0, 9.0), Vec3::new(173.0, 20.0, 9.0)] {
+        d.pick(&app.session, face_sel(&app.session, p).unwrap());
+    }
+    let (_, moving) = rim(&app.session, "Body2", Vec3::new(230.0, 20.0, 10.0));
+    d.pick(&app.session, moving);
+    let (hit, fixed) = rim(&app.session, "Body1", Vec3::new(20.0, 60.0, 10.0));
+    let ctx = egui::Context::default();
+    app.dialog = Some(d.clone());
+    settle_alignment_update(&mut app, &ctx);
+    let confirmed_pose = app.preview.interaction.as_ref().unwrap().to_document["Body2"];
+    app.viewport.hover = Some(hit);
+    settle_alignment_update(&mut app, &ctx);
+    assert_ne!(app.preview.interaction.as_ref().unwrap().to_document["Body2"], confirmed_pose);
+    let before = apply_commands(&app, &d).unwrap();
+    let doc = app.session.doc.clone();
+    assert!(alignment_hover_commands(&app, &d).is_some());
+    let mut settings = serde_json::to_value(&app.preferences).unwrap();
+    settings["joint_auto_alignment"] = json!(false);
+    app.preferences = serde_json::from_value(settings).unwrap();
+    assert!(alignment_hover_commands(&app, &d).is_none());
+    settle_alignment_update(&mut app, &ctx);
+    assert_eq!(app.preview.interaction.as_ref().unwrap().to_document["Body2"], confirmed_pose);
+    assert_eq!(apply_commands(&app, &d).unwrap(), before);
+    assert!(d.inputs[3].items.is_empty());
+    d.pick(&app.session, fixed);
+    let confirmed = apply_commands(&app, &d).unwrap();
+    assert_eq!(confirmed[0].1["a_alignment"]["reference"]["type"], "circle_center");
+    app.session.scratch().execute(&confirmed[0].0, &confirmed[0].1).unwrap();
+    assert_eq!(app.session.doc, doc);
+}
+
+#[test]
 fn secondary_alignment_primary_pick_preference_defaults_off_and_persists_transactions() {
     let old: crate::prefs::Prefs = serde_json::from_value(json!({})).unwrap();
     assert_eq!(serde_json::to_value(old).unwrap()["joint_moving_first"], false);

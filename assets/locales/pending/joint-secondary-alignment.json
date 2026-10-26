@@ -1,0 +1,34 @@
+{
+  "en": {
+    "dialog.alignment_1_optional": "Alignment 1 (optional)",
+    "dialog.alignment_2_optional": "Alignment 2 (optional)",
+    "dialog.invert_alignment": "Invert alignment",
+    "settings.joint_auto_alignment": "Automatically preview joint alignment on hover",
+    "settings.joint_auto_alignment_help": "Preview alignment while hovering hole rims or other alignment references. Turn off to align only when you click a reference. Saved joints and primary origins are unchanged.",
+    "settings.joint_moving_first": "Invert joint selection order",
+    "settings.joint_moving_first_help": "Select the moving component first, then the fixed component, when creating a joint."
+  },
+  "it": {
+    "dialog.alignment_1_optional": "Allineamento 1 (facoltativo)",
+    "dialog.alignment_2_optional": "Allineamento 2 (facoltativo)",
+    "dialog.invert_alignment": "Inverti allineamento",
+    "settings.joint_auto_alignment": "Anteprima automatica dell’allineamento dei giunti al passaggio del mouse",
+    "settings.joint_auto_alignment_help": "Mostra l’anteprima dell’allineamento passando sui bordi dei fori o sugli altri riferimenti. Disattiva per allineare solo con un clic. I giunti salvati e le origini primarie non cambiano.",
+    "settings.joint_moving_first": "Inverti ordine di selezione dei giunti",
+    "settings.joint_moving_first_help": "Quando crei un giunto, seleziona prima il componente da spostare, poi quello fisso."
+  },
+  "ja": {
+    "dialog.alignment_1_optional": "位置合わせ 1（任意）",
+    "dialog.alignment_2_optional": "位置合わせ 2（任意）",
+    "dialog.invert_alignment": "位置合わせを反転",
+    "settings.joint_moving_first": "ジョイントの選択順序を反転",
+    "settings.joint_moving_first_help": "ジョイントの作成時に、移動するコンポーネントを先に選択し、次に固定するコンポーネントを選択します。"
+  },
+  "zh": {
+    "dialog.alignment_1_optional": "对齐 1（可选）",
+    "dialog.alignment_2_optional": "对齐 2（可选）",
+    "dialog.invert_alignment": "反转对齐",
+    "settings.joint_moving_first": "反转接头选择顺序",
+    "settings.joint_moving_first_help": "创建接头时，先选择移动组件，再选择固定组件。"
+  }
+}

@@ -845,6 +845,8 @@ macro_rules! preference_settings {
 }
 
 preference_settings! {
+    /// Transient secondary joint alignment follows hovered references; clicks remain explicit.
+    joint_auto_alignment: bool = true, PAGE_DESIGN => check_id("settings.joint_auto_alignment");
     /// Primary order captured by newly opened Joint dialogs.
     joint_moving_first: bool = false, PAGE_DESIGN => check_id("settings.joint_moving_first");
     /// Units of new designs.

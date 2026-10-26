@@ -562,3 +562,7 @@ the adjacent rim face), `cylinder` (`name`), `construction` (`feature` id), `ske
 (`sketch` id and `curve` id), `origin_axis` (`axis`: X/Y/Z), and `origin_plane` (`plane`: XY/XZ/YZ).
 Omit a field to leave that side unchanged; pass `null` to clear it. Supplying `occurrence`
 also checks the exact picked instance of a shared definition.
+
+### Automatic alignment preview preference
+
+In **Preferences > Design**, **Automatically preview joint alignment on hover** controls the transient secondary-alignment preview, including hole rims. It is on by default, including for profiles saved before this setting existed. Turn it off to keep the confirmed pose while hovering and apply alignment only by explicitly clicking a reference. The setting does not change primary origins, saved joints, reference validation or the command API. Changes take effect in the open dialog on its next preview update; Apply, Cancel and Defaults follow the usual preference transactions.

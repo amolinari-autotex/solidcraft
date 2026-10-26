@@ -569,7 +569,6 @@ pub fn snap_of(s: &Session, sel: &Sel) -> Option<SnapPt> {
                         .map(|p| json!({"circle":p["reference"]["name"],"end":p["reference"]["end"]}))
                         .unwrap_or_else(|| json!({"point": pt(c), "z": pt(z)}));
                     (body, SnapPt { at: c, z, kind: SnapKind::CircleCenter, param })
-
                 }
                 None => {
                     let mid = polyline_mid(e);
@@ -1169,6 +1168,9 @@ pub(crate) fn alignment_input_available(d: &Dialog, index: usize) -> bool {
 }
 
 pub(crate) fn alignment_hover_commands(app: &SolveApp, d: &Dialog) -> Option<Vec<(String, Value)>> {
+    if !app.preferences.joint_auto_alignment {
+        return None;
+    }
     let side = alignment_side(&d.kind, d.active)?;
     // Highlight and snap markers are always available, but the first reference must be
     // clicked before a counterpart can transiently change the assembled pose.
