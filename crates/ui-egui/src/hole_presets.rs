@@ -401,10 +401,16 @@ pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, doc
             let width = (ui.available_width() - height - ui.spacing().item_spacing.x).max(1.0);
             ui.allocate_ui_with_layout(egui::vec2(width, height), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let response = ui_kit::dropdown_menu(ui, "personal_hole_preset_choice", &display, |ui| {
-                    let placeholder = ui.selectable_value(&mut selected, 0, tr("hole_presets.select"));
+                    let placeholder = ui_kit::list_picker(ui, "hole_presets_select", tr("hole_presets.select"), selected == 0);
+                    if placeholder.clicked() {
+                        selected = 0;
+                    }
                     crate::scenario::publish_handle(&format!("dialog:hole_presets.preset:{}", tr("hole_presets.select")), placeholder.rect.center());
                     for (index, preset) in library.0.iter().enumerate() {
-                        let option = ui.selectable_value(&mut selected, index + 1, &preset.name);
+                        let option = ui_kit::list_picker(ui, &format!("hole_preset_{index}"), &preset.name, selected == index + 1);
+                        if option.clicked() {
+                            selected = index + 1;
+                        }
                         crate::scenario::publish_handle(&format!("dialog:hole_presets.preset:{}", preset.name), option.rect.center());
                     }
                 });
@@ -439,12 +445,12 @@ pub(crate) fn rows(ui: &mut egui::Ui, d: &mut Dialog, library: &mut Library, doc
                 state.error = None;
                 state.confirming_delete = false;
             }
-            if ui_kit::button(ui, tr("hole_presets.rename"), Button::Enabled(chosen.is_some())).clicked() {
+            if ui_kit::button(ui, tr("hole_presets.rename"), ui_kit::Button::Enabled(chosen.is_some())).clicked() {
                 state.prompt = Some(NamePrompt { name: state.selected.clone(), renaming: true });
                 state.error = None;
                 state.confirming_delete = false;
             }
-            if ui_kit::button(ui, tr("hole_presets.delete"), Button::Enabled(chosen.is_some())).clicked() {
+            if ui_kit::button(ui, tr("hole_presets.delete"), ui_kit::Button::Enabled(chosen.is_some())).clicked() {
                 state.confirming_delete = true;
                 state.error = None;
             }
