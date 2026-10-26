@@ -45,6 +45,7 @@ pub fn plan(slot: &Slot, cli: &Path) -> Plan {
 /// The folders a link goes in, best first.
 pub const DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 
+#[cfg(unix)]
 fn slot(link: &Path) -> Slot {
     match std::fs::symlink_metadata(link) {
         Err(_) => Slot::Empty,
