@@ -171,6 +171,22 @@ fn hole_presets_automatically_recall_only_changed_selection_without_persistent_n
 }
 
 #[test]
+fn hole_presets_name_prompt_keeps_keyboard_when_canvas_requests_value_focus() {
+    let mut h = personal_preset_harness();
+    let document = h.app.session.doc.to_json();
+    let fields = format!("{:?}", h.app.dialog.as_ref().unwrap().kind);
+    h.step(&json!({"widget":"Save new"})).unwrap();
+    preset_name(&mut h, "FocusTarget");
+    h.app.dialog.as_mut().unwrap().restore_value_focus = true;
+    h.frames(2);
+    h.step(&json!({"text":"-kept"})).unwrap();
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert_eq!(serde_json::to_value(&h.app.preferences.hole_presets).unwrap()[0]["name"], "FocusTarget-kept");
+    assert_eq!(h.app.session.doc.to_json(), document);
+    assert_eq!(format!("{:?}", h.app.dialog.as_ref().unwrap().kind), fields);
+}
+
+#[test]
 fn hole_presets_name_prompt_cancel_duplicate_invalid_and_prefilled_rename_leave_document_untouched() {
     let mut h = personal_preset_harness();
     save_preset(&mut h, "Workshop");
