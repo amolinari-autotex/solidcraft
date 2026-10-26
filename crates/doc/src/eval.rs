@@ -622,11 +622,13 @@ mod thread_handedness_tests {
         for direction in [Vec3::Z, Vec3::X, Vec3::new(1.0, 2.0, 3.0)] {
             for internal in [false, true] {
                 let axis = UnitVec3::new(direction).unwrap();
+                let radius = if internal { 2.5 } else { 3.0 };
                 let mut info = ThreadInfo {
                     feature: 1,
                     body: "Stock".into(),
                     designation: "M6x1".into(),
                     major_diameter: 6.0,
+                    radius,
                     pitch: 1.0,
                     internal,
                     handedness: crate::ThreadHandedness::Right,
@@ -635,7 +637,6 @@ mod thread_handedness_tests {
                     start: 1.3,
                     end: 4.3,
                 };
-                let radius = if internal { 2.5 } else { 3.0 };
                 let right = thread_groove(&info, radius, (false, true)).unwrap();
                 info.handedness = crate::ThreadHandedness::Left;
                 let left = thread_groove(&info, radius, (false, true)).unwrap();
