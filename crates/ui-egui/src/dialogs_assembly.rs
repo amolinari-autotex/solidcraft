@@ -685,7 +685,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Asm, inputs: &mut [Se
                 });
                 let mut reverse = f.reverse_alignment[0] ^ f.reverse_alignment[1];
                 form_row(ui, "Invert alignment", |ui| {
-                    let response = ui.add_enabled(selected.is_some(), egui::Checkbox::new(&mut reverse, ""));
+                    let response = ui.add_enabled_ui(selected.is_some(), |ui| crate::ui_kit::checkbox(ui, "", &mut reverse)).inner;
                     if response.changed()
                         && let Some(side) = selected
                     {

@@ -21,6 +21,8 @@
     "dialog.alignment_1_optional": "位置合わせ 1（任意）",
     "dialog.alignment_2_optional": "位置合わせ 2（任意）",
     "dialog.invert_alignment": "位置合わせを反転",
+    "settings.joint_auto_alignment": "ホバー時にジョイントの位置合わせを自動プレビュー",
+    "settings.joint_auto_alignment_help": "穴の縁や他の位置合わせ参照にカーソルを合わせるとプレビューします。オフにすると、参照をクリックしたときだけ位置合わせします。保存済みのジョイントと主原点は変更されません。",
     "settings.joint_moving_first": "ジョイントの選択順序を反転",
     "settings.joint_moving_first_help": "ジョイントの作成時に、移動するコンポーネントを先に選択し、次に固定するコンポーネントを選択します。"
   },
@@ -28,6 +30,8 @@
     "dialog.alignment_1_optional": "对齐 1（可选）",
     "dialog.alignment_2_optional": "对齐 2（可选）",
     "dialog.invert_alignment": "反转对齐",
+    "settings.joint_auto_alignment": "悬停时自动预览接头对齐",
+    "settings.joint_auto_alignment_help": "悬停在孔边缘或其他对齐参考上时预览对齐。关闭后，仅在点击参考时对齐。已保存的接头和主原点保持不变。",
     "settings.joint_moving_first": "反转接头选择顺序",
     "settings.joint_moving_first_help": "创建接头时，先选择移动组件，再选择固定组件。"
   }
