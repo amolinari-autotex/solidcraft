@@ -227,7 +227,7 @@ fn switching_from_a_sketch_to_a_feature_rejects_replaced_or_changed_documents() 
             "change" => {
                 h.app.run("solid.box", json!({"corner": [80, 0, 0], "length": 2, "width": 2, "height": 2})).unwrap();
             }
-            _ => unreachable!(),
+            _ => assert_eq!(action, "change", "unexpected test action"),
         }
         let current = h.app.session.doc.clone();
         let sketch = h.app.session.active_sketch;

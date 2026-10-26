@@ -99,7 +99,9 @@ mod tests {
         });
         finish.send(Ok(prepared)).ok().unwrap();
         // Run just the dialog, without the normal frame's save polling.
-        let _ = h.ctx.run_ui(Default::default(), |ui| crate::dialogs::show(&mut h.app, ui.ctx()));
+        let mut out = h.ctx.run_ui(Default::default(), |ui| crate::dialogs::show(&mut h.app, ui.ctx()));
+        // Not drawn: discard the texture updates explicitly.
+        out.textures_delta.clear();
         assert!(std::sync::Arc::ptr_eq(&document, &h.app.session.doc));
         assert_eq!(h.app.session.undo.len(), history);
         assert!(h.app.dialog.as_ref().unwrap().error.as_ref().unwrap().contains("file operation"));
