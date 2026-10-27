@@ -475,16 +475,9 @@ fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, V
 
 /// No threads on the web: compute right away.
 #[cfg(target_arch = "wasm32")]
-fn spawn(
-    pv: &mut PreviewState,
-    key: u64,
-    scratch: Session,
-    cmds: Vec<(String, Value)>,
-    colors: Colors,
-    tool: bool,
-    work: PreviewWork,
-) {
-    pv.apply(key, compute_candidate(&scratch, &cmds, colors, tool, work.fallback.as_deref()));
+fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool, work: PreviewWork) {
+    let PreviewWork { progress: _progress, fallback } = work;
+    pv.apply(key, compute_candidate(&scratch, &cmds, colors, tool, fallback.as_deref()));
 }
 
 fn compute_candidate(scratch: &Session, cmds: &[(String, Value)], colors: Colors, tool: bool, fallback: Option<&[(String, Value)]>) -> Job {
@@ -1291,11 +1284,11 @@ mod tests {
         let (before, after) = (a.model.state(), b.model.state());
         let c = colors();
         let generic = build(&before, &after, c);
-        assert!(count(&generic.scene.xray, 28, c.removed) > 0, "reproduce the cut heuristic's false positive");
+        assert!(count(&generic.scene, &generic.scene.xray, 28, c.removed) > 0, "reproduce the cut heuristic's false positive");
         let motion = build_motion(&before, &after, Colors { added: c.body, new_body: c.body, ..c });
-        assert_eq!(count(&motion.scene.xray, 28, c.removed), 0);
-        assert!(count(&motion.scene.tris, crate::gpu::TRI_SIZE, c.body) > 0);
-        assert!(count(&motion.scene.ghost, 28, c.removed) > 0);
+        assert_eq!(count(&motion.scene, &motion.scene.xray, 28, c.removed), 0);
+        assert!(count(&motion.scene, &motion.scene.tris, crate::gpu::TRI_SIZE, c.body) > 0);
+        assert!(count(&motion.scene, &motion.scene.ghost, 28, c.removed) > 0);
         assert_eq!(motion.replaced, ["Body1"]);
     }
 

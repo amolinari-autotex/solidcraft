@@ -500,6 +500,14 @@ fn secondary_alignment_feedback_picks_the_solved_geometry() {
         hits.iter().any(|hit| matches!(hit, crate::viewport::Hit::Face {body, ..} if body == "Body2")),
         "the moved part must be pickable at its solved pose: {hits:?}"
     );
+    h.app.set_origin_shown(false);
+    h.app.viewport.hover = hits.into_iter().find(|hit| matches!(hit, crate::viewport::Hit::Face { body, .. } if body == "Body2"));
+    let lit = crate::viewport::build_highlight(&h.app).merged();
+    assert!(!lit.tris.is_empty(), "the picked face must also be highlighted");
+    for vertex in lit.tris.as_chunks::<{ crate::gpu::TRI_SIZE }>().0 {
+        let x = f32::from_le_bytes(vertex[..4].try_into().unwrap());
+        assert!((-0.01..=20.01).contains(&x), "feedback must follow the solved pose, not Body2's original x=30..50: {x}");
+    }
     assert!(h.app.session.doc.assembly.joints.is_empty());
 }
 
