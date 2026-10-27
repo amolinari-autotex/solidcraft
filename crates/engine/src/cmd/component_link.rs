@@ -429,7 +429,8 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
         link_refused(s.path.as_deref(), &link.path).map_err(|e| bad(cmd, format!("{cname}: {e}")))?;
         let file = resolve(s.path.as_deref(), &link.path);
         let bytes = read_link(&file, s.path.as_deref()).map_err(|e| bad(cmd, format!("{cname}: {e}")))?;
-        let kept_faces = s.doc.feature(link.feature).map(|f| digest(f.link_faces.as_slice()));
+        // A link that has not recorded the properties it inherited (made before they were) is read again.
+        let kept_faces = s.doc.feature(link.feature).filter(|_| !link.inherited.is_empty()).map(|f| digest(f.link_faces.as_slice()));
         if let Some(known) = kept_faces.and_then(|faces| unchanged_read(&file, digest(bytes.as_slice()), digest(old.as_bytes()), faces)) {
             warnings.extend(known);
             unchanged.push(cname);
