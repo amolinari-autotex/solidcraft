@@ -174,9 +174,9 @@ fn design_bodies(file: &Path, bytes: &[u8]) -> Result<Linked> {
     } else {
         (solidcraft_io::read_design(bytes).map_err(fail)?, None)
     };
-    let (name, feature, faces, metadata) = session_bodies(&Session::opened_at(doc, saved.as_ref(), Some(&shown)), &shown)?;
+    let (name, feature, faces, metadata, properties) = session_bodies(&Session::opened_at(doc, saved.as_ref(), Some(&shown)), &shown)?;
     remember_read(file, digest(bytes), &feature, &faces);
-    Ok((name, feature, faces, metadata))
+    Ok((name, feature, faces, metadata, properties))
 }
 
 /// The solid bodies of `part`, the design saved as `shown`, as an Import feature.
