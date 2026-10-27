@@ -14,5 +14,25 @@
   "zh": {
     "material.selection.choose": "选择材料",
     "material.selection.mixed": "不同材料"
+  },
+  "ar": {
+    "material.selection.choose": "اختر مادة",
+    "material.selection.mixed": "مواد مختلفة"
+  },
+  "he": {
+    "material.selection.choose": "בחירת חומר",
+    "material.selection.mixed": "חומרים שונים"
+  },
+  "vi": {
+    "material.selection.choose": "Chọn vật liệu",
+    "material.selection.mixed": "Các vật liệu khác nhau"
+  },
+  "de": {
+    "material.selection.choose": "Material auswählen",
+    "material.selection.mixed": "Unterschiedliche Materialien"
+  },
+  "ko": {
+    "material.selection.choose": "재질 선택",
+    "material.selection.mixed": "서로 다른 재질"
   }
 }
