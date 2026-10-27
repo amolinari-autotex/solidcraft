@@ -2617,13 +2617,38 @@ pub struct StandardPart {
 /// A component whose contents come from another design file (Insert Design): where that file
 /// is, and the Import feature in the component that holds its bodies (Update Links replaces
 /// them; Break Link keeps them and forgets the file).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DesignLink {
     /// The design file: relative to this design's folder once this design is saved, else as
     /// given (`/` separates folders).
     pub path: String,
     /// The Import feature holding the linked design's bodies.
     pub feature: u64,
+    /// Last inherited values, by Import body slot. Differing assembly assignments are
+    /// local overrides and survive a source update. Older links start with no baseline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<LinkedBodyProperties>,
+}
+
+/// The values last inherited by a linked body, not another editable material library.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkedBodyProperties {
+    pub material: String,
+    /// SHA-256 of the inherited custom definition, for equality only. The complete
+    /// engineering card stays in user_materials, not duplicated once per linked body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_fingerprint: Option<String>,
+    /// Explicit body/component look only: material fallback must remain a fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appearance: Option<crate::appearance::Look>,
+}
+
+impl LinkedBodyProperties {
+    pub fn fingerprint(material: &UserMaterial) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(material).map_err(|e| DocError::Invalid(e.to_string()))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
 }
 
 /// A name the design's counter hands out (`Body1`).

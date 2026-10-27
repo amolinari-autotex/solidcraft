@@ -95,7 +95,10 @@ fn every_menu_label_is_in_the_english_catalog() {
     // Linked components offer source-file actions absent from the sample design.
     let linked = app.session.execute("component.create", &json!({"name": "Linked part"})).expect("linked component");
     let component = linked["component"].as_u64().expect("component id");
-    app.session.doc_mut().links.insert(component, solidcraft_engine::doc::DesignLink { path: "part.solidcraft".into(), feature: 0 });
+    app.session
+        .doc_mut()
+        .links
+        .insert(component, solidcraft_engine::doc::DesignLink { path: "part.solidcraft".into(), feature: 0, ..Default::default() });
     take(&app, &mut seen);
     assert!(seen.contains("Open Linked Design"));
 

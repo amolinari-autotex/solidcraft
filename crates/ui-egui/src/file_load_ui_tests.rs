@@ -279,7 +279,7 @@ fn update_links_and_open_linked_design_ask_before_a_network_location() {
     let comp = h.app.run("component.insert_design", json!({"path": part})).unwrap()["component"].as_u64().unwrap();
     h.app.run("file.save", json!({"path": case})).unwrap();
     let feature = h.app.session.doc.links[&comp].feature;
-    h.app.session.doc_mut().links.insert(comp, solidcraft_engine::doc::DesignLink { path: crafted.into(), feature });
+    h.app.session.doc_mut().links.insert(comp, solidcraft_engine::doc::DesignLink { path: crafted.into(), feature, ..Default::default() });
     save_part(8.0);
     let until_idle = |h: &mut crate::scenario::Harness| {
         let began = std::time::Instant::now();
