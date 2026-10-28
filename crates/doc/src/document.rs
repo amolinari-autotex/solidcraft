@@ -2641,6 +2641,10 @@ pub struct LinkedBodyProperties {
     /// Explicit body/component look only: material fallback must remain a fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appearance: Option<crate::appearance::Look>,
+    /// Last inherited authored face overrides. None marks links saved before face
+    /// inheritance; Some(empty) records that the source has no authored face overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faces: Option<Vec<crate::appearance::FaceLook>>,
 }
 
 impl LinkedBodyProperties {
@@ -3156,14 +3160,22 @@ impl Document {
     /// The model with each body carrying the colour, opacity and face colours it is shown with
     /// (for export).
     pub fn painted(&self, state: &crate::ModelState) -> crate::ModelState {
+        self.painted_with_faces(state, true)
+    }
+
+    /// Linked designs carry authored face overrides as editable properties. Their STEP
+    /// geometry keeps imported paint, without baking a second copy of those overrides.
+    pub fn painted_for_link(&self, state: &crate::ModelState) -> crate::ModelState {
+        self.painted_with_faces(state, false)
+    }
+
+    fn painted_with_faces(&self, state: &crate::ModelState, authored_faces: bool) -> crate::ModelState {
         let mut st = state.clone();
         for b in &mut st.bodies {
             let c = self.body_color(b);
-            let faces: Vec<solidcraft_kernel::FacePaint> = self
-                .face_colors(b)
-                .into_iter()
-                .map(|(face, l)| solidcraft_kernel::FacePaint { face, color: l.rgb(), opacity: l.opacity as f32 })
-                .collect();
+            let face_colors = if authored_faces { self.face_colors(b) } else { self.imported_face_colors(b) };
+            let faces: Vec<solidcraft_kernel::FacePaint> =
+                face_colors.into_iter().map(|(face, l)| solidcraft_kernel::FacePaint { face, color: l.rgb(), opacity: l.opacity as f32 }).collect();
             let opacity = self.model_body_opacity(b) as f32;
             let paint = solidcraft_kernel::Paint { opacity, faces };
             if c != b.body.color() || b.body.paint() != Some(&paint) {

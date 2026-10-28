@@ -90,15 +90,18 @@ pub fn resolve_design_links(doc: &mut Document, from: Option<&str>) {
 /// the design gives their faces (`Feature::link_faces`), with the source's design properties.
 type Linked = (String, solidcraft_io::StepFeature, Vec<Vec<String>>, solidcraft_doc::Metadata, Vec<SourceProperties>);
 
+#[derive(Clone)]
 struct SourceProperties {
     material: String,
     definition: Option<UserMaterial>,
     appearance: Option<solidcraft_doc::appearance::Look>,
+    /// Resolved authored overrides, by the face index in this imported body.
+    faces: Vec<(usize, solidcraft_doc::appearance::Look)>,
 }
 
 /// What a linked file last gave, by the file: digests of its bytes, of the STEP text it gave and
-/// of its face names, and that read's warnings. Update Links evaluates a file again only when its
-/// bytes or the linked bodies changed since (#5606). Bounded, oldest first out.
+/// of its face names, and that read's warnings and source properties. Update Links evaluates
+/// a file again only when its bytes or the linked bodies changed since (#5606). Bounded, oldest first out.
 static READS: Mutex<Vec<LinkRead>> = Mutex::new(Vec::new());
 const READS_SIZE: usize = 256;
 
@@ -108,6 +111,7 @@ struct LinkRead {
     step: u64,
     faces: u64,
     warnings: Vec<String>,
+    properties: Vec<SourceProperties>,
 }
 
 #[cfg(test)]
@@ -122,15 +126,18 @@ fn digest<T: Hash + ?Sized>(value: &T) -> u64 {
     h.finish()
 }
 
-/// The warnings of the last read of `file`, when it had these bytes and gave the STEP text
+/// Warnings and source properties of the last read of `file`, when it had these bytes and gave the STEP text
 /// `step` and the face names `faces`: the bodies it gives are the ones the link holds.
-fn unchanged_read(file: &Path, bytes: u64, step: u64, faces: u64) -> Option<Vec<String>> {
+fn unchanged_read(file: &Path, bytes: u64, step: u64, faces: u64) -> Option<(Vec<String>, Vec<SourceProperties>)> {
     let file = absolute(file);
     let reads = READS.lock().ok()?;
-    reads.iter().find(|r| r.file == file && r.bytes == bytes && r.step == step && r.faces == faces).map(|r| r.warnings.clone())
+    reads
+        .iter()
+        .find(|r| r.file == file && r.bytes == bytes && r.step == step && r.faces == faces)
+        .map(|r| (r.warnings.clone(), r.properties.clone()))
 }
 
-fn remember_read(file: &Path, bytes: u64, feature: &solidcraft_io::StepFeature, faces: &[Vec<String>]) {
+fn remember_read(file: &Path, bytes: u64, feature: &solidcraft_io::StepFeature, faces: &[Vec<String>], properties: &[SourceProperties]) {
     let FeatureKind::Import { step, .. } = &feature.kind else { return };
     let file = absolute(file);
     let Ok(mut reads) = READS.lock() else { return };
@@ -138,7 +145,14 @@ fn remember_read(file: &Path, bytes: u64, feature: &solidcraft_io::StepFeature, 
     if reads.len() >= READS_SIZE {
         reads.remove(0);
     }
-    reads.push(LinkRead { file, bytes, step: digest(step.as_bytes()), faces: digest(faces), warnings: feature.warnings.clone() });
+    reads.push(LinkRead {
+        file,
+        bytes,
+        step: digest(step.as_bytes()),
+        faces: digest(faces),
+        warnings: feature.warnings.clone(),
+        properties: properties.to_vec(),
+    });
 }
 
 /// The bytes of the design at `file`, which must not be the design saved at `own`.
@@ -175,7 +189,7 @@ fn design_bodies(file: &Path, bytes: &[u8]) -> Result<Linked> {
         (solidcraft_io::read_design(bytes).map_err(fail)?, None)
     };
     let (name, feature, faces, metadata, properties) = session_bodies(&Session::opened_at(doc, saved.as_ref(), Some(&shown)), &shown)?;
-    remember_read(file, digest(bytes), &feature, &faces);
+    remember_read(file, digest(bytes), &feature, &faces, &properties);
     Ok((name, feature, faces, metadata, properties))
 }
 
@@ -190,7 +204,7 @@ fn session_bodies(part: &Session, shown: &str) -> Result<Linked> {
     if solids.is_empty() {
         return Err(EngineError::Other(format!("{shown}: the design has no solid bodies to link")));
     }
-    let step = solidcraft_io::export(&part.doc.painted(&world), &solids, solidcraft_io::Format::Step, &name)
+    let step = solidcraft_io::export(&part.doc.painted_for_link(&world), &solids, solidcraft_io::Format::Step, &name)
         .map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
     let mut feature = solidcraft_io::step_import_feature(&step, shown).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
     if world.bodies.len() > solids.len() {
@@ -235,7 +249,15 @@ fn session_bodies(part: &Session, shown: &str) -> Result<Linked> {
                 .get(key)
                 .cloned()
                 .or_else(|| part.doc.appearances.components.get(&part.doc.model_body_component(source)).cloned());
-            Ok(SourceProperties { material, definition, appearance })
+            let names = solidcraft_doc::naming::face_names(source);
+            let authored: std::collections::BTreeMap<_, _> = part
+                .doc
+                .authored_face_colors(source)
+                .into_iter()
+                .filter_map(|(index, look)| names.get(index).map(|name| (name.clone(), look)))
+                .collect();
+            let faces = carried.iter().enumerate().filter_map(|(index, name)| authored.get(name).map(|look| (index, look.clone()))).collect();
+            Ok(SourceProperties { material, definition, appearance, faces })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok((name, feature, faces, part.doc.metadata.clone(), properties))
@@ -280,6 +302,100 @@ fn inherit_material(doc: &mut Document, source: &SourceProperties, previous: Opt
     Ok(name)
 }
 
+/// Replace only unchanged inherited face assignments. A locally edited, added or removed
+/// override remains local, independently for each face. Resolve names on the evaluated Import,
+/// not source feature IDs or face order from the source's model.
+fn inherit_faces(
+    s: &mut Session,
+    name: &str,
+    source: &SourceProperties,
+    previous: Option<&LinkedBodyProperties>,
+) -> (Vec<solidcraft_doc::appearance::FaceLook>, bool) {
+    use solidcraft_doc::appearance::FaceLook;
+    let previous = previous.and_then(|p| p.faces.as_deref()).unwrap_or_default();
+    if source.faces.is_empty() && previous.is_empty() {
+        return (Vec::new(), false);
+    }
+    let state = s.model.state();
+    let Some(body) = state.body(name) else { return (Vec::new(), false) };
+    let names = solidcraft_doc::naming::face_names(body);
+    // A stable named assignment needs no new geometric point. Keep its position in
+    // the appearance list and avoid tessellating on unchanged cached reads.
+    if previous.len() == source.faces.len()
+        && previous.iter().all(|old| old.body == name && s.doc.appearances.faces.contains(old))
+        && source.faces.iter().all(|(index, look)| {
+            names.get(*index).is_some_and(|name| previous.iter().any(|old| old.name.as_ref() == Some(name) && old.look == *look))
+        })
+    {
+        return (previous.to_vec(), false);
+    }
+    let before = s.doc.appearances.faces.clone();
+    let mut local = before.clone();
+    let mut inherited = Vec::new();
+    let mut replaced = Vec::new();
+    let mut blocked = std::collections::BTreeSet::new();
+    for old in previous {
+        let mut old = old.clone();
+        old.body = name.into();
+        if let Some(index) = local.iter().position(|face| *face == old) {
+            local.remove(index);
+            replaced.push(old);
+        } else {
+            if let Some(name) = &old.name {
+                blocked.extend(solidcraft_doc::naming::faces_with_stem(body, name));
+            }
+            // Remember an explicit local removal too, including after save/reopen.
+            inherited.push(old);
+        }
+    }
+    s.doc_mut().appearances.faces = local;
+    blocked.extend(s.doc.authored_face_colors(body).into_iter().map(|(index, _)| index));
+    let spots = if source.faces.is_empty() { Vec::new() } else { solidcraft_doc::naming::face_spots(body) };
+    let mut assignments = Vec::new();
+    for (index, look) in &source.faces {
+        if blocked.contains(index) {
+            // An appended local override can coexist with the old inherited entry.
+            // Keep that baseline as a tombstone if the local override is later removed.
+            if let Some(old) = names.get(*index).and_then(|name| previous.iter().find(|old| old.name.as_ref() == Some(name))) {
+                let mut old = old.clone();
+                old.body = name.into();
+                if !inherited.contains(&old) {
+                    inherited.push(old);
+                }
+            }
+            continue;
+        }
+        let Some(face_name) = names.get(*index).filter(|name| !name.is_empty()) else { continue };
+        let Some(spot) = spots.get(*index).and_then(|spot| *spot) else { continue };
+        let face = FaceLook {
+            body: name.into(),
+            point: spot.point,
+            look: look.clone(),
+            name: Some(face_name.clone()),
+            strict_name: false,
+            certificate: None,
+        };
+        assignments.push(face.clone());
+        inherited.push(face);
+    }
+    // Replace inherited entries in place; leave all local and other bodies' entries
+    // in their original order, including multiple overrides on the same face.
+    let mut after = Vec::new();
+    for old in &before {
+        if replaced.contains(old) {
+            if let Some(index) = assignments.iter().position(|face| face.body == old.body && face.name == old.name) {
+                after.push(assignments.remove(index));
+            }
+        } else {
+            after.push(old.clone());
+        }
+    }
+    after.extend(assignments);
+    let changed = after != before;
+    s.doc_mut().appearances.faces = after;
+    (inherited, changed)
+}
+
 /// Apply properties after evaluation has resolved body-name collisions. Last inherited
 /// values are kept independently for material and appearance, so overriding one does not
 /// stop updates of the other. Session::execute makes this part of the command's undo step.
@@ -319,6 +435,9 @@ fn inherit_properties(s: &mut Session, component: u64, sources: &[SourceProperti
             }
             next.appearance.clone_from(&source.appearance);
         }
+        let (faces, face_changed) = inherit_faces(s, name, source, old);
+        next.faces = Some(faces);
+        changed |= face_changed;
         if let Some(snapshot) = inherited.get_mut(slot) {
             *snapshot = next;
         }
@@ -430,10 +549,21 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
         let file = resolve(s.path.as_deref(), &link.path);
         let bytes = read_link(&file, s.path.as_deref()).map_err(|e| bad(cmd, format!("{cname}: {e}")))?;
         // A link that has not recorded the properties it inherited (made before they were) is read again.
-        let kept_faces = s.doc.feature(link.feature).filter(|_| !link.inherited.is_empty()).map(|f| digest(f.link_faces.as_slice()));
-        if let Some(known) = kept_faces.and_then(|faces| unchanged_read(&file, digest(bytes.as_slice()), digest(old.as_bytes()), faces)) {
+        let kept_faces = s
+            .doc
+            .feature(link.feature)
+            .filter(|_| !link.inherited.is_empty() && link.inherited.iter().all(|p| p.faces.is_some()))
+            .map(|f| digest(f.link_faces.as_slice()));
+        if let Some((known, properties)) = kept_faces.and_then(|faces| unchanged_read(&file, digest(bytes.as_slice()), digest(old.as_bytes()), faces))
+        {
             warnings.extend(known);
-            unchanged.push(cname);
+            // Another component or session may have evaluated this source first. Its
+            // cached geometry says nothing about this link's inherited properties.
+            if inherit_properties(s, comp, &properties)? {
+                updated.push(cname)
+            } else {
+                unchanged.push(cname)
+            }
             continue;
         }
         let (_, sf, faces, _, properties) = design_bodies(&file, &bytes).map_err(|e| bad(cmd, format!("{cname}: {e}")))?;

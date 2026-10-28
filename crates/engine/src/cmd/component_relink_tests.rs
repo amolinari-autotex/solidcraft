@@ -213,7 +213,9 @@ fn linked_design_properties_keep_opaque_pbr_and_face_color_after_reload() {
     });
     run(&mut part, "file.save", json!({}));
     let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "body_name": "Cube"}));
     let c = run(&mut s, "component.insert_design", json!({"path": file}))["component"].as_u64().unwrap();
+    assert!(!s.doc.appearances.faces.iter().any(|face| face.body == "Cube"), "the assembly's existing body keeps its appearance");
     let check = |s: &Session| {
         let state = s.model.state();
         let body = state.bodies.iter().find(|b| b.component == c).unwrap();
@@ -230,6 +232,152 @@ fn linked_design_properties_keep_opaque_pbr_and_face_color_after_reload() {
     let mut cold = Session::default();
     run(&mut cold, "doc.open", json!({"path": assembly}));
     check(&cold);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn linked_face_overrides_update_independently_and_preserve_local_edits_and_removals() {
+    use solidcraft_doc::appearance::{FaceLook, Look};
+    use solidcraft_geom::Vec3;
+    let dir = folder("properties-faces");
+    let file = dir.join("source.solidcraft");
+    let mut part = properties_part(&file, "Steel", None, [12, 34, 56]);
+    let top = Vec3::new(5.0, 5.0, 10.0);
+    let side = Vec3::new(10.0, 5.0, 5.0);
+    for (point, color) in [(top, [190, 20, 30]), (side, [20, 190, 30])] {
+        part.doc_mut().appearances.faces.push(FaceLook {
+            body: "Cube".into(),
+            point,
+            look: Look::custom(color, 1.0),
+            name: None,
+            strict_name: false,
+            certificate: None,
+        });
+    }
+    run(&mut part, "file.save", json!({}));
+    let mut s = Session::default();
+    let c = run(&mut s, "component.insert_design", json!({"path": file}))["component"].as_u64().unwrap();
+    let color = |s: &Session, point| {
+        let state = s.model.state();
+        let body = state.bodies.iter().find(|b| b.component == c).unwrap();
+        let index = solidcraft_doc::appearance::face_index_at(body, point).unwrap();
+        s.doc.face_colors(body).into_iter().find(|(face, _)| *face == index).map(|(_, look)| look.color)
+    };
+    assert_eq!(color(&s, top), Some([190, 20, 30]));
+    assert_eq!(color(&s, side), Some([20, 190, 30]));
+    part.doc_mut().appearances.faces[0].look = Look::custom([30, 40, 200], 1.0);
+    part.doc_mut().appearances.faces.pop();
+    run(&mut part, "file.save", json!({}));
+    run(&mut s, "component.update_links", json!({}));
+    assert_eq!(color(&s, top), Some([30, 40, 200]));
+    assert_eq!(color(&s, side), None, "a removed source override reveals the body's look");
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(color(&s, side), Some([20, 190, 30]));
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(color(&s, side), None);
+    let mut local = s.doc.appearances.faces[0].clone();
+    local.look = Look::custom([200, 180, 30], 1.0);
+    s.doc_mut().appearances.faces.push(local);
+    let assembly = dir.join("assembly.solidcraft");
+    run(&mut s, "file.save", json!({"path": assembly}));
+    let mut cold = Session::default();
+    run(&mut cold, "doc.open", json!({"path": assembly}));
+    part.doc_mut().appearances.faces[0].look = Look::custom([40, 50, 60], 1.0);
+    run(&mut part, "file.save", json!({}));
+    run(&mut cold, "component.update_links", json!({}));
+    assert_eq!(color(&cold, top), Some([200, 180, 30]), "a local face edit survives a source edit after reopening");
+    cold.doc_mut().appearances.faces.clear();
+    part.doc_mut().appearances.faces[0].look = Look::custom([60, 70, 80], 1.0);
+    run(&mut part, "file.save", json!({}));
+    run(&mut cold, "component.update_links", json!({}));
+    assert_eq!(color(&cold, top), None, "an explicit local removal is not restored by a source update");
+    // A link saved by the earlier material-only implementation must be read again,
+    // even when the file read cache already knows the current source bytes.
+    cold.doc_mut().links.get_mut(&c).unwrap().inherited[0].faces = None;
+    run(&mut cold, "component.update_links", json!({}));
+    assert_eq!(color(&cold, top), Some([60, 70, 80]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn linked_properties_update_every_component_and_session_sharing_a_cached_source() {
+    let dir = folder("properties-shared-read");
+    let file = dir.join("source.solidcraft");
+    let mut part = properties_part(&file, "Source alloy", Some(4.2), [12, 34, 56]);
+    let mut s = Session::default();
+    let a = run(&mut s, "component.insert_design", json!({"path": file}))["component"].as_u64().unwrap();
+    let b = run(&mut s, "component.insert_design", json!({"path": file}))["component"].as_u64().unwrap();
+    let mut other = Session::default();
+    let c = run(&mut other, "component.insert_design", json!({"path": file}))["component"].as_u64().unwrap();
+    part.doc_mut().user_materials[0].density = 4.8;
+    run(&mut part, "file.save", json!({}));
+    let updated = run(&mut s, "component.update_links", json!({}));
+    assert_eq!(updated["updated"].as_array().unwrap().len(), 2, "{updated}");
+    for component in [a, b] {
+        let p = run(&mut s, "component.properties", json!({"component": component}));
+        assert!((p["total"]["mass_g"].as_f64().unwrap() - 4.8).abs() < 1e-6, "{p}");
+    }
+    run(&mut other, "component.update_links", json!({}));
+    let p = run(&mut other, "component.properties", json!({"component": c}));
+    assert!((p["total"]["mass_g"].as_f64().unwrap() - 4.8).abs() < 1e-6, "{p}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn linked_face_removal_without_a_body_look_does_not_reveal_baked_source_paint() {
+    use solidcraft_doc::appearance::{FaceLook, Look};
+    let dir = folder("properties-unpainted-body");
+    let file = dir.join("source.solidcraft");
+    let mut part = properties_part(&file, "Steel", None, [12, 34, 56]);
+    part.doc_mut().appearances.bodies.clear();
+    part.doc_mut().appearances.faces.push(FaceLook {
+        body: "Cube".into(),
+        point: solidcraft_geom::Vec3::new(5.0, 5.0, 10.0),
+        look: Look::custom([190, 20, 30], 0.65),
+        name: None,
+        strict_name: false,
+        certificate: None,
+    });
+    run(&mut part, "file.save", json!({}));
+    let mut s = Session::default();
+    run(&mut s, "component.insert_design", json!({"path": file}));
+    assert_eq!(s.doc.face_colors(&s.model.state().bodies[0]).len(), 1);
+    assert!(s.doc.appearances.bodies.is_empty());
+    s.doc_mut().appearances.faces.clear();
+    assert!(s.doc.face_colors(&s.model.state().bodies[0]).is_empty(), "local removal must reveal the body's material, not duplicate STEP paint");
+    part.doc_mut().appearances.faces[0].look = Look::custom([20, 190, 30], 0.8);
+    run(&mut part, "file.save", json!({}));
+    run(&mut s, "component.update_links", json!({}));
+    assert!(s.doc.face_colors(&s.model.state().bodies[0]).is_empty(), "source edits must preserve the local removal");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn unchanged_linked_face_overrides_do_not_reorder_assignments_or_report_updates() {
+    use solidcraft_doc::appearance::{FaceLook, Look};
+    let dir = folder("properties-face-cache");
+    let file = dir.join("source.solidcraft");
+    let mut part = properties_part(&file, "Steel", None, [12, 34, 56]);
+    part.doc_mut().appearances.faces.push(FaceLook {
+        body: "Cube".into(),
+        point: solidcraft_geom::Vec3::new(5.0, 5.0, 10.0),
+        look: Look::custom([190, 20, 30], 0.65),
+        name: None,
+        strict_name: false,
+        certificate: None,
+    });
+    run(&mut part, "file.save", json!({}));
+    let mut s = Session::default();
+    for _ in 0..2 {
+        run(&mut s, "component.insert_design", json!({"path": file}));
+    }
+    let before = s.doc.clone();
+    for _ in 0..2 {
+        let result = run(&mut s, "component.update_links", json!({}));
+        assert!(result["updated"].as_array().unwrap().is_empty(), "{result}");
+        assert_eq!(result["unchanged"].as_array().unwrap().len(), 2, "{result}");
+        assert_eq!(s.doc, before, "unchanged links preserve assignment order and inherited baselines");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
