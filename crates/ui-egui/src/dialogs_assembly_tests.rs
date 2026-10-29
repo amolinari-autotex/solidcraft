@@ -33,7 +33,7 @@ fn rim(s: &Session, body: &str, center: Vec3) -> (crate::viewport::Hit, Sel) {
     let mesh = b.mesh();
     let index = mesh.edges.iter().position(|e| circle_of(e).is_some_and(|(c, _)| c.dist(center) < 1e-6)).unwrap();
     let point = mesh.edges[index][0];
-    (crate::viewport::Hit::Edge { body: body.into(), index, mid: point }, Sel::Edge { body: body.into(), index, point })
+    (crate::viewport::Hit::Edge { body: body.into(), index, mid: point, point }, Sel::Edge { body: body.into(), index, point })
 }
 
 #[test]
@@ -704,14 +704,15 @@ fn secondary_alignment_feedback_accepts_named_edge_and_tracks_sketch_namespace()
     let body = state.body("Body2").unwrap();
     let mesh = body.mesh();
     let index = mesh.edges.iter().position(|e| e.len() >= 2 && (e.last().unwrap().x - e[0].x).abs() > 19.0).unwrap();
-    let hit = crate::viewport::Hit::Edge { body: "Body2".into(), index, mid: (mesh.edges[index][0] + *mesh.edges[index].last().unwrap()) / 2.0 };
+    let point = (mesh.edges[index][0] + *mesh.edges[index].last().unwrap()) / 2.0;
+    let hit = crate::viewport::Hit::Edge { body: "Body2".into(), index, mid: point, point };
     let selection = d.candidate(&app.session, &hit).unwrap();
     d.pick(&app.session, selection);
     let commands = apply_commands(&app, &d).unwrap();
     assert_eq!(commands[0].1["b_alignment"]["reference"]["type"], "edge");
     app.session.scratch().execute(&commands[0].0, &commands[0].1).unwrap();
     d.active = 2;
-    let hit = crate::viewport::Hit::SketchCurve { sketch: 99, id: "l1".into(), straight: true };
+    let hit = crate::viewport::Hit::SketchCurve { sketch: 99, id: "l1".into(), straight: true, point: Vec3::ZERO };
     assert!(d.candidate(&app.session, &hit).is_none(), "a missing sketch has no matching occurrence");
 }
 

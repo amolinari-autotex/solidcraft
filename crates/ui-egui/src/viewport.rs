@@ -3634,9 +3634,14 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
     let moving = |name: &str| dragging && chain_of(live.as_ref(), name).is_some();
     let chained = live.as_ref().filter(|_| !dragging);
     let carry = |b: &solidcraft_engine::doc::ModelBody| chain_of(chained, &b.name);
-    let replaced = |name: &str| moving(name) || (app.preview.interaction.is_none() && app.preview.effective_replaced().iter().any(|n| n == name) && chain_of(chained, name).is_none());
-    let shown = |b: &solidcraft_engine::doc::ModelBody| carried_mesh(carry(b), if product || (app.preview.draw_active() && app.preview.interaction.is_some()) { b.mesh() } else { shown_mesh(app, b, &active_bodies) });
-    let drawn = |b: &solidcraft_engine::doc::ModelBody| carried_mesh(carry(b), if app.preview.draw_active() && app.preview.interaction.is_some() { b.mesh() } else { drawn_mesh(app, b) });
+    let previewing_joint = (app.preview.active && !app.preview.rolled_back) && app.preview.interaction.is_some();
+    let replaced = |name: &str| {
+        moving(name) || (!previewing_joint && app.preview.effective_replaced().iter().any(|n| n == name) && chain_of(chained, name).is_none())
+    };
+    let shown = |b: &solidcraft_engine::doc::ModelBody| {
+        carried_mesh(carry(b), if product || previewing_joint { b.mesh() } else { shown_mesh(app, b, &active_bodies) })
+    };
+    let drawn = |b: &solidcraft_engine::doc::ModelBody| carried_mesh(carry(b), if previewing_joint { b.mesh() } else { drawn_mesh(app, b) });
     let items = app.highlighted();
     let sketches = selected_sketches(app, &items);
     let mut sel = Vec::new();
@@ -3798,7 +3803,11 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
                 {
                     let m = drawn(b);
                     let point = if carry(b).is_some() { crate::dialogs_move::shown_point(app, body, *point) } else { *point };
-                    if let Some(e) = if app.preview.draw_active() && app.preview.interaction.is_some() { m.edges.get(*index) } else { edge_of(&m, *index, point) } {
+                    if let Some(e) = if (app.preview.active && !app.preview.rolled_back) && app.preview.interaction.is_some() {
+                        m.edges.get(*index)
+                    } else {
+                        edge_of(&m, *index, point)
+                    } {
                         edge_lines(&mut feedback, e, selected_edge, 3.0, &edge_normals(&m, e));
                     }
                 }
@@ -3885,18 +3894,14 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
             selected_faces.entry(body.as_str()).or_default().insert(*index);
         }
     }
-    for b in st
-        .bodies
-        .iter()
-        .filter(|b| app.session.body_visible(&b.name) && (app.preview.interaction.is_some() || !app.preview.effective_replaced().contains(&b.name)))
-    {
+    for b in st.bodies.iter().filter(|b| app.session.body_visible(&b.name) && !replaced(&b.name)) {
         let whole = hovered_whole.contains(b.name.as_str());
         let faces: Vec<usize> =
             if whole { (0..b.body.face_count()).collect() } else { hovered_faces.get(b.name.as_str()).cloned().unwrap_or_default() };
         if faces.is_empty() {
             continue;
         }
-        let m = shown(b);
+        let m = drawn(b);
         let base = body_color(&s.doc, b).unwrap_or(t.body);
         let k = t.hover_face_lift;
         let hover_col = [base.r().saturating_add(k), base.g().saturating_add(k), base.b().saturating_add(k), 255];
